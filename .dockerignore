@@ -1,0 +1,19 @@
+# Node / build outputs
+node_modules
+dist
+coverage
+
+# SCM / IDE
+.git
+.gitignore
+.github
+.vscode
+
+# Local data and artifacts
+data
+badges
+
+# Env and logs
+.env
+*.log
+

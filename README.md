@@ -7,7 +7,63 @@ Single-tenant Hyperliquid BTC Perp Tracker (MVP).
 Quick start
 - Prereqs: Node.js 18+ (global `fetch`), npm or pnpm.
 - Install deps: `npm install`
-- Dev run: `npm run dev` then open http://localhost:3000
+- Dev run (memory storage): `npm run dev` then open http://localhost:3000
+
+Local development (with Postgres)
+- Start Postgres only via Compose: `docker compose up -d db`
+- Set env for the app (PowerShell examples):
+  - `$env:STORAGE_BACKEND = 'postgres'`
+  - `$env:DATABASE_URL = 'postgresql://hlbot:hlbotpassword@localhost:5432/hlbot'`
+- Apply migrations: `npm run migrate`
+- Start dev server: `npm run dev` (http://localhost:3000)
+
+Production (bare metal)
+- Build: `npm run build`
+- Set env (at minimum): `STORAGE_BACKEND=postgres`, `DATABASE_URL=postgresql://...`
+- Migrate: `npm run migrate`
+- Start: `npm start`
+
+Docker
+- Create `.env` from template: `cp .env.example .env` (or copy manually on Windows)
+- Build and run all services: `docker compose up -d --build`
+- Open the UI: http://localhost:3000 (or set `APP_PORT` in `.env`)
+- View logs: `docker compose logs -f app`
+- Stop containers (keep data): `docker compose down`
+- Remove containers and data: `docker compose down -v`
+- Notes:
+  - Default backend is Postgres (`STORAGE_BACKEND=postgres`) with persistent volume `pgdata`.
+  - Redis is included but optional. Switch by setting `STORAGE_BACKEND=redis` and ensuring `REDIS_URL` is set.
+  - The app runs DB migrations automatically on container start.
+
+Migrations
+- All SQL migrations live in `migrations/` and are applied in lexicographic order (e.g., `001_init.sql`, `002_add_x.sql`).
+- Applied versions are tracked in `schema_migrations`.
+- Run locally: `npm run migrate` or check status with `npm run migrate:status`.
+- In Docker: the app image runs migrations automatically on startup via `docker/entrypoint.sh` before launching the server.
+
+Environment variables
+- `PORT` (default `3000`) — Express server port.
+- `POLL_INTERVAL_MS` (default `90000`) — background poll interval.
+- `STORAGE_BACKEND` — `postgres` (recommended), `redis`, or `memory`.
+- Postgres: use `DATABASE_URL` (e.g., `postgresql://user:pass@host:5432/db`).
+- Redis: use `REDIS_URL` (e.g., `redis://localhost:6379`).
+- See `.env.example` for a complete template used by docker-compose.
+
+API endpoints
+- `GET /api/addresses` — list tracked addresses.
+- `POST /api/addresses` — add an address `{ address: string }`.
+- `DELETE /api/addresses/:address` — remove an address.
+- `GET /api/recommendations` — current recommendations.
+- `POST /api/poll-now` — trigger an immediate background poll.
+- `GET /api/positions/:address` — on-demand perp positions for an address.
+- `GET /api/price` — current BTCUSD price (ws/http source info included).
+- `GET /` — static UI.
+
+Troubleshooting
+- Port in use (3000/5432): change `APP_PORT`, `PG_PORT`, or `PORT` in `.env`.
+- DB not ready: compose waits for Postgres health. Check `docker compose logs db`.
+- Migrations failed: view `docker compose logs app` or run `npm run migrate` locally with correct `DATABASE_URL`.
+- Reset data: `docker compose down -v` (removes Postgres and Redis volumes).
 
 Features
 - Add an address to track; de-duplicated and persisted via Redis or Postgres.

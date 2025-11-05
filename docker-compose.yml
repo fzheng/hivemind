@@ -1,0 +1,58 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: hlbot-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-hlbot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hlbotpassword}
+      POSTGRES_DB: ${POSTGRES_DB:-hlbot}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "${PG_PORT:-5432}:5432" # optional local access
+
+  redis:
+    image: redis:7-alpine
+    container_name: hlbot-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "${REDIS_PORT:-6379}:6379" # optional local access
+
+  app:
+    build: .
+    image: hlbot:latest
+    container_name: hlbot-app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      # - redis # enable if using Redis backend
+    environment:
+      NODE_ENV: production
+      PORT: ${PORT:-3000}
+      POLL_INTERVAL_MS: ${POLL_INTERVAL_MS:-90000}
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-postgres}
+      # Postgres connection
+      DATABASE_URL: ${DATABASE_URL:-postgresql://hlbot:hlbotpassword@db:5432/hlbot}
+      # Redis (optional)
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+    ports:
+      - "${APP_PORT:-3000}:3000"
+
+volumes:
+  pgdata:
+  redisdata:
