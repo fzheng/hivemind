@@ -5,50 +5,66 @@ import type { PositionInfo } from './types';
 // Reuse a single HTTP transport for SDK calls
 const transport = new hl.HttpTransport();
 
+// Internal helpers
+function isBtcCoin(coin: unknown): boolean {
+  return typeof coin === 'string' && /^btc$/i.test(coin);
+}
+
+function toUser(address: string): `0x${string}` {
+  return address.toLowerCase() as `0x${string}`;
+}
+
+/**
+ * Returns net BTC perp exposure (signed size in coin units).
+ * Falls back to 0 on API errors to keep callers resilient.
+ */
 export async function fetchBtcPerpExposure(address: string): Promise<number> {
   try {
     const data = await clearinghouseState(
       { transport },
-      { user: address as `0x${string}` }
+      { user: toUser(address) }
     );
-    const positions = data.assetPositions || [];
+    const positions = data?.assetPositions ?? [];
     let netBtc = 0;
-    for (const ap of positions) {
-      const coin = ap?.position?.coin ?? '';
-      const size = Number(ap?.position?.szi ?? 0);
-      if (/^btc$/i.test(coin) && Number.isFinite(size)) {
-        netBtc += size;
-      }
+    for (const assetPosition of positions) {
+      const pos = assetPosition?.position;
+      const coin = pos?.coin ?? '';
+      const size = Number(pos?.szi ?? 0);
+      if (isBtcCoin(coin) && Number.isFinite(size)) netBtc += size;
     }
     return netBtc;
-  } catch (e) {
+  } catch {
     return 0;
   }
 }
 
+/**
+ * Returns all non-flat perp positions for a user from the info API.
+ * BTC is included here (for completeness) and symbol is uppercased.
+ */
 export async function fetchPerpPositions(address: string): Promise<PositionInfo[]> {
   try {
     const data = await clearinghouseState(
       { transport },
-      { user: address as `0x${string}` }
+      { user: toUser(address) }
     );
     const out: PositionInfo[] = [];
-    for (const ap of data.assetPositions || []) {
-      const coin = ap?.position?.coin ?? '';
-      const size = Number(ap?.position?.szi ?? 0);
+    for (const assetPosition of data?.assetPositions ?? []) {
+      const pos = assetPosition?.position;
+      const coin = pos?.coin ?? '';
+      const size = Number(pos?.szi ?? 0);
       if (!Number.isFinite(size) || size === 0) continue;
-      const entry = Number(ap?.position?.entryPx ?? NaN);
-      const levValue = Number(ap?.position?.leverage?.value ?? NaN);
-      const symbol = coin; // e.g., BTC
+      const entry = Number(pos?.entryPx ?? NaN);
+      const levValue = Number(pos?.leverage?.value ?? NaN);
       out.push({
-        symbol,
+        symbol: String(coin).toUpperCase(),
         size,
         entryPriceUsd: Number.isFinite(entry) ? entry : undefined,
         leverage: Number.isFinite(levValue) ? levValue : undefined,
       });
     }
     return out;
-  } catch (e) {
+  } catch {
     return [];
   }
 }
@@ -66,29 +82,52 @@ export interface UserFill {
   hash?: string;
 }
 
-export async function fetchUserBtcFills(address: string, opts?: { aggregateByTime?: boolean }): Promise<UserFill[]> {
+/**
+ * Fetches recent user fills and returns only BTC fills, newest first.
+ * Values are normalized to numbers and optional fields omitted if invalid.
+ */
+export async function fetchUserBtcFills(
+  address: string,
+  opts?: { aggregateByTime?: boolean }
+): Promise<UserFill[]> {
   try {
     const fills = await userFills(
       { transport },
-      { user: address as `0x${string}`, aggregateByTime: opts?.aggregateByTime },
+      { user: toUser(address), aggregateByTime: opts?.aggregateByTime },
     );
     const out: UserFill[] = [];
     for (const f of fills || []) {
-      if (!/^btc$/i.test(String(f?.coin))) continue;
-      const px = Number(f?.px);
-      const sz = Number(f?.sz);
-      const time = Number(f?.time);
-      const start = Number(f?.startPosition);
-      const closed = f?.closedPnl != null ? Number(f?.closedPnl) : undefined;
-      const fee = f?.fee != null ? Number(f?.fee) : undefined;
+      if (!isBtcCoin((f as any)?.coin)) continue;
+      const px = Number((f as any)?.px);
+      const sz = Number((f as any)?.sz);
+      const time = Number((f as any)?.time);
+      const start = Number((f as any)?.startPosition);
+      const closedRaw = (f as any)?.closedPnl;
+      const feeRaw = (f as any)?.fee;
       const feeToken = typeof (f as any)?.feeToken === 'string' ? String((f as any).feeToken) : undefined;
       const hash = typeof (f as any)?.hash === 'string' ? String((f as any).hash) : undefined;
-      const side = (f?.side === 'B' ? 'B' : 'A') as 'B' | 'A';
+      const side = ((f as any)?.side === 'B' ? 'B' : 'A') as 'B' | 'A';
+
       if (!Number.isFinite(px) || !Number.isFinite(sz) || !Number.isFinite(time) || !Number.isFinite(start)) continue;
-      out.push({ coin: 'BTC', px, sz, side, time, startPosition: start, closedPnl: Number.isFinite(closed!) ? closed : undefined, fee, feeToken, hash });
+
+      const closed = Number.isFinite(Number(closedRaw)) ? Number(closedRaw) : undefined;
+      const fee = Number.isFinite(Number(feeRaw)) ? Number(feeRaw) : undefined;
+
+      out.push({
+        coin: 'BTC',
+        px,
+        sz,
+        side,
+        time,
+        startPosition: start,
+        closedPnl: closed,
+        fee,
+        feeToken,
+        hash,
+      });
     }
     return out.sort((a, b) => b.time - a.time);
-  } catch (e) {
+  } catch {
     return [];
   }
 }

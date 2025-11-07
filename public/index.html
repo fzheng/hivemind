@@ -150,6 +150,21 @@
           tr.querySelector('a[data-address]')?.addEventListener('click', (e) => { e.preventDefault(); showHoldings(p.address); });
           tr.querySelector('a[data-action="remove"]')?.addEventListener('click', async (e) => { e.preventDefault(); await removeAddress(p.address); await refresh(); });
           tr.querySelector('a[data-action="edit-nick"]')?.addEventListener('click', async (e) => { e.preventDefault(); await editNickname(p.address, p.nickname || ''); await refresh(); });
+          // Add external Hyperbot link in actions
+          (function(){ return;
+            const actions = tr.querySelector('td .small');
+            if (!actions) return;
+            const sep = document.createElement('span');
+            sep.className = 'muted';
+            sep.textContent = ' · ';
+            const link = document.createElement('a');
+            link.href = `https://hyperbot.network/trader/${encodeURIComponent(p.address)}`;
+            link.target = '_blank';
+            link.rel = 'noopener';
+            link.textContent = 'Hyperbot ↗';
+            actions.appendChild(sep);
+            actions.appendChild(link);
+          })();
           positionsTbody.appendChild(tr);
         });
       }
@@ -273,13 +288,15 @@
       modal.className = 'modal-overlay';
       const modalCard = document.createElement('div');
       modalCard.className = 'modal-card';
-      modalCard.innerHTML = '<div class="row" style="justify-content:space-between; align-items:center; margin-bottom:8px;"><strong>Perp holdings</strong><button id="modalClose" aria-label="Close holdings modal">Close</button></div><div id="modalBody" class="small"></div>';
+      modalCard.innerHTML = '<div class="row" style="justify-content:space-between; align-items:center; margin-bottom:8px;"><div id="modalHeader" class="row" style="gap:8px; align-items:center;"><strong>Perp holdings</strong><a id="modalHyperbot" href="#" target="_blank" rel="noopener" class="small" style="text-decoration:underline;">Open in Hyperbot ↗</a></div><button id="modalClose" aria-label="Close holdings modal">Close</button></div><div id="modalBody" class="small"></div>';
       modal.appendChild(modalCard);
       document.body.appendChild(modal);
       document.getElementById('modalClose').addEventListener('click', () => { modal.style.display = 'none'; });
 
       async function showHoldings(address) {
         modal.style.display = 'flex';
+        const hbLink = modal.querySelector('#modalHyperbot');
+        if (hbLink) hbLink.setAttribute('href', 'https://hyperbot.network/trader/' + encodeURIComponent(address));
         const body = modal.querySelector('#modalBody');
         body.textContent = 'Loading...';
         try {
