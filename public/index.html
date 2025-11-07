@@ -12,7 +12,10 @@
     <div class="wrap">
       <header class="site-header">
         <h1>Hyperliquid BTC Perp Tracker</h1>
-        <div class="small muted">BTC: <span id="btcPrice">-</span></div>
+        <div class="row" style="align-items:center; gap:12px;">
+          <div class="small muted">BTC: <span id="btcPrice">-</span></div>
+          <div class="small muted">IP: <a href="#" id="ipInfoLink" aria-label="Refresh IP and region">-</a></div>
+        </div>
       </header>
 
       <div class="card" aria-labelledby="addressEntryTitle">
@@ -94,6 +97,7 @@
       const addrFilterSel = document.getElementById('addrFilter');
       const timeModeSel = document.getElementById('timeModeSel');
       const btcPriceSpan = document.getElementById('btcPrice');
+      const ipInfoLink = document.getElementById('ipInfoLink');
       let posSort = { key: 'updated', dir: 'desc' };
       let tradeSort = { key: 'time', dir: 'desc' };
       let tradesState = { items: [], nextBeforeId: null };
@@ -245,6 +249,25 @@
         } catch (e) {}
       }
 
+      async function refreshIpDisplay() {
+        try {
+          const r = await fetch('/api/ipinfo');
+          const j = await r.json();
+          const ip = j && typeof j.ip === 'string' ? j.ip : '-';
+          const region = j && typeof j.region === 'string' ? j.region : null;
+          const country = j && typeof j.country === 'string' ? j.country : null;
+          const city = j && typeof j.city === 'string' ? j.city : null;
+          let suffix = '';
+          if (city && country) suffix = `${city}, ${country}`;
+          else if (country) suffix = country;
+          else if (region) suffix = region;
+          ipInfoLink.textContent = suffix ? `${ip} (${suffix})` : ip;
+          ipInfoLink.title = 'Click to refresh IP via server';
+        } catch (e) {
+          ipInfoLink.textContent = '-';
+        }
+      }
+
       addBtn.addEventListener('click', async () => {
         const address = (addrInput.value || '').trim();
         addMsg.textContent = '';
@@ -268,6 +291,18 @@
           addMsg.textContent = 'Network error';
         }
       });
+
+      // IP refresh click (server-originated call)
+      if (ipInfoLink) {
+        ipInfoLink.addEventListener('click', async (e) => {
+          e.preventDefault();
+          try {
+            ipInfoLink.textContent = '…';
+            await fetch('/api/ipinfo/refresh', { method: 'POST' });
+          } catch (e) { /* ignore */ }
+          await refreshIpDisplay();
+        });
+      }
 
       async function removeAddress(address) {
         await fetch(`/api/addresses/${encodeURIComponent(address)}`, { method: 'DELETE' });
@@ -356,6 +391,9 @@
       setInterval(refresh, 5000);
       refreshPrice();
       setInterval(refreshPrice, 3000);
+      // Initial IP info + periodic UI refresh (server fetch interval is independent)
+      refreshIpDisplay();
+      setInterval(refreshIpDisplay, 60000);
       async function loadTradesPage({ reset } = { reset: false }) {
         try {
           const params = new URLSearchParams();

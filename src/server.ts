@@ -13,6 +13,7 @@ import { RealtimeTracker } from './realtime';
 const app = express();
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 const POLL_INTERVAL_MS = process.env.POLL_INTERVAL_MS ? Number(process.env.POLL_INTERVAL_MS) : 90_000;
+const IPINFO_INTERVAL_MS = process.env.IPINFO_INTERVAL_MS ? Number(process.env.IPINFO_INTERVAL_MS) : 600_000; // 10 minutes
 
 app.use(cors());
 app.use(express.json());
@@ -20,6 +21,42 @@ app.use(express.json());
 // In-memory state mirrors persisted addresses and latest recommendations
 let recommendations: Recommendation[] = [];
 const changes = new EventQueue(5000);
+
+// Server-side IP/region tracking via ipinfo.io (VPN awareness)
+type IpInfo = {
+  ip: string | null;
+  region: string | null;
+  country?: string | null;
+  city?: string | null;
+  updatedAt: string | null;
+};
+let ipInfoState: IpInfo = { ip: null, region: null, country: null, city: null, updatedAt: null };
+
+async function refreshIpInfo(): Promise<IpInfo> {
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 8000);
+    const res = await fetch('https://ipinfo.io/json', {
+      method: 'GET',
+      headers: { 'Accept': 'application/json', 'User-Agent': 'hlbot/0.1 (+https://github.com/)' },
+      signal: ctrl.signal,
+    } as any);
+    clearTimeout(t);
+    if (!res.ok) throw new Error(`ipinfo HTTP ${res.status}`);
+    const j: any = await res.json();
+    ipInfoState = {
+      ip: typeof j?.ip === 'string' ? j.ip : null,
+      region: typeof j?.region === 'string' ? j.region : null,
+      country: typeof j?.country === 'string' ? j.country : null,
+      city: typeof j?.city === 'string' ? j.city : null,
+      updatedAt: new Date().toISOString(),
+    };
+  } catch (e) {
+    // Keep previous state on failure; stamp updatedAt to reflect attempt
+    ipInfoState = { ...ipInfoState, updatedAt: new Date().toISOString() };
+  }
+  return ipInfoState;
+}
 
 async function getAddresses(): Promise<Address[]> {
   return await storageList();
@@ -103,6 +140,19 @@ app.get('/api/recommendations', (_req, res) => {
 
 app.get('/api/price', (_req, res) => {
   res.json(getCurrentBtcPrice());
+});
+
+// IP info endpoints (server-originated)
+app.get('/api/ipinfo', (_req, res) => {
+  res.json(ipInfoState);
+});
+app.post('/api/ipinfo/refresh', async (_req, res) => {
+  try {
+    const info = await refreshIpInfo();
+    res.json(info);
+  } catch (e) {
+    res.status(500).json({ error: 'ipinfo refresh failed' });
+  }
 });
 
 // Stream changes (poll-style API): /api/changes?since=0&limit=200
@@ -293,6 +343,9 @@ realtime.start().catch((e) => console.warn('[realtime] start failed', e));
 initStorage()
   .then(async () => {
     await startPriceFeed(getAddresses);
+    // Initial IP info fetch and periodic refresh
+    await refreshIpInfo().catch(() => {});
+    setInterval(() => { void refreshIpInfo(); }, IPINFO_INTERVAL_MS);
     app.listen(PORT, () => {
       console.log(`hlbot server listening on http://localhost:${PORT}`);
     });
