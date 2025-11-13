@@ -1,0 +1,158 @@
+import asyncio
+import json
+import os
+from datetime import datetime, timedelta
+from typing import Dict
+from uuid import uuid4
+
+import asyncpg
+import nats
+from fastapi import FastAPI
+from prometheus_client import Counter, Histogram, generate_latest, CollectorRegistry, CONTENT_TYPE_LATEST
+from starlette.responses import Response
+
+from contracts.py.models import FillEvent, ScoreEvent, SignalEvent, OutcomeEvent
+
+SERVICE_NAME = "hl-decide"
+NATS_URL = os.getenv("NATS_URL", "nats://localhost:4222")
+DB_URL = os.getenv("DATABASE_URL", "postgresql://hlbot:hlbotpassword@localhost:5432/hlbot")
+
+app = FastAPI(title="hl-decide", version="0.1.0")
+scores: Dict[str, ScoreEvent] = {}
+fills: Dict[str, FillEvent] = {}
+registry = CollectorRegistry()
+signal_counter = Counter("decide_signals_total", "Signals emitted", registry=registry)
+outcome_counter = Counter("decide_outcomes_total", "Outcomes emitted", registry=registry)
+decision_latency = Histogram(
+    "decide_latency_seconds",
+    "Latency between receiving score and emitting signal",
+    registry=registry,
+    buckets=(0.01, 0.05, 0.1, 0.5),
+)
+
+
+async def ensure_stream(js, name: str, subjects):
+    try:
+        await js.stream_info(name)
+    except Exception:
+        await js.add_stream(name=name, subjects=subjects)
+
+
+def pick_side(score: ScoreEvent) -> str:
+    return "long" if score.score >= 0 else "short"
+
+
+async def persist_ticket(conn, ticket_id: str, signal: SignalEvent):
+    await conn.execute(
+        """
+        INSERT INTO tickets (id, ts, address, asset, side, payload)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        """,
+        ticket_id,
+        signal.signal_ts,
+        signal.address,
+        signal.asset,
+        signal.side,
+        json.dumps(signal.model_dump()),
+    )
+
+
+async def persist_outcome(conn, outcome: OutcomeEvent):
+    await conn.execute(
+        """
+        INSERT INTO ticket_outcomes (ticket_id, closed_ts, result_r, closed_reason, notes)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (ticket_id) DO UPDATE SET
+          closed_ts = EXCLUDED.closed_ts,
+          result_r = EXCLUDED.result_r,
+          closed_reason = EXCLUDED.closed_reason,
+          notes = EXCLUDED.notes
+        """,
+        outcome.ticket_id,
+        outcome.closed_ts,
+        outcome.result_r,
+        outcome.closed_reason,
+        outcome.notes,
+    )
+
+
+async def emit_signal(address: str):
+    score = scores.get(address)
+    fill = fills.get(address)
+    if not score or not fill:
+        return
+    with decision_latency.time():
+        signal_ts = datetime.utcnow()
+        ticket_id = str(uuid4())
+        signal = SignalEvent(
+            ticket_id=ticket_id,
+            address=address,
+            asset=fill.asset,
+            side=pick_side(score),
+            confidence=min(max(abs(score.score), 0.1), 1.0),
+            score_ts=score.ts,
+            signal_ts=signal_ts,
+            expires_at=signal_ts + timedelta(seconds=10),
+            reason="consensus",
+            payload={"fill_id": fill.fill_id, "weight": score.weight},
+        )
+        await app.state.js.publish("d.signals.v1", signal.model_dump_json().encode("utf-8"))
+        async with app.state.db.acquire() as conn:
+            await persist_ticket(conn, ticket_id, signal)
+        signal_counter.inc()
+        asyncio.create_task(schedule_close(ticket_id, signal))
+
+
+async def schedule_close(ticket_id: str, signal: SignalEvent):
+    await asyncio.sleep(10)
+    outcome = OutcomeEvent(
+        ticket_id=ticket_id,
+        closed_ts=datetime.utcnow(),
+        result_r=0.0,
+        closed_reason="timebox",
+        notes="Timeboxed exit",
+    )
+    await app.state.js.publish("d.outcomes.v1", outcome.model_dump_json().encode("utf-8"))
+    async with app.state.db.acquire() as conn:
+        await persist_outcome(conn, outcome)
+    outcome_counter.inc()
+
+
+async def handle_score(msg):
+    data = ScoreEvent.model_validate_json(msg.data.decode())
+    scores[data.address] = data
+    await emit_signal(data.address)
+
+
+async def handle_fill(msg):
+    data = FillEvent.model_validate_json(msg.data.decode())
+    fills[data.address] = data
+    await emit_signal(data.address)
+
+
+@app.on_event("startup")
+async def startup():
+    app.state.db = await asyncpg.create_pool(DB_URL)
+    app.state.nc = await nats.connect(NATS_URL)
+    app.state.js = app.state.nc.jetstream()
+    await ensure_stream(app.state.js, "HL_D", ["d.signals.v1", "d.outcomes.v1"])
+    await app.state.nc.subscribe("b.scores.v1", cb=handle_score)
+    await app.state.nc.subscribe("c.fills.v1", cb=handle_fill)
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    if hasattr(app.state, "nc"):
+        await app.state.nc.drain()
+    if hasattr(app.state, "db"):
+        await app.state.db.close()
+
+
+@app.get("/healthz")
+async def health():
+    return {"status": "ok", "scores": len(scores), "fills": len(fills)}
+
+
+@app.get("/metrics")
+async def metrics():
+    return Response(content=generate_latest(registry), media_type=CONTENT_TYPE_LATEST)

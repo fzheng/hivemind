@@ -1,0 +1,64 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "d.signals.v1",
+  "title": "SignalEvent",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "ticket_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "address": {
+      "type": "string",
+      "pattern": "^0x[a-fA-F0-9]{40}$"
+    },
+    "asset": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 16
+    },
+    "side": {
+      "type": "string",
+      "enum": ["long", "short", "flat"]
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "score_ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "signal_ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "reason": {
+      "type": "string",
+      "enum": ["consensus", "fallback"]
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": true,
+      "default": {}
+    }
+  },
+  "required": [
+    "ticket_id",
+    "address",
+    "asset",
+    "side",
+    "confidence",
+    "score_ts",
+    "signal_ts",
+    "expires_at",
+    "reason",
+    "payload"
+  ]
+}

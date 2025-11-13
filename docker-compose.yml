@@ -1,7 +1,16 @@
+version: "3.9"
+
+networks:
+  hl_net:
+    driver: bridge
+
+volumes:
+  pgdata:
+  natsdata:
+
 services:
-  db:
+  postgres:
     image: postgres:16-alpine
-    container_name: hlbot-db
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-hlbot}
@@ -14,45 +23,96 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks: [hl_net]
     ports:
-      - "${PG_PORT:-5432}:5432" # optional local access
+      - "127.0.0.1:${PG_PORT:-5432}:5432"
 
-  redis:
-    image: redis:7-alpine
-    container_name: hlbot-redis
+  nats:
+    image: nats:2.10-alpine
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
+    command: ["-js", "-sd", "/nats/data", "-m", "8222"]
     volumes:
-      - redisdata:/data
-    healthcheck:
-      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      - natsdata:/nats/data
+    networks: [hl_net]
     ports:
-      - "${REDIS_PORT:-6379}:6379" # optional local access
+      - "127.0.0.1:${NATS_PORT:-4222}:4222"
+      - "127.0.0.1:${NATS_MONITOR_PORT:-8222}:8222"
 
-  app:
-    build: .
-    image: hlbot:latest
-    container_name: hlbot-app
+  hl-scout:
+    build:
+      context: .
+      dockerfile: services/hl-scout/Dockerfile
     restart: unless-stopped
-    depends_on:
-      db:
-        condition: service_healthy
-      # - redis # enable if using Redis backend
     environment:
       NODE_ENV: production
-      PORT: ${PORT:-3000}
-      POLL_INTERVAL_MS: ${POLL_INTERVAL_MS:-90000}
-      STORAGE_BACKEND: ${STORAGE_BACKEND:-postgres}
-      # Postgres connection
-      DATABASE_URL: ${DATABASE_URL:-postgresql://hlbot:hlbotpassword@db:5432/hlbot}
-      # Redis (optional)
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      PORT: 8080
+      OWNER_TOKEN: ${OWNER_TOKEN:-dev-owner}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://hlbot:hlbotpassword@postgres:5432/hlbot}
+      NATS_URL: nats://nats:4222
+      SERVICE_NAME: hl-scout
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_started
+    networks: [hl_net]
     ports:
-      - "${APP_PORT:-3000}:3000"
+      - "127.0.0.1:${SCOUT_PORT:-4101}:8080"
 
-volumes:
-  pgdata:
-  redisdata:
+  hl-stream:
+    build:
+      context: .
+      dockerfile: services/hl-stream/Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 8080
+      OWNER_TOKEN: ${OWNER_TOKEN:-dev-owner}
+      NATS_URL: nats://nats:4222
+      SCOUT_URL: http://hl-scout:8080
+      SERVICE_NAME: hl-stream
+    depends_on:
+      nats:
+        condition: service_started
+      hl-scout:
+        condition: service_started
+    networks: [hl_net]
+    ports:
+      - "127.0.0.1:${STREAM_PORT:-4102}:8080"
+
+  hl-sage:
+    build:
+      context: .
+      dockerfile: services/hl-sage/Dockerfile
+    restart: unless-stopped
+    environment:
+      PORT: 8080
+      OWNER_TOKEN: ${OWNER_TOKEN:-dev-owner}
+      NATS_URL: nats://nats:4222
+      SERVICE_NAME: hl-sage
+    depends_on:
+      nats:
+        condition: service_started
+    networks: [hl_net]
+    ports:
+      - "127.0.0.1:${SAGE_PORT:-4103}:8080"
+
+  hl-decide:
+    build:
+      context: .
+      dockerfile: services/hl-decide/Dockerfile
+    restart: unless-stopped
+    environment:
+      PORT: 8080
+      OWNER_TOKEN: ${OWNER_TOKEN:-dev-owner}
+      NATS_URL: nats://nats:4222
+      DATABASE_URL: ${DATABASE_URL:-postgresql://hlbot:hlbotpassword@postgres:5432/hlbot}
+      SERVICE_NAME: hl-decide
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_started
+    networks: [hl_net]
+    ports:
+      - "127.0.0.1:${DECIDE_PORT:-4104}:8080"

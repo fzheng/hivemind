@@ -16,10 +16,10 @@ function getDatabaseUrl() {
 }
 
 function getMigrationsDir() {
-  // Default directory moved from root 'migrations' to 'scripts/migrations'
+  // Default directory moved to /db/migrations for monorepo
   // Set MIGRATIONS_DIR to override if needed.
   return process.env.MIGRATIONS_DIR
-    || path.resolve(process.cwd(), 'scripts', 'migrations');
+    || path.resolve(process.cwd(), 'db', 'migrations');
 }
 
 function getMigrationsList(dir) {

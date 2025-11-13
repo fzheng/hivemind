@@ -29,3 +29,10 @@ export function nowIso() {
   return new Date().toISOString();
 }
 
+export async function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function normalizeAddress(value: string): string {
+  return value.trim().toLowerCase();
+}

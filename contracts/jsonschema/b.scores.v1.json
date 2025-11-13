@@ -1,0 +1,41 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "b.scores.v1",
+  "title": "ScoreEvent",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "address": {
+      "type": "string",
+      "pattern": "^0x[a-fA-F0-9]{40}$"
+    },
+    "score": {
+      "type": "number",
+      "minimum": -1,
+      "maximum": 1
+    },
+    "weight": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "rank": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "window_s": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "meta": {
+      "type": "object",
+      "additionalProperties": true,
+      "default": {}
+    }
+  },
+  "required": ["address", "score", "weight", "rank", "window_s", "ts"]
+}

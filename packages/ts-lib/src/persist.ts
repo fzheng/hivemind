@@ -1,13 +1,13 @@
-// Use dynamic import to avoid hard dependency in non-Postgres envs
-let pool: any = null;
+import type { Pool } from 'pg';
+import { getPool as getSharedPool } from './postgres';
 
-async function getPool(): Promise<any> {
-  if (pool) return pool;
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { Pool: PgPool } = require('pg');
-  const connectionString = process.env.PG_CONNECTION_STRING || process.env.DATABASE_URL;
-  pool = new PgPool({ connectionString });
-  return pool;
+let poolPromise: Promise<Pool> | null = null;
+
+async function getPool(): Promise<Pool> {
+  if (!poolPromise) {
+    poolPromise = getSharedPool();
+  }
+  return poolPromise;
 }
 
 export type InsertableEvent = {

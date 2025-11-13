@@ -1,0 +1,64 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "c.fills.v1",
+  "title": "FillEvent",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "fill_id": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 64
+    },
+    "source": {
+      "type": "string",
+      "enum": ["fake", "hyperliquid"]
+    },
+    "address": {
+      "type": "string",
+      "pattern": "^0x[a-fA-F0-9]{40}$"
+    },
+    "asset": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 16
+    },
+    "side": {
+      "type": "string",
+      "enum": ["buy", "sell"]
+    },
+    "size": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "price": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "start_position": {
+      "type": ["number", "null"]
+    },
+    "realized_pnl": {
+      "type": ["number", "null"]
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "meta": {
+      "type": "object",
+      "additionalProperties": true,
+      "default": {}
+    }
+  },
+  "required": [
+    "fill_id",
+    "source",
+    "address",
+    "asset",
+    "side",
+    "size",
+    "price",
+    "ts"
+  ]
+}
