@@ -5,8 +5,11 @@ module.exports = {
   roots: ['<rootDir>/tests'],
   moduleFileExtensions: ['ts', 'js', 'json'],
   collectCoverage: true,
-  collectCoverageFrom: ['src/**/*.ts', '!src/server.ts'],
+  collectCoverageFrom: [
+    'services/**/*.ts',
+    'packages/**/*.ts',
+    '!**/dist/**',
+  ],
   coverageReporters: ['text', 'lcov', 'json-summary'],
   setupFilesAfterEnv: ['<rootDir>/tests/jest.setup.ts'],
 };
-
