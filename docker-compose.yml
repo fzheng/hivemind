@@ -18,6 +18,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-hlbot}
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
       interval: 10s
@@ -33,6 +34,12 @@ services:
     command: ["-js", "-sd", "/nats/data", "-m", "8222"]
     volumes:
       - natsdata:/nats/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
     networks: [hl_net]
     ports:
       - "127.0.0.1:${NATS_PORT:-4222}:4222"
@@ -55,6 +62,12 @@ services:
         condition: service_healthy
       nats:
         condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
     networks: [hl_net]
     ports:
       - "127.0.0.1:${SCOUT_PORT:-4101}:8080"
@@ -70,12 +83,21 @@ services:
       OWNER_TOKEN: ${OWNER_TOKEN:-dev-owner}
       NATS_URL: nats://nats:4222
       SCOUT_URL: http://hl-scout:8080
+      DATABASE_URL: ${DATABASE_URL:-postgresql://hlbot:hlbotpassword@postgres:5432/hlbot}
       SERVICE_NAME: hl-stream
     depends_on:
+      postgres:
+        condition: service_healthy
       nats:
         condition: service_started
       hl-scout:
         condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
     networks: [hl_net]
     ports:
       - "127.0.0.1:${STREAM_PORT:-4102}:8080"
@@ -93,6 +115,12 @@ services:
     depends_on:
       nats:
         condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
     networks: [hl_net]
     ports:
       - "127.0.0.1:${SAGE_PORT:-4103}:8080"
@@ -113,6 +141,12 @@ services:
         condition: service_healthy
       nats:
         condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
     networks: [hl_net]
     ports:
       - "127.0.0.1:${DECIDE_PORT:-4104}:8080"

@@ -211,3 +211,169 @@ export async function deleteTradesForAddress(address: string): Promise<number> {
     return 0;
   }
 }
+
+export interface AddressPerformance {
+  address: string;
+  trades: number;
+  wins: number;
+  winRate: number;
+  pnl7d: number;
+  avgSize: number;
+  efficiency: number;
+}
+
+export async function getAddressPerformance(days = 7): Promise<AddressPerformance[]> {
+  try {
+    const p = await getPool();
+    const { rows } = await p.query(
+      `
+        select
+          address,
+          count(*) as trades,
+          sum(case when (payload->>'realizedPnlUsd')::numeric > 0 then 1 else 0 end) as wins,
+          coalesce(sum((payload->>'realizedPnlUsd')::numeric),0) as pnl_total,
+          coalesce(sum(case when at >= now() - $1::interval then (payload->>'realizedPnlUsd')::numeric else 0 end),0) as pnl_7d,
+          coalesce(avg((payload->>'size')::numeric),0) as avg_size
+        from hl_events
+        where type = 'trade'
+        group by address
+        order by pnl_7d desc, address asc
+      `,
+      [`${Math.max(1, days)} days`]
+    );
+    return rows.map((row: any) => {
+      const trades = Number(row.trades) || 0;
+      const wins = Number(row.wins) || 0;
+      const pnlTotal = Number(row.pnl_total) || 0;
+      const efficiency = trades > 0 ? pnlTotal / trades : pnlTotal;
+      return {
+        address: row.address,
+        trades,
+        wins,
+        winRate: trades ? wins / trades : 0,
+        pnl7d: Number(row.pnl_7d) || 0,
+        avgSize: Number(row.avg_size) || 0,
+        efficiency,
+      };
+    });
+  } catch (_e) {
+    return [];
+  }
+}
+
+export interface RecentFill {
+  id: number;
+  address: string;
+  at: string;
+  side: 'buy' | 'sell';
+  size: number;
+  priceUsd: number;
+  realizedPnlUsd: number | null;
+  action?: string | null;
+}
+
+export async function listRecentFills(limit = 25): Promise<RecentFill[]> {
+  try {
+    const p = await getPool();
+    const { rows } = await p.query(
+      `
+        select id, address, at, payload
+        from hl_events
+        where type = 'trade'
+        order by at desc
+        limit $1
+      `,
+      [Math.max(1, Math.min(200, limit))]
+    );
+    return rows.map((row: any) => ({
+      id: Number(row.id),
+      address: row.address,
+      at: row.at,
+      side: ((row.payload?.side === 'sell') ? 'sell' : 'buy') as 'buy' | 'sell',
+      size: Number(row.payload?.size ?? row.payload?.payload?.size ?? 0),
+      priceUsd: Number(row.payload?.priceUsd ?? row.payload?.price ?? 0),
+      realizedPnlUsd: row.payload?.realizedPnlUsd != null ? Number(row.payload?.realizedPnlUsd) : null,
+      action: row.payload?.action ?? null,
+    }));
+  } catch (_e) {
+    return [];
+  }
+}
+
+export interface DecisionRecord {
+  id: string;
+  address: string;
+  asset: string;
+  side: string;
+  ts: string;
+  status: 'open' | 'closed';
+  closedReason?: string | null;
+  result?: number | null;
+}
+
+export async function listRecentDecisions(limit = 20): Promise<DecisionRecord[]> {
+  try {
+    const p = await getPool();
+    const { rows } = await p.query(
+      `
+        select
+          t.id,
+          t.address,
+          t.asset,
+          t.side,
+          t.ts,
+          o.closed_reason,
+          o.result_r,
+          o.closed_ts
+        from tickets t
+        left join ticket_outcomes o on o.ticket_id = t.id
+        order by t.ts desc
+        limit $1
+      `,
+      [Math.max(1, Math.min(100, limit))]
+    );
+    return rows.map((row: any) => ({
+      id: row.id,
+      address: row.address,
+      asset: row.asset,
+      side: row.side,
+      ts: row.ts,
+      status: row.closed_reason ? 'closed' : 'open',
+      closedReason: row.closed_reason,
+      result: row.result_r != null ? Number(row.result_r) : null
+    }));
+  } catch (_e) {
+    return [];
+  }
+}
+
+export async function fetchLatestFillForAddress(address: string): Promise<RecentFill | null> {
+  try {
+    const p = await getPool();
+    const { rows } = await p.query(
+      `
+        select id, address, at, payload
+        from hl_events
+        where type = 'trade'
+          and address = $1
+        order by at desc
+        limit 1
+      `,
+      [address.toLowerCase()]
+    );
+    const row = rows[0];
+    if (!row) return null;
+    return {
+      id: Number(row.id),
+      address: row.address,
+      at: row.at,
+      side: ((row.payload?.side === 'sell') ? 'sell' : 'buy') as 'buy' | 'sell',
+      size: Number(row.payload?.size ?? 0),
+      priceUsd: Number(row.payload?.priceUsd ?? 0),
+      realizedPnlUsd: row.payload?.realizedPnlUsd != null ? Number(row.payload?.realizedPnlUsd) : null,
+      action: row.payload?.action ?? null,
+    };
+  } catch (_e) {
+    return null;
+  }
+}

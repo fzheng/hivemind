@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hyperliquid Scout Dashboard</title>
+    <link rel="stylesheet" href="/dashboard/static/dashboard.css" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    <header>
+      <div class="header-left">
+        <h1>Hyperliquid Ops Dashboard</h1>
+        <p id="dashboard-status">Loading stats…</p>
+      </div>
+      <div class="period-toggle">
+        <button class="active" data-period="30">30d</button>
+        <button data-period="7">7d</button>
+      </div>
+    </header>
+    <main>
+      <section class="card">
+        <div class="toggle-group">
+          <button class="active" data-symbol="BTCUSDT">BTC</button>
+          <button data-symbol="ETHUSDT">ETH</button>
+        </div>
+        <div id="tradingview_chart" class="chart-container"></div>
+      </section>
+
+      <section class="grid-2">
+        <div class="card">
+          <h3>Top Performance</h3>
+          <span class="metric-hint">Efficiency = realized PnL / trades</span>
+          <table class="stats-table">
+            <thead>
+              <tr>
+                <th>Address</th>
+                <th>Win Rate</th>
+                <th>Trades</th>
+                <th>Efficiency</th>
+                <th>Holdings</th>
+                <th>Realized PnL</th>
+              </tr>
+            </thead>
+            <tbody id="address-table"></tbody>
+          </table>
+        </div>
+        <div class="card">
+          <h3>Recommendation</h3>
+          <div class="recommendation" id="recommendation-card">
+            <p>Waiting for data…</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="grid-2">
+        <div class="card">
+          <h3>Live Fills</h3>
+          <ul class="fills-list" id="fills-feed"></ul>
+        </div>
+        <div class="card">
+          <h3>Decisions</h3>
+          <ul class="decisions-list" id="decisions-list"></ul>
+        </div>
+      </section>
+    </main>
+    <script src="https://s3.tradingview.com/tv.js"></script>
+    <script type="module" src="/dashboard/static/dashboard.js"></script>
+  </body>
+</html>

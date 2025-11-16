@@ -2,7 +2,7 @@ import * as hl from '@nktkas/hyperliquid';
 import { clearinghouseState as infoClearinghouse } from '@nktkas/hyperliquid/api/info';
 import { clearinghouseState as subClearinghouse, userEvents as subUserEvents } from '@nktkas/hyperliquid/api/subscription';
 import { getCurrentBtcPrice } from './price';
-import { EventQueue } from './queue';
+import { EventQueue, type ChangeEvent } from './queue';
 import { insertEvent, upsertCurrentPosition, insertTradeIfNew } from './persist';
 
 type Address = string;
@@ -20,6 +20,10 @@ function sideFromSize(size: number): 'long' | 'short' | 'flat' {
   return 'flat';
 }
 
+interface RealtimeOptions {
+  onTrade?: (payload: { address: string; event: ChangeEvent }) => void;
+}
+
 export class RealtimeTracker {
   private ws: any; // shared WebSocketTransport for clearinghouseState
   private http: any; // HttpTransport
@@ -30,14 +34,16 @@ export class RealtimeTracker {
   private q: EventQueue;
   private primeInflight: Map<Address, Promise<void>>;
   private lastPrimeAt: Map<Address, number>;
+  private onTrade?: (payload: { address: string; event: ChangeEvent }) => void;
 
-  constructor(getAddresses: () => Promise<Address[]>, queue: EventQueue) {
+  constructor(getAddresses: () => Promise<Address[]>, queue: EventQueue, opts?: RealtimeOptions) {
     this.getAddresses = getAddresses;
     this.q = queue;
     this.subs = new Map();
     this.snapshots = new Map();
     this.primeInflight = new Map();
     this.lastPrimeAt = new Map();
+    this.onTrade = opts?.onTrade;
   }
 
   async start() {
@@ -261,6 +267,7 @@ export class RealtimeTracker {
           action: actionLabel,
           dbId: persistResult.id ?? undefined,
         });
+        this.onTrade?.({ address: addr, event: evt });
         touched = true;
       }
       if (touched) {

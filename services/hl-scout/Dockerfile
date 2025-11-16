@@ -2,6 +2,7 @@ FROM node:20-alpine
 WORKDIR /app
 
 # Install dependencies and build TypeScript sources
+RUN apk add --no-cache curl
 COPY package*.json ./
 COPY tsconfig*.json ./
 COPY tsconfig.base.json ./

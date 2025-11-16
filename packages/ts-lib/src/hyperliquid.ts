@@ -1,5 +1,5 @@
 import * as hl from '@nktkas/hyperliquid';
-import { clearinghouseState, userFills } from '@nktkas/hyperliquid/api/info';
+import { clearinghouseState, userFills, userDetails, metaAndAssetCtxs } from '@nktkas/hyperliquid/api/info';
 import type { PositionInfo } from './types';
 
 // Reuse a single HTTP transport for SDK calls
@@ -130,4 +130,70 @@ export async function fetchUserBtcFills(
   } catch {
     return [];
   }
+}
+
+export interface UserProfileSummary {
+  txCount: number;
+  lastTxTime: string | null;
+}
+
+export async function fetchUserProfile(address: string): Promise<UserProfileSummary> {
+  try {
+    const data = await userDetails(
+      { transport },
+      { user: toUser(address) }
+    );
+    const txs = data?.txs ?? [];
+    const last = txs[0];
+    return {
+      txCount: txs.length,
+      lastTxTime: last?.time ? new Date(Number(last.time)).toISOString() : null
+    };
+  } catch {
+    return { txCount: 0, lastTxTime: null };
+  }
+}
+
+export async function fetchSpotPrice(symbol: 'BTCUSDT' | 'ETHUSDT'): Promise<number> {
+  const url = `https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Ticker HTTP ${res.status}`);
+  const data = (await res.json()) as { price?: string };
+  const price = Number(data.price);
+  if (!Number.isFinite(price)) throw new Error('Invalid ticker price');
+  return price;
+}
+
+type MarkCache = {
+  ts: number;
+  prices: Record<string, number>;
+};
+
+let markCache: MarkCache | null = null;
+
+async function loadMetaMarks(): Promise<MarkCache> {
+  const [meta, ctxs] = await metaAndAssetCtxs({ transport });
+  const prices: Record<string, number> = {};
+  (meta?.universe || []).forEach((asset: any, idx: number) => {
+    const name = String(asset?.name || '').toUpperCase();
+    const ctx = ctxs?.[idx];
+    const mark = Number(ctx?.markPx ?? ctx?.markPx ?? ctx?.midPx);
+    if (Number.isFinite(mark)) prices[name] = mark;
+  });
+  const cache = { ts: Date.now(), prices };
+  markCache = cache;
+  return cache;
+}
+
+export async function fetchPerpMarkPrice(symbol: 'BTC' | 'ETH'): Promise<number> {
+  const now = Date.now();
+  if (!markCache || now - markCache.ts > 1500) {
+    await loadMetaMarks();
+  }
+  const price = markCache?.prices?.[symbol.toUpperCase()];
+  if (price == null) {
+    await loadMetaMarks();
+    return markCache?.prices?.[symbol.toUpperCase()] ?? 0;
+  }
+  return price;
 }

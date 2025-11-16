@@ -9,6 +9,8 @@ import {
   CandidateEventSchema,
   createLogger,
   fetchUserBtcFills,
+  fetchUserProfile,
+  fetchPerpMarkPrice,
   getOwnerToken,
   getPool,
   getPort,
@@ -21,13 +23,23 @@ import {
   ensureStream,
   connectNats,
   normalizeAddress,
-  nowIso
+  nowIso,
+  listRecentFills,
+  listRecentDecisions,
+  fetchLatestFillForAddress
 } from '@hl/ts-lib';
+import LeaderboardService from './leaderboard';
 
 const OWNER_TOKEN = getOwnerToken();
 const logger = createLogger('hl-scout');
 const metrics = initMetrics('hl_scout');
 const candidateLatency = createHistogram(metrics, 'candidate_publish_seconds', 'Latency for publishing candidates', [0.01, 0.05, 0.1, 0.25, 0.5, 1]);
+const DEFAULT_LEADERBOARD_PERIOD = Number(process.env.LEADERBOARD_DEFAULT_PERIOD ?? 30);
+const LEADERBOARD_PERIODS = (process.env.LEADERBOARD_PERIODS ?? '30')
+  .split(',')
+  .map((v) => Number(v.trim()))
+  .filter((v) => Number.isFinite(v) && v > 0);
+let leaderboardService: LeaderboardService | null = null;
 
 const swaggerDoc: OpenAPIV3.Document = {
   openapi: '3.0.0',
@@ -148,9 +160,48 @@ const swaggerDoc: OpenAPIV3.Document = {
         },
         responses: { 200: { description: 'Backfill triggered' } }
       }
+    },
+    '/dashboard/summary': {
+      get: {
+        summary: 'Aggregated performance stats per address',
+        responses: { 200: { description: 'Performance summary' } }
+      }
+    },
+    '/dashboard/fills': {
+      get: {
+        summary: 'Recent fills feed',
+        parameters: [
+          { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 200 } }
+        ],
+        responses: { 200: { description: 'Recent fills' } }
+      }
+    },
+    '/dashboard/decisions': {
+      get: {
+        summary: 'Recent decision tickets',
+        parameters: [
+          { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 100 } }
+        ],
+        responses: { 200: { description: 'Decision list' } }
+      }
+    },
+    '/dashboard/price': {
+      get: {
+        summary: 'Latest price snapshot',
+        parameters: [
+          { name: 'symbol', in: 'query', schema: { type: 'string', enum: ['BTCUSDT', 'ETHUSDT'], default: 'BTCUSDT' } }
+        ],
+        responses: { 200: { description: 'Current price' } }
+      }
     }
   }
 };
+
+function parsePeriod(value: any): number {
+  const n = Number(value);
+  if (Number.isFinite(n) && n > 0) return n;
+  return LEADERBOARD_PERIODS[0] || DEFAULT_LEADERBOARD_PERIOD || 30;
+}
 
 interface AddressPayload {
   address: string;
@@ -238,6 +289,22 @@ async function main() {
   await ensureStream(nats.jsm, 'HL_A', [topic]);
   await bootstrapCandidates(topic, nats.js);
 
+  const leaderboardOptions = {
+    apiUrl: process.env.LEADERBOARD_API_URL,
+    topN: Number(process.env.LEADERBOARD_TOP_N ?? 1000),
+    selectCount: Number(process.env.LEADERBOARD_SELECT_COUNT ?? 12),
+    periods: LEADERBOARD_PERIODS.length ? LEADERBOARD_PERIODS : [DEFAULT_LEADERBOARD_PERIOD || 30],
+    refreshMs: Number(process.env.LEADERBOARD_REFRESH_MS ?? 24 * 60 * 60 * 1000),
+    pageSize: Number(process.env.LEADERBOARD_PAGE_SIZE ?? 100),
+  };
+  leaderboardService = new LeaderboardService(leaderboardOptions, async (candidate) => {
+    await publishCandidate(topic, nats.js, candidate);
+  });
+  leaderboardService.start();
+  await leaderboardService.ensureSeeded().catch((err) => {
+    logger.error('leaderboard_seed_failed', { err: err?.message });
+  });
+
   const app = express();
   app.use(cors());
   app.use(express.json());
@@ -294,6 +361,128 @@ async function main() {
     const address = normalizeAddress(req.params.address);
     const inserted = await backfillRecent(address, Number(req.body?.limit) || 50);
     res.json({ ok: true, inserted });
+  });
+
+  app.post('/admin/leaderboard/refresh', ownerOnly, async (_req, res) => {
+    if (!leaderboardService) return res.status(503).json({ error: 'leaderboard unavailable' });
+    await leaderboardService.refreshAll().catch((err) => {
+      logger.error('leaderboard_manual_refresh_failed', { err: err?.message });
+      throw err;
+    });
+    res.json({ ok: true });
+  });
+
+  app.get('/leaderboard', async (req, res) => {
+    if (!leaderboardService) return res.status(503).json({ error: 'leaderboard unavailable' });
+    const period = parsePeriod(req.query.period);
+    const limit = Number(req.query.limit ?? 100);
+    const entries = await leaderboardService.getEntries(period, Math.max(1, Math.min(1000, limit)));
+    res.json({ period, entries });
+  });
+
+  app.get('/leaderboard/selected', async (req, res) => {
+    if (!leaderboardService) return res.status(503).json({ error: 'leaderboard unavailable' });
+    const period = parsePeriod(req.query.period);
+    const limit = Number(req.query.limit ?? process.env.LEADERBOARD_SELECT_COUNT ?? 12);
+    const entries = await leaderboardService.getSelected(period, Math.max(1, Math.min(50, limit)));
+    res.json({ period, entries });
+  });
+
+  app.get('/dashboard/summary', async (req, res) => {
+    if (!leaderboardService) return res.status(503).json({ error: 'leaderboard unavailable' });
+    const period = parsePeriod(req.query.period);
+    const limit = Number(req.query.limit ?? process.env.LEADERBOARD_SELECT_COUNT ?? 12);
+    const selected = await leaderboardService.getSelected(
+      period,
+      Math.max(1, Math.min(limit, Number(process.env.LEADERBOARD_SELECT_COUNT ?? 12)))
+    );
+    const stats = selected;
+    const top = selected[0] ?? stats[0] ?? null;
+    const featured = top ? await fetchLatestFillForAddress(top.address) : null;
+    const profileEntries = await Promise.all(
+      stats.slice(0, 5).map(async (row) => ({
+        address: row.address,
+        profile: await fetchUserProfile(row.address),
+      }))
+    );
+    const profiles: Record<string, unknown> = {};
+    for (const entry of profileEntries) {
+      profiles[entry.address] = entry.profile;
+    }
+    const holdings: Record<string, { symbol: string; size: number }> = {};
+    if (selected.length) {
+      const pool = await getPool();
+      const { rows } = await pool.query(
+        'select address, symbol, size from hl_current_positions where lower(address) = any($1)',
+        [selected.map((s) => s.address.toLowerCase())]
+      );
+      for (const row of rows) {
+        const addr = String(row.address || '').toLowerCase();
+        if (!addr) continue;
+        holdings[addr] = {
+          symbol: String(row.symbol || 'BTC').toUpperCase(),
+          size: Number(row.size || 0),
+        };
+      }
+    }
+    res.json({
+      period,
+      stats,
+      selected,
+      featured,
+      holdings,
+      recommendation: top
+        ? {
+            address: top.address,
+            winRate: top.winRate,
+            realizedPnl: top.realizedPnl,
+            weight: top.weight,
+            rank: top.rank,
+            message: `Route new fills for ${top.address} (rank #${top.rank})`,
+          }
+        : null,
+      profiles,
+    });
+  });
+
+  app.get('/dashboard/fills', async (req, res) => {
+    const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 25));
+    const period = parsePeriod(req.query.period);
+    const fills = await listRecentFills(limit);
+    const remarkMap = new Map<string, string>();
+    if (leaderboardService) {
+      const cohort = await leaderboardService.getSelected(
+        period,
+        Number(process.env.LEADERBOARD_SELECT_COUNT ?? 12)
+      );
+      for (const entry of cohort) {
+        if (entry.remark) {
+          remarkMap.set(entry.address.toLowerCase(), entry.remark);
+        }
+      }
+    }
+    const enriched = fills.map((fill) => ({
+      ...fill,
+      remark: remarkMap.get(fill.address.toLowerCase()) || null,
+    }));
+    res.json({ fills: enriched });
+  });
+
+  app.get('/dashboard/decisions', async (req, res) => {
+    const limit = Number(req.query.limit) || 20;
+    const decisions = await listRecentDecisions(limit);
+    res.json({ decisions });
+  });
+
+  app.get('/dashboard/price', async (req, res) => {
+    try {
+      const symbol = (req.query.symbol === 'ETHUSDT' ? 'ETH' : 'BTC') as 'BTC' | 'ETH';
+      const price = await fetchPerpMarkPrice(symbol);
+      res.json({ symbol: `${symbol}USDT`, price, ts: new Date().toISOString() });
+    } catch (err: any) {
+      logger.error('price_fetch_failed', { err: err?.message });
+      res.status(502).json({ error: 'price_fetch_failed' });
+    }
   });
 
   const port = getPort(8080);

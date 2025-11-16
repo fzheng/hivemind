@@ -11,7 +11,8 @@ services/
   hl-sage    Python      — scoring + ranks API
   hl-decide  Python      — decision engine + tickets/outcomes
 contracts/              — jsonschema + generated zod & pydantic bindings
-db/migrations           — shared schema (addresses, marks_1m, tickets, ...)
+docker/postgres-init    — SQL auto-run when Postgres initializes a fresh volume
+db/migrations           — archived schema snapshots
 ```
 
 ## Quick Start
@@ -21,6 +22,7 @@ npm install
 cp .env.example .env          # tweak OWNER_TOKEN etc if needed
 docker compose up --build
 ```
+The Postgres container runs every SQL file under `docker/postgres-init/` the first time it creates its data directory, so the schema loads automatically. Docker Compose has healthchecks for every container, so `docker compose ps` will show `(healthy)` once each service responds on `/healthz`.
 
 Health endpoints (`http://127.0.0.1:{port}/healthz`):
 
@@ -40,6 +42,7 @@ Health endpoints (`http://127.0.0.1:{port}/healthz`):
 | hl-stream | http://localhost:4102/docs | Swagger UI documenting watchlist + `/ws`. |
 | hl-sage | http://localhost:4103/docs | FastAPI interactive docs (candidates/scores). |
 | hl-decide | http://localhost:4104/docs | FastAPI interactive docs (signals/outcomes). |
+| Ops dashboard | http://localhost:4102/dashboard | Live TradingView chart, address stats, fills, and decision feed. |
 
 ### End-to-end smoke
 ```bash
@@ -66,16 +69,7 @@ Run `npm run contracts:generate` to refresh bindings (automatically wired as `pr
 
 ## Database
 
-`db/migrations` contains all SQL (addresses, events, marks_1m, tickets, ticket_outcomes, …). Apply via:
-```bash
-npm run migrate
-npm run migrate:status
-```
-
-### New tables
-- `marks_1m(asset, ts, mid, atr14)`
-- `tickets(id UUID, ts, address, asset, side, payload JSONB)`
-- `ticket_outcomes(ticket_id FK, closed_ts, result_r, closed_reason, notes)`
+When the Postgres container receives a fresh data directory it automatically executes every `.sql` file in `docker/postgres-init/` (currently `001_base.sql`). That script creates all shared tables (`addresses`, `hl_events`, `hl_current_positions`, `marks_1m`, `tickets`, `ticket_outcomes`, `hl_leaderboard_entries`, …), so you do **not** need to run `npm run migrate`. To reset the schema, run `docker compose down -v` and bring the stack back up—Postgres will reapply the base schema during initialization.
 
 ## Environment
 
@@ -88,6 +82,11 @@ Key variables (see `.env.example`):
 | `DATABASE_URL`   | `postgresql://hlbot:...@postgres`| Postgres DSN |
 | `SCOUT_SEEDS`    | 3 demo 0x addresses              | Initial candidates emitted on boot |
 | `SCOUT_URL`      | `http://hl-scout:8080`           | Used by hl-stream to refresh watchlist |
+| `LEADERBOARD_API_URL` | `https://hyperbot.network/...` | Hyperbot smart money API |
+| `LEADERBOARD_TOP_N` | `1000` | Number of leaderboard entries fetched per period |
+| `LEADERBOARD_SELECT_COUNT` | `12` | Auto-tracked addresses pushed to hl-stream/hl-sage |
+| `LEADERBOARD_PERIODS` | `7,30` | Leaderboard periods (days) to crawl |
+| `LEADERBOARD_REFRESH_MS` | `86400000` | Crawl cadence (ms) |
 | `*_PORT`         | `410{1-4}`                       | Host-forwarded HTTP ports |
 
 Compose keeps everything on an isolated bridge network and only binds owner HTTP ports to `127.0.0.1`.
@@ -101,22 +100,23 @@ Compose keeps everything on an isolated bridge network and only binds owner HTTP
 | `npm run dev:stream`   | Watch mode for hl-stream |
 | `npm run contracts:generate` | Rebuild zod/pydantic bindings |
 | `npm run e2e-smoke`    | Seed + wait for Candidate→Outcome flow |
-| `npm run migrate`      | Apply SQL migrations |
 
 ## Service Notes
 
 ### hl-scout (TS)
 - Express API for addresses (`GET/POST/DELETE /addresses`).
 - `POST /admin/seed` & `/admin/backfill/:address` require `x-owner-key`.
-- Publishes `a.candidates.v1` for seeds and new additions.
+- Crawls the Hyperbot "smart" leaderboard on a schedule (configurable periods/top-N), scoring entries by win rate, PnL efficiency, and pnlList consistency, then publishes `a.candidates.v1` with weights/metadata.
+- On startup, automatically seeds the leaderboard if no entries exist.
 - Reuses Hyperliquid info/backfill helpers to warm Postgres (`hl_events`).  
 - Swagger UI at http://localhost:4101/docs.
 
 ### hl-stream (TS)
-- Watches hl-scout for address updates via `POST /watchlist/refresh`.
+- Pulls the weighted leaderboard selection from hl-scout and mirrors those addresses’ Hyperliquid realtime feeds.
 - Exposes `/ws` with the legacy event queue semantics.
-- Emits fake fills every second per watched address → `c.fills.v1` + WS broadcast.
+- Emits authentic fills for tracked addresses → `c.fills.v1` + WS broadcast.
 - Swagger UI at http://localhost:4102/docs.
+- Serves the operator dashboard at `/dashboard` and proxies summary/fills/decision data.
 
 ### hl-sage (Py/FastAPI)
 - Subscribes to `a.candidates.v1`, computes deterministic equal weights, emits `b.scores.v1`.
@@ -128,6 +128,25 @@ Compose keeps everything on an isolated bridge network and only binds owner HTTP
 - Consumes `b.scores.v1` + `c.fills.v1`, emits `d.signals.v1` with naive majority.
 - Persists tickets & time-boxed outcomes in Postgres; publishes `d.outcomes.v1`.
 - FastAPI docs at http://localhost:4104/docs.
+
+### Operator Dashboard
+Open http://localhost:4102/dashboard to monitor the stack:
+
+- TradingView BTC/ETH toggle chart (official widget).
+- Address performance table (win rate, trades, efficiency, realized PnL, Hyperliquid tx counts).
+- Live fills feed streamed from Hyperliquid userEvents via `/ws`.
+- Decision panel (tickets + outcomes) and a recommendation card highlighting the best-performing address. Address rows include Hyperliquid profile metadata (via the `userDetails` Info API). The highlighted address also powers the “push to user” recommendation data returned by `GET /dashboard/summary`.
+- Use the top-right toggle to switch the leaderboard view between 30-day and 7-day periods.
+
+## Smart Leaderboard Ingest
+
+`hl-scout` crawls Hyperbot’s smart leaderboard (`https://hyperbot.network/api/leaderboard/smart`) for each configured period (defaults: 7d and 30d). For every refresh it:
+
+1. Fetches the top `LEADERBOARD_TOP_N` addresses sorted by realized PnL.
+2. Computes derived metrics (win rate safety, trade efficiency, realized PnL, pnlList consistency) and scores each wallet.
+3. Persists the scored rows to `hl_leaderboard_entries`, exposes them via `/leaderboard`/`/leaderboard/selected`, and emits `a.candidates.v1` events with weights + metadata.
+
+`hl-stream` consumes the selected list (default 12 addresses) to drive realtime Hyperliquid subscriptions, while `hl-sage` combines the weights with live fills and inferred positions to publish `b.scores.v1` follow signals.
 
 ## Development Tips
 

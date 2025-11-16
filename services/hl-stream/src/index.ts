@@ -4,19 +4,21 @@ import http from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import swaggerUi from 'swagger-ui-express';
 import type { OpenAPIV3 } from 'openapi-types';
+import path from 'path';
+import fs from 'fs';
+import { setMaxListeners } from 'events';
 import {
   EventQueue,
+  RealtimeTracker,
   createHistogram,
   createLogger,
   getOwnerToken,
   getPort,
   initMetrics,
   normalizeAddress,
-  nowIso,
   connectNats,
   ensureStream,
   publishJson,
-  FillEvent,
   FillEventSchema
 } from '@hl/ts-lib';
 
@@ -24,6 +26,9 @@ const OWNER_TOKEN = getOwnerToken();
 const logger = createLogger('hl-stream');
 const metrics = initMetrics('hl_stream');
 const fillsHistogram = createHistogram(metrics, 'fills_publish_seconds', 'Latency for publishing fills', [0.005, 0.01, 0.05, 0.1]);
+const WATCH_PERIOD = Number(process.env.LEADERBOARD_PERIOD ?? process.env.LEADERBOARD_WATCH_PERIOD ?? 30);
+const WATCH_LIMIT = Number(process.env.LEADERBOARD_SELECT_COUNT ?? 12);
+setMaxListeners(0);
 
 const swaggerDoc: OpenAPIV3.Document = {
   openapi: '3.0.0',
@@ -67,7 +72,10 @@ const swaggerDoc: OpenAPIV3.Document = {
 const queue = new EventQueue(5000);
 const clients = new Set<{ ws: WebSocket; lastSeq: number; alive: boolean }>();
 let watchlist: string[] = [];
-const scoutUrl = process.env.SCOUT_URL || 'http://localhost:4101';
+const scoutUrl = process.env.SCOUT_URL || 'http://hl-scout:8080';
+const dashboardDir = path.resolve(__dirname, '..', 'public');
+const fillsSubject = 'c.fills.v1';
+let tracker: RealtimeTracker | null = null;
 
 function ownerOnly(req: Request, res: Response, next: NextFunction) {
   const token = (req.headers['x-owner-key'] || req.headers['x-owner-token'] || '').toString();
@@ -76,52 +84,80 @@ function ownerOnly(req: Request, res: Response, next: NextFunction) {
 }
 
 async function fetchWatchlist(): Promise<string[]> {
-  const res = await fetch(`${scoutUrl}/addresses`, {
-    headers: { 'x-owner-key': OWNER_TOKEN }
-  });
-  if (!res.ok) throw new Error(`scout HTTP ${res.status}`);
-  const data = await res.json();
-  return (data?.addresses || []).map((entry: any) => normalizeAddress(entry.address));
+  const selectedUrl = new URL('/leaderboard/selected', scoutUrl);
+  selectedUrl.searchParams.set('period', String(WATCH_PERIOD));
+  selectedUrl.searchParams.set('limit', String(WATCH_LIMIT));
+  try {
+    const res = await fetch(selectedUrl, { headers: { 'x-owner-key': OWNER_TOKEN } });
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data?.entries) && data.entries.length) {
+        return data.entries.map((entry: any) => normalizeAddress(entry.address));
+      }
+    }
+  } catch (err) {
+    logger.warn('selected_watchlist_failed', { err: err instanceof Error ? err.message : err });
+  }
+  try {
+    const fallback = await fetch(`${scoutUrl}/addresses`, {
+      headers: { 'x-owner-key': OWNER_TOKEN }
+    });
+    if (fallback.ok) {
+      const fallbackData = await fallback.json();
+      return (fallbackData?.addresses || []).map((entry: any) => normalizeAddress(entry.address));
+    }
+  } catch (err) {
+    logger.warn('addresses_watchlist_failed', { err: err instanceof Error ? err.message : err });
+  }
+  if (watchlist.length) return watchlist;
+  return [];
 }
 
-function buildFakeFill(address: string): FillEvent {
-  const side = Math.random() > 0.5 ? 'buy' : 'sell';
-  const size = Number((Math.random() * 0.5 + 0.01).toFixed(4));
-  const price = Number((60000 + Math.random() * 500 - 250).toFixed(2));
+async function proxyScout(pathname: string, req: Request, res: Response) {
+  try {
+    const target = new URL(pathname, scoutUrl);
+    const idx = req.originalUrl.indexOf('?');
+    if (idx >= 0) {
+      target.search = req.originalUrl.slice(idx);
+    }
+    const response = await fetch(target, { headers: { 'x-owner-key': OWNER_TOKEN } });
+    const body = await response.text();
+    const type = response.headers.get('content-type') || 'application/json';
+    res.status(response.status).setHeader('Content-Type', type).send(body);
+  } catch (err: any) {
+    logger.error('dashboard_proxy_failed', { err: err?.message });
+    res.status(502).json({ error: 'proxy_failed' });
+  }
+}
+
+function toFillEventPayload(evt: any) {
   return FillEventSchema.parse({
-    fill_id: `${address}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
-    source: 'fake',
-    address,
-    asset: 'BTC',
-    side,
-    size,
-    price,
-    start_position: null,
-    realized_pnl: null,
-    ts: nowIso(),
-    meta: { generator: 'fake' }
+    fill_id: evt.hash || `${evt.address}-${evt.at}`,
+    source: 'hyperliquid',
+    address: evt.address,
+    asset: evt.symbol || 'BTC',
+    side: evt.side === 'sell' ? 'sell' : 'buy',
+    size: Number(evt.size ?? evt.payload?.size ?? 0),
+    price: Number(evt.priceUsd ?? evt.payload?.priceUsd ?? 0),
+    start_position: typeof evt.startPosition === 'number' ? evt.startPosition : null,
+    realized_pnl: evt.realizedPnlUsd != null ? Number(evt.realizedPnlUsd) : null,
+    ts: evt.at,
+    meta: { action: evt.action ?? null }
   });
 }
 
-async function publishFill(
+async function publishFillFromEvent(
   js: Awaited<ReturnType<typeof connectNats>>['js'],
-  subject: string,
-  fill: FillEvent
+  evt: any
 ) {
-  const end = (fillsHistogram as any).startTimer?.({ operation: 'publish' });
-  await publishJson(js, subject, fill);
-  end?.();
-  queue.push({
-    type: 'trade',
-    at: fill.ts,
-    address: fill.address,
-    symbol: 'BTC',
-    side: fill.side === 'buy' ? 'buy' : 'sell',
-    direction: fill.side === 'buy' ? 'long' : 'short',
-    effect: fill.side === 'buy' ? 'open' : 'close',
-    priceUsd: fill.price,
-    size: fill.size
-  } as any);
+  try {
+    const fill = toFillEventPayload(evt);
+    const end = (fillsHistogram as any).startTimer?.({ operation: 'publish' });
+    await publishJson(js, fillsSubject, fill);
+    end?.();
+  } catch (err: any) {
+    logger.warn('fill_publish_failed', { err: err?.message });
+  }
 }
 
 function configureWebSocket(server: http.Server) {
@@ -179,16 +215,30 @@ function configureWebSocket(server: http.Server) {
 async function main() {
   const natsUrl = process.env.NATS_URL || 'nats://localhost:4222';
   const nats = await connectNats(natsUrl);
-  const subject = 'c.fills.v1';
-  await ensureStream(nats.jsm, 'HL_C', [subject]);
+  await ensureStream(nats.jsm, 'HL_C', [fillsSubject]);
 
   watchlist = await fetchWatchlist();
   logger.info('watchlist_loaded', { count: watchlist.length });
+
+  tracker = new RealtimeTracker(async () => watchlist, queue, {
+    onTrade: ({ event }) => {
+      publishFillFromEvent(nats.js, event).catch((err) =>
+        logger.error('fill_publish_failed', { err: err?.message })
+      );
+    }
+  });
+  tracker.start().catch((err) => logger.error('realtime_start_failed', { err: err?.message }));
 
   const app = express();
   app.use(cors());
   app.use(express.json());
   app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerDoc));
+  if (fs.existsSync(dashboardDir)) {
+    app.use('/dashboard/static', express.static(dashboardDir));
+    app.get('/dashboard', (_req, res) => {
+      res.sendFile(path.join(dashboardDir, 'dashboard.html'));
+    });
+  }
 
   app.get('/healthz', (_req, res) => res.json({ status: 'ok', watchlist: watchlist.length }));
   app.get('/metrics', metricsHandler(metrics));
@@ -196,28 +246,29 @@ async function main() {
 
   app.post('/watchlist/refresh', ownerOnly, async (_req, res) => {
     watchlist = await fetchWatchlist();
+    await tracker?.refresh();
     logger.info('watchlist_refreshed', { count: watchlist.length });
     res.json({ ok: true, count: watchlist.length });
   });
+  app.get('/dashboard/api/summary', (req, res) => proxyScout('/dashboard/summary', req, res));
+  app.get('/dashboard/api/fills', (req, res) => proxyScout('/dashboard/fills', req, res));
+  app.get('/dashboard/api/decisions', (req, res) => proxyScout('/dashboard/decisions', req, res));
+  app.get('/dashboard/api/price', (req, res) => proxyScout('/dashboard/price', req, res));
 
   const server = http.createServer(app);
   configureWebSocket(server);
 
-  const loop = () => {
-    if (!watchlist.length) return;
-    for (const addr of watchlist) {
-      const fill = buildFakeFill(addr);
-      publishFill(nats.js, subject, fill).catch((err) => logger.error('fill_publish_failed', { err: err?.message }));
-    }
-  };
-  setInterval(loop, 1000);
   setInterval(async () => {
     try {
       watchlist = await fetchWatchlist();
-    } catch (err) {
+      await tracker?.refresh();
+    } catch (err: any) {
       logger.warn('watchlist_poll_failed', { err: err instanceof Error ? err.message : String(err) });
     }
   }, 60000);
+  setInterval(() => {
+    void tracker?.ensureFreshSnapshots();
+  }, 30000);
 
   const port = getPort(8080);
   server.listen(port, () => logger.info('hl-stream listening', { port }));
