@@ -504,6 +504,10 @@ function metricsHandler(ctx: ReturnType<typeof initMetrics>) {
 }
 
 main().catch((err) => {
-  logger.error('fatal_startup', { err: err instanceof Error ? err.message : String(err) });
+  console.error('[FATAL]', err);
+  logger.error('fatal_startup', {
+    err: err instanceof Error ? err.message : String(err),
+    stack: err instanceof Error ? err.stack : undefined
+  });
   process.exit(1);
 });

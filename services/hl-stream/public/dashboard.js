@@ -119,19 +119,19 @@ function renderAddresses(stats = [], profiles = {}, holdings = {}) {
       const pnlCell = typeof row.realizedPnl === 'number' ? fmtUsdShort(row.realizedPnl) : placeholder();
       return `
         <tr>
-          <td title="Hyperliquid tx count: ${txCount}">
+          <td data-label="Address" title="Hyperliquid tx count: ${txCount}">
             <a href="https://hyperbot.network/trader/${row.address}" target="_blank" rel="noopener noreferrer">
               ${shortAddress(row.address)}
             </a>
             ${row.remark ? `<div class="addr-remark">${row.remark}</div>` : ''}
           </td>
-          <td>${winRateCell}</td>
-          <td>${drawdownCell}</td>
-          <td>${tradesCell}</td>
-          <td class="holds-cell">
+          <td data-label="Win Rate">${winRateCell}</td>
+          <td data-label="Max Drawdown">${drawdownCell}</td>
+          <td data-label="Trades">${tradesCell}</td>
+          <td data-label="Holdings" class="holds-cell">
             ${holdingCell}
           </td>
-          <td>${pnlCell}</td>
+          <td data-label="Realized PnL">${pnlCell}</td>
         </tr>
       `;
     })
@@ -178,13 +178,13 @@ function renderFills(list) {
       const sideClass = action.toLowerCase().includes('short') ? 'sell' : 'buy';
       return `
         <tr>
-          <td>${fmtDateTime(fill.time_utc)}</td>
-          <td><a href="https://hyperbot.network/trader/${fill.address}" target="_blank" rel="noopener noreferrer">${shortAddress(fill.address)}</a></td>
-          <td><span class="pill ${sideClass}">${action}</span></td>
-          <td>${size}</td>
-          <td>${prev}</td>
-          <td>${price}</td>
-          <td>${pnl}</td>
+          <td data-label="Time">${fmtDateTime(fill.time_utc)}</td>
+          <td data-label="Address"><a href="https://hyperbot.network/trader/${fill.address}" target="_blank" rel="noopener noreferrer">${shortAddress(fill.address)}</a></td>
+          <td data-label="Action"><span class="pill ${sideClass}">${action}</span></td>
+          <td data-label="Size">${size}</td>
+          <td data-label="Previous Position">${prev}</td>
+          <td data-label="Price">${price}</td>
+          <td data-label="Closed PnL">${pnl}</td>
         </tr>
       `;
     })

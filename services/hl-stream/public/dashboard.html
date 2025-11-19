@@ -35,20 +35,22 @@
       <section class="grid-2">
         <div class="card">
           <h3>Top Performance</h3>
-          <span class="metric-hint">Live leaderboard data from Hyperbot &amp; Hyperliquid. Cells labeled “No live data” indicate the upstream API did not return a value.</span>
-          <table class="stats-table">
-            <thead>
-              <tr>
-                <th>Address</th>
-                <th>Win Rate</th>
-                <th>Max Drawdown</th>
-                <th>Trades</th>
-                <th>Holdings</th>
-                <th>Realized PnL</th>
-              </tr>
-            </thead>
-            <tbody id="address-table"></tbody>
-          </table>
+          <span class="metric-hint">Live leaderboard data from Hyperbot &amp; Hyperliquid. Cells labeled "No live data" indicate the upstream API did not return a value.</span>
+          <div class="table-wrapper">
+            <table class="stats-table">
+              <thead>
+                <tr>
+                  <th>Address</th>
+                  <th>Win Rate</th>
+                  <th>Max Drawdown</th>
+                  <th>Trades</th>
+                  <th>Holdings</th>
+                  <th>Realized PnL</th>
+                </tr>
+              </thead>
+              <tbody id="address-table"></tbody>
+            </table>
+          </div>
         </div>
         <div class="card">
           <h3>Recommendation</h3>
@@ -61,20 +63,22 @@
       <section class="grid-2">
         <div class="card">
           <h3>Live Fills</h3>
-          <table class="stats-table fills-table">
-            <thead>
-              <tr>
-                <th>Time</th>
-                <th>Address</th>
-                <th>Action</th>
-                <th>Size</th>
-                <th>Previous Position</th>
-                <th>Price</th>
-                <th>Closed PnL</th>
-              </tr>
-            </thead>
-            <tbody id="fills-table"></tbody>
-          </table>
+          <div class="table-wrapper">
+            <table class="stats-table fills-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Address</th>
+                  <th>Action</th>
+                  <th>Size</th>
+                  <th>Previous Position</th>
+                  <th>Price</th>
+                  <th>Closed PnL</th>
+                </tr>
+              </thead>
+              <tbody id="fills-table"></tbody>
+            </table>
+          </div>
         </div>
         <div class="card">
           <h3>Decisions</h3>
