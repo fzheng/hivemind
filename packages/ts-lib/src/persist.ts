@@ -568,6 +568,43 @@ export async function isCustomAccount(address: string): Promise<boolean> {
   }
 }
 
+/**
+ * Update nickname for a custom account
+ * @returns Updated account or null if not found
+ */
+export async function updateCustomAccountNickname(
+  address: string,
+  nickname: string | null
+): Promise<{ success: boolean; account?: CustomAccount; error?: string }> {
+  try {
+    const p = await getPool();
+    const { rows } = await p.query(
+      `UPDATE hl_custom_accounts
+       SET nickname = $2
+       WHERE lower(address) = $1
+       RETURNING id, address, nickname, added_at`,
+      [address.toLowerCase(), nickname || null]
+    );
+
+    if (!rows.length) {
+      return { success: false, error: 'Account not found' };
+    }
+
+    return {
+      success: true,
+      account: {
+        id: Number(rows[0].id),
+        address: String(rows[0].address),
+        nickname: rows[0].nickname ? String(rows[0].nickname) : null,
+        addedAt: String(rows[0].added_at),
+      },
+    };
+  } catch (e) {
+    console.error('[persist] updateCustomAccountNickname failed:', e);
+    return { success: false, error: 'Failed to update nickname' };
+  }
+}
+
 // =====================
 // Leaderboard Refresh Timestamp
 // =====================

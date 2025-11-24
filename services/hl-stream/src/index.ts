@@ -344,6 +344,25 @@ async function main() {
       res.status(502).json({ error: 'proxy_failed' });
     }
   });
+  app.patch('/dashboard/api/custom-accounts/:address', async (req, res) => {
+    try {
+      const target = new URL(`/custom-accounts/${encodeURIComponent(req.params.address)}`, scoutUrl);
+      const response = await fetch(target, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-owner-key': OWNER_TOKEN
+        },
+        body: JSON.stringify(req.body)
+      });
+      const body = await response.text();
+      const type = response.headers.get('content-type') || 'application/json';
+      res.status(response.status).setHeader('Content-Type', type).send(body);
+    } catch (err: any) {
+      logger.error('custom_accounts_patch_proxy_failed', { err: err?.message });
+      res.status(502).json({ error: 'proxy_failed' });
+    }
+  });
 
   // Leaderboard refresh proxy routes
   app.post('/dashboard/api/leaderboard/refresh', async (_req, res) => {

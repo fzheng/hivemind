@@ -139,6 +139,9 @@ function renderAddresses(stats = [], profiles = {}, holdings = {}) {
       const isCustom = row.isCustom === true;
       const customIndicator = isCustom ? '<span class="custom-star" title="Custom tracked account">★</span>' : '';
       const removeBtn = isCustom ? `<button class="remove-custom-btn" data-address="${row.address}" title="Remove custom account">×</button>` : '';
+      const nicknameDisplay = row.remark
+        ? `<span class="nickname-display" data-address="${row.address}" data-nickname="${escapeHtml(row.remark)}" title="Click to edit nickname">${escapeHtml(row.remark)}</span>`
+        : (isCustom ? `<span class="nickname-display nickname-empty" data-address="${row.address}" data-nickname="" title="Click to add nickname">+ Add nickname</span>` : '');
       return `
         <tr class="${isCustom ? 'custom-row' : ''}">
           <td data-label="Address" title="Hyperliquid tx count: ${txCount}">
@@ -149,7 +152,7 @@ function renderAddresses(stats = [], profiles = {}, holdings = {}) {
               </a>
               ${removeBtn}
             </span>
-            ${row.remark ? `<div class="addr-remark">${row.remark}</div>` : ''}
+            <div class="addr-remark">${nicknameDisplay}</div>
           </td>
           <td data-label="Win Rate">${winRateCell}</td>
           <td data-label="Trades">${tradesCell}</td>
@@ -169,6 +172,16 @@ function renderAddresses(stats = [], profiles = {}, holdings = {}) {
       e.preventDefault();
       const address = btn.dataset.address;
       if (address) removeCustomAccount(address);
+    });
+  });
+
+  // Attach event listeners for nickname editing (custom accounts only)
+  document.querySelectorAll('.nickname-display').forEach((el) => {
+    el.addEventListener('click', (e) => {
+      e.preventDefault();
+      const address = el.dataset.address;
+      const currentNickname = el.dataset.nickname || '';
+      if (address) showNicknameEditor(el, address, currentNickname);
     });
   });
 }
@@ -487,6 +500,107 @@ async function removeCustomAccount(address) {
     await refreshSummary();
   } catch (err) {
     console.error('Remove custom account error:', err);
+  }
+}
+
+// Escape HTML to prevent XSS
+function escapeHtml(text) {
+  if (!text) return '';
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+// Show inline nickname editor
+function showNicknameEditor(el, address, currentNickname) {
+  // Create inline editor
+  const container = el.parentElement;
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.value = currentNickname;
+  input.className = 'nickname-input';
+  input.placeholder = 'Enter nickname';
+  input.maxLength = 32;
+
+  const saveBtn = document.createElement('button');
+  saveBtn.className = 'nickname-save-btn';
+  saveBtn.textContent = 'Save';
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.className = 'nickname-cancel-btn';
+  cancelBtn.textContent = 'Cancel';
+
+  const editorWrapper = document.createElement('div');
+  editorWrapper.className = 'nickname-editor';
+  editorWrapper.appendChild(input);
+  editorWrapper.appendChild(saveBtn);
+  editorWrapper.appendChild(cancelBtn);
+
+  // Hide original display, show editor
+  el.style.display = 'none';
+  container.appendChild(editorWrapper);
+  input.focus();
+  input.select();
+
+  // Save handler
+  const save = async () => {
+    const newNickname = input.value.trim();
+    saveBtn.disabled = true;
+    saveBtn.textContent = '...';
+
+    const success = await updateNickname(address, newNickname);
+    if (success) {
+      editorWrapper.remove();
+      await refreshSummary();
+    } else {
+      saveBtn.disabled = false;
+      saveBtn.textContent = 'Save';
+      input.focus();
+    }
+  };
+
+  // Cancel handler
+  const cancel = () => {
+    editorWrapper.remove();
+    el.style.display = '';
+  };
+
+  saveBtn.addEventListener('click', save);
+  cancelBtn.addEventListener('click', cancel);
+
+  // Enter to save, Escape to cancel
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      save();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      cancel();
+    }
+  });
+}
+
+// Update nickname via API
+async function updateNickname(address, nickname) {
+  try {
+    const res = await fetch(`${API_BASE}/custom-accounts/${encodeURIComponent(address)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nickname: nickname || null })
+    });
+
+    if (!res.ok) {
+      const data = await res.json();
+      console.error('Update nickname error:', data.error);
+      showCustomError(data.error || 'Failed to update nickname');
+      return false;
+    }
+
+    return true;
+  } catch (err) {
+    console.error('Update nickname error:', err);
+    showCustomError('Failed to update nickname');
+    return false;
   }
 }
 

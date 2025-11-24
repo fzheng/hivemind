@@ -34,6 +34,7 @@ import {
   listCustomAccounts,
   addCustomAccount,
   removeCustomAccount,
+  updateCustomAccountNickname,
   getCustomAccountCount,
   getLastRefreshTime
 } from '@hl/ts-lib';
@@ -686,6 +687,33 @@ async function main() {
     } catch (err: any) {
       logger.error('custom_account_remove_failed', { err: err?.message });
       res.status(500).json({ error: 'Failed to remove custom account' });
+    }
+  });
+
+  // Update nickname for a custom account
+  app.patch('/custom-accounts/:address', async (req, res) => {
+    try {
+      const { address } = req.params;
+      const { nickname } = req.body;
+
+      if (!address) {
+        res.status(400).json({ error: 'Address is required' });
+        return;
+      }
+
+      const sanitizedNickname = nickname ? sanitizeNickname(nickname) : null;
+      const result = await updateCustomAccountNickname(address, sanitizedNickname);
+
+      if (!result.success) {
+        res.status(404).json({ error: result.error });
+        return;
+      }
+
+      logger.info('custom_account_nickname_updated', { address, nickname: sanitizedNickname });
+      res.json({ success: true, account: result.account });
+    } catch (err: any) {
+      logger.error('custom_account_update_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to update nickname' });
     }
   });
 
