@@ -624,6 +624,19 @@ async function main() {
         return;
       }
 
+      // Check if account already exists in system-ranked entries
+      if (leaderboardService) {
+        const existingEntry = await leaderboardService.isSystemRankedAccount(address);
+        if (existingEntry) {
+          res.status(400).json({
+            error: 'Account already exists in system rankings',
+            rank: existingEntry.rank,
+            score: existingEntry.score,
+          });
+          return;
+        }
+      }
+
       const sanitizedNickname = nickname ? sanitizeNickname(nickname) : null;
       const result = await addCustomAccount(address, sanitizedNickname);
 
@@ -635,7 +648,7 @@ async function main() {
       logger.info('custom_account_added', { address: result.account?.address });
 
       // Immediately fetch stats for the new custom account so it doesn't show all zeros
-      // We await this so stats are available when UI reloads
+      // Custom accounts are now properly scored using the same algorithm as system accounts
       let stats = null;
       if (leaderboardService && result.account?.address) {
         try {

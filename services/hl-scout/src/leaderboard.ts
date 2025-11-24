@@ -6,6 +6,8 @@ import {
   CandidateEventSchema,
   computePerformanceScore,
   DEFAULT_SCORING_PARAMS,
+  removeCustomAccount,
+  listCustomAccounts,
   type ScoringParams
 } from '@hl/ts-lib';
 import type { CandidateEvent } from '@hl/ts-lib';
@@ -55,6 +57,8 @@ type LeaderboardRawEntry = {
   maxDrawdown?: number;
   numWins?: number;
   numLosses?: number;
+  /** Timestamp (ms) of last operation - used for activity filtering */
+  lastOperationAt?: number;
   // Nested stats object from API (contains accurate maxDrawdown)
   stats?: {
     maxDrawdown?: number;
@@ -72,7 +76,7 @@ export type RankedEntry = {
   score: number;
   weight: number;
   filtered?: boolean;
-  filterReason?: 'max_drawdown_exceeded' | 'scalping_penalty';
+  filterReason?: 'not_profitable' | 'insufficient_data';
   winRate: number;
   executedOrders: number;
   realizedPnl: number;
@@ -170,8 +174,7 @@ export class LeaderboardService {
     const raw = await this.fetchPeriod(period);
     let ranked = this.scoreEntries(raw);
 
-    // Two-phase scoring: first score, then enrich, then re-filter based on API stats
-    // We need to enrich more than selectCount to account for potential filtering
+    // Enrich top entries with detailed stats from API
     const enrichTarget = Math.min(ranked.length, Math.max(this.enrichCount, this.opts.selectCount * 2));
     const toEnrich = ranked.slice(0, enrichTarget);
 
@@ -179,41 +182,31 @@ export class LeaderboardService {
     if (toEnrich.length) {
       await this.applyAddressStats(period, toEnrich);
       hyperliquidSeries = await this.fetchPortfolioSeriesBatch(period, toEnrich);
-
-      // Re-filter based on enriched API stats (maxDrawdown from query-addr-stat)
-      const maxDrawdownLimit = Number(process.env.SCORING_MAX_DRAWDOWN_LIMIT ?? DEFAULT_SCORING_PARAMS.maxDrawdownLimit);
-      const beforeCount = ranked.length;
-
-      ranked = ranked.filter((entry) => {
-        const enrichedMDD = entry.statMaxDrawdown ?? 0;
-        if (enrichedMDD > maxDrawdownLimit) {
-          this.logger.info('filtered_high_mdd_enriched', {
-            address: entry.address,
-            statMaxDrawdown: enrichedMDD,
-          });
-          return false;
-        }
-        return true;
-      });
-
-      const filteredCount = beforeCount - ranked.length;
-      if (filteredCount > 0) {
-        this.logger.info('entries_filtered_by_enriched_mdd', { filteredCount, remaining: ranked.length });
-
-        // Recalculate weights for top selectCount after filtering
-        const topN = ranked.slice(0, this.opts.selectCount);
-        const sumScores = topN.reduce((sum, e) => sum + e.score, 0);
-        for (const entry of ranked) {
-          if (topN.includes(entry) && sumScores > 0) {
-            entry.weight = entry.score / sumScores;
-          } else {
-            entry.weight = 0;
-          }
-        }
-      }
     }
 
     const tracked = ranked.slice(0, this.enrichCount);
+
+    // Auto-convert custom accounts that are now picked by the system
+    // If a custom account appears in the system-ranked entries, remove its custom status
+    try {
+      const customAccounts = await listCustomAccounts();
+      const topAddresses = new Set(ranked.slice(0, this.opts.selectCount).map(e => normalizeAddress(e.address)));
+
+      for (const custom of customAccounts) {
+        const normalizedCustom = normalizeAddress(custom.address);
+        if (topAddresses.has(normalizedCustom)) {
+          // This custom account is now system-ranked, remove custom status
+          await removeCustomAccount(custom.address);
+          this.logger.info('custom_account_auto_converted', {
+            address: normalizedCustom,
+            reason: 'Account is now in system top rankings',
+          });
+        }
+      }
+    } catch (err: any) {
+      this.logger.warn('custom_account_auto_convert_failed', { err: err?.message });
+    }
+
     await this.persistPeriod(period, ranked, tracked, hyperliquidSeries);
     await this.publishTopCandidates(period, ranked.slice(0, this.opts.selectCount));
     this.logger.info('leaderboard_updated', { period, count: ranked.length });
@@ -238,31 +231,62 @@ export class LeaderboardService {
    * Scores entries using the new composite performance scoring formula.
    *
    * Formula components (weighted sum):
-   * 1. Smooth PnL Score (45%) - performance over time (monotonicity, drawdowns)
-   * 2. Adjusted Win Rate (30%) - with Laplace smoothing, penalize 100% win rates
-   * 3. Normalized PnL (15%) - log-scaled realized PnL (modest weight for whales)
-   * 4. Trade Frequency (10%) - prefer moderate activity, not too many trades
+   * 1. Stability Score (50%) - smooth, controlled profit generation (most important)
+   * 2. Win Rate (25%) - with progressive penalty for < 60%
+   * 3. Trade Frequency (15%) - with progressive penalty for > 150 trades
+   * 4. Realized PnL (10%) - tiebreaker for large accounts
    */
   private scoreEntries(entries: LeaderboardRawEntry[]): RankedEntry[] {
     // Build scoring params from defaults with optional env overrides
     const scoringParams: ScoringParams = {
-      smoothPnlWeight: Number(process.env.SCORING_SMOOTH_PNL_WEIGHT ?? DEFAULT_SCORING_PARAMS.smoothPnlWeight),
+      stabilityWeight: Number(process.env.SCORING_STABILITY_WEIGHT ?? DEFAULT_SCORING_PARAMS.stabilityWeight),
       winRateWeight: Number(process.env.SCORING_WIN_RATE_WEIGHT ?? DEFAULT_SCORING_PARAMS.winRateWeight),
-      pnlWeight: Number(process.env.SCORING_PNL_WEIGHT ?? DEFAULT_SCORING_PARAMS.pnlWeight),
       tradeFreqWeight: Number(process.env.SCORING_TRADE_FREQ_WEIGHT ?? DEFAULT_SCORING_PARAMS.tradeFreqWeight),
-      optimalTrades: Number(process.env.SCORING_OPTIMAL_TRADES ?? DEFAULT_SCORING_PARAMS.optimalTrades),
-      tradeSigma: Number(process.env.SCORING_TRADE_SIGMA ?? DEFAULT_SCORING_PARAMS.tradeSigma),
+      pnlWeight: Number(process.env.SCORING_PNL_WEIGHT ?? DEFAULT_SCORING_PARAMS.pnlWeight),
       pnlReference: Number(process.env.SCORING_PNL_REFERENCE ?? DEFAULT_SCORING_PARAMS.pnlReference),
-      // Hard filters
-      maxDrawdownLimit: Number(process.env.SCORING_MAX_DRAWDOWN_LIMIT ?? DEFAULT_SCORING_PARAMS.maxDrawdownLimit),
-      scalpingThreshold: Number(process.env.SCORING_SCALPING_THRESHOLD ?? DEFAULT_SCORING_PARAMS.scalpingThreshold),
+      minTrades: Number(process.env.SCORING_MIN_TRADES ?? DEFAULT_SCORING_PARAMS.minTrades),
+      maxTrades: Number(process.env.SCORING_MAX_TRADES ?? DEFAULT_SCORING_PARAMS.maxTrades),
+      tradeCountThreshold: Number(process.env.SCORING_TRADE_COUNT_THRESHOLD ?? DEFAULT_SCORING_PARAMS.tradeCountThreshold),
+      winRateThreshold: Number(process.env.SCORING_WIN_RATE_THRESHOLD ?? DEFAULT_SCORING_PARAMS.winRateThreshold),
+      drawdownTolerance: Number(process.env.SCORING_DRAWDOWN_TOLERANCE ?? DEFAULT_SCORING_PARAMS.drawdownTolerance),
+      downsideTolerance: Number(process.env.SCORING_DOWNSIDE_TOLERANCE ?? DEFAULT_SCORING_PARAMS.downsideTolerance),
     };
 
-    // Hard filter thresholds
-    const maxDrawdownLimit = scoringParams.maxDrawdownLimit; // 80%
-    const maxTradesHardLimit = Number(process.env.SCORING_MAX_TRADES_LIMIT ?? 200); // Hard cap on trades
+    // Hard filters applied before scoring
+    const maxTrades = Number(process.env.SCORING_MAX_TRADES ?? scoringParams.maxTrades);
+    const inactivityDays = Number(process.env.SCORING_INACTIVITY_DAYS ?? 14);
+    const inactivityThresholdMs = inactivityDays * 24 * 60 * 60 * 1000;
+    const now = Date.now();
 
-    const base = entries
+    // Pre-filter entries before scoring
+    const preFiltered = entries.filter((entry) => {
+      const executed = Number(entry.executedOrders ?? 0);
+      const lastOpAt = Number(entry.lastOperationAt ?? 0);
+
+      // Hard filter: remove accounts with > maxTrades
+      if (executed > maxTrades) {
+        return false;
+      }
+
+      // Hard filter: remove accounts inactive for > inactivityDays
+      if (lastOpAt > 0 && (now - lastOpAt) > inactivityThresholdMs) {
+        return false;
+      }
+
+      return true;
+    });
+
+    this.logger.info('pre_filter_stats', {
+      total: entries.length,
+      afterFilter: preFiltered.length,
+      removedHighTrades: entries.filter(e => Number(e.executedOrders ?? 0) > maxTrades).length,
+      removedInactive: entries.filter(e => {
+        const lastOpAt = Number(e.lastOperationAt ?? 0);
+        return lastOpAt > 0 && (now - lastOpAt) > inactivityThresholdMs;
+      }).length,
+    });
+
+    const base = preFiltered
       .map((entry) => {
         const address = normalizeAddress(entry.address);
         const winRate = clamp(Number(entry.winRate ?? 0), 0, 1);
@@ -270,66 +294,15 @@ export class LeaderboardService {
         const pnl = Number(entry.realizedPnl ?? 0);
         const efficiency = executed > 0 ? pnl / executed : pnl;
 
-        // Get API's maxDrawdown from stats object (more accurate than computed from pnlList)
-        const apiMaxDrawdown = entry.stats?.maxDrawdown ?? entry.maxDrawdown ?? 0;
-
-        // HARD FILTER 1: Max drawdown > 80% from API stats
-        if (apiMaxDrawdown > maxDrawdownLimit) {
-          this.logger.info('filtered_high_mdd', { address, apiMaxDrawdown });
-          return {
-            address,
-            score: 0,
-            filtered: true,
-            filterReason: 'max_drawdown_exceeded' as const,
-            winRate,
-            executedOrders: executed,
-            realizedPnl: pnl,
-            efficiency,
-            pnlConsistency: 0,
-            remark: entry.remark ?? null,
-            labels: entry.labels || [],
-            statOpenPositions: null,
-            statClosedPositions: null,
-            statAvgPosDuration: null,
-            statTotalPnl: null,
-            statMaxDrawdown: apiMaxDrawdown,
-            meta: { ...entry, filtered: true, filterReason: 'max_drawdown_exceeded', apiMaxDrawdown },
-          };
-        }
-
-        // HARD FILTER 2: Trades > 200 (scalping hard cap)
-        if (executed > maxTradesHardLimit) {
-          this.logger.info('filtered_scalper', { address, executedOrders: executed });
-          return {
-            address,
-            score: 0,
-            filtered: true,
-            filterReason: 'scalping_penalty' as const,
-            winRate,
-            executedOrders: executed,
-            realizedPnl: pnl,
-            efficiency,
-            pnlConsistency: 0,
-            remark: entry.remark ?? null,
-            labels: entry.labels || [],
-            statOpenPositions: null,
-            statClosedPositions: null,
-            statAvgPosDuration: null,
-            statTotalPnl: null,
-            statMaxDrawdown: apiMaxDrawdown,
-            meta: { ...entry, filtered: true, filterReason: 'scalping_penalty', executedOrders: executed },
-          };
-        }
-
         // Estimate wins/losses from win rate and trade count
         const numTrades = executed;
         const numWins = Math.round(numTrades * winRate);
         const numLosses = numTrades - numWins;
 
-        // Get pnlList for smooth PnL score calculation
+        // Get pnlList for stability score calculation
         const pnlList = entry.pnlList || [];
 
-        // Compute score using the new formula with pnlList
+        // Compute score using the new stability-based formula
         const scoringResult = computePerformanceScore({
           realizedPnl: pnl,
           numTrades,
@@ -337,9 +310,6 @@ export class LeaderboardService {
           numLosses,
           pnlList,
         }, scoringParams);
-
-        // Use the higher of API's maxDrawdown or computed maxDrawdown
-        const effectiveMaxDrawdown = Math.max(apiMaxDrawdown, scoringResult.details.maxDrawdown);
 
         return {
           address,
@@ -350,22 +320,21 @@ export class LeaderboardService {
           executedOrders: executed,
           realizedPnl: pnl,
           efficiency,
-          pnlConsistency: scoringResult.details.smoothPnlScore, // Use smooth PnL as consistency metric
+          pnlConsistency: scoringResult.details.stabilityScore, // Use stability score as consistency metric
           remark: entry.remark ?? null,
           labels: entry.labels || [],
           statOpenPositions: null,
           statClosedPositions: null,
           statAvgPosDuration: null,
           statTotalPnl: null,
-          statMaxDrawdown: effectiveMaxDrawdown, // Use effective max drawdown
+          statMaxDrawdown: scoringResult.details.maxDrawdown,
           meta: {
             ...entry,
-            scoringDetails: { ...scoringResult.details, maxDrawdown: effectiveMaxDrawdown },
+            scoringDetails: scoringResult.details,
             numWins,
             numLosses,
             filtered: scoringResult.filtered,
             filterReason: scoringResult.filterReason,
-            apiMaxDrawdown,
           },
         };
       })
@@ -383,8 +352,8 @@ export class LeaderboardService {
       this.logger.info('entries_filtered', {
         total: base.length,
         filtered: filteredCount,
-        mddFiltered: base.filter(e => e.filterReason === 'max_drawdown_exceeded').length,
-        scalpingFiltered: base.filter(e => e.filterReason === 'scalping_penalty').length,
+        notProfitable: base.filter(e => e.filterReason === 'not_profitable').length,
+        insufficientData: base.filter(e => e.filterReason === 'insufficient_data').length,
       });
     }
 
@@ -806,6 +775,63 @@ export class LeaderboardService {
     }));
   }
 
+  /**
+   * Check if an address exists in system-ranked entries (non-custom)
+   * Returns the entry if found, null otherwise
+   */
+  async isSystemRankedAccount(address: string, period?: number): Promise<RankedEntry | null> {
+    const pool = await getPool();
+    const targetPeriod = period ?? this.opts.periods[0] ?? 30;
+    const normalized = normalizeAddress(address);
+
+    const { rows } = await pool.query(
+      `
+        SELECT
+          address,
+          rank,
+          score,
+          weight,
+          coalesce(win_rate,0) as win_rate,
+          coalesce(executed_orders,0) as executed_orders,
+          coalesce(realized_pnl,0) as realized_pnl,
+          coalesce(pnl_consistency,0) as pnl_consistency,
+          coalesce(efficiency,0) as efficiency,
+          remark,
+          labels,
+          metrics
+        FROM hl_leaderboard_entries
+        WHERE period_days = $1
+          AND lower(address) = $2
+          AND (metrics->>'custom' IS NULL OR metrics->>'custom' != 'true')
+          AND score > 0
+      `,
+      [targetPeriod, normalized]
+    );
+
+    if (!rows.length) return null;
+
+    const row = rows[0];
+    return {
+      address: row.address,
+      rank: Number(row.rank),
+      score: Number(row.score),
+      weight: Number(row.weight),
+      winRate: Number(row.win_rate),
+      executedOrders: Number(row.executed_orders),
+      realizedPnl: Number(row.realized_pnl),
+      pnlConsistency: Number(row.pnl_consistency),
+      efficiency: Number(row.efficiency),
+      remark: row.remark,
+      labels: Array.isArray(row.labels) ? row.labels : [],
+      meta: row.metrics,
+      statOpenPositions: null,
+      statClosedPositions: null,
+      statAvgPosDuration: null,
+      statTotalPnl: null,
+      statMaxDrawdown: null,
+    };
+  }
+
   async getSelected(period: number, limit = this.opts.selectCount): Promise<RankedEntry[]> {
     const pool = await getPool();
     const { rows } = await pool.query(
@@ -873,6 +899,7 @@ export class LeaderboardService {
   /**
    * Fetch stats for a custom account and upsert into hl_leaderboard_entries.
    * This is called when a user adds a custom account so stats appear immediately.
+   * Custom accounts are now properly scored using the same algorithm as system accounts.
    */
   async fetchAndStoreCustomAccountStats(address: string, nickname?: string | null): Promise<RankedEntry | null> {
     const normalized = normalizeAddress(address);
@@ -883,25 +910,65 @@ export class LeaderboardService {
     // Fetch stats from Hyperbot API
     const stats = await this.fetchAddressStat(normalized, period);
 
-    // Build a minimal RankedEntry with fetched stats
+    // Also try to find the account in the raw leaderboard API to get pnlList for proper scoring
+    let pnlList: Array<{ timestamp: number; value: string }> | undefined;
+    let rawWinRate = stats?.winRate ?? 0;
+    let rawExecutedOrders = (stats?.openPosCount ?? 0) + (stats?.closePosCount ?? 0);
+    let rawRealizedPnl = stats?.totalPnl ?? 0;
+
+    try {
+      // Fetch the raw leaderboard to find this address and get its pnlList
+      const raw = await this.fetchPeriod(period);
+      const found = raw.find(e => normalizeAddress(e.address) === normalized);
+      if (found) {
+        pnlList = found.pnlList;
+        rawWinRate = found.winRate ?? rawWinRate;
+        rawExecutedOrders = found.executedOrders ?? rawExecutedOrders;
+        rawRealizedPnl = found.realizedPnl ?? rawRealizedPnl;
+        this.logger.info('custom_account_found_in_leaderboard', { address: normalized });
+      }
+    } catch (err: any) {
+      this.logger.warn('custom_account_leaderboard_fetch_failed', { address: normalized, err: err?.message });
+    }
+
+    // Compute proper score using the scoring algorithm (same as system accounts)
+    // Use computeFullScore: true to get the full score even if the account would be filtered
+    const numWins = Math.round(rawWinRate * rawExecutedOrders);
+    const numLosses = rawExecutedOrders - numWins;
+
+    const scoringResult = computePerformanceScore({
+      realizedPnl: rawRealizedPnl,
+      numTrades: rawExecutedOrders,
+      numWins,
+      numLosses,
+      pnlList: pnlList?.map(p => parseFloat(p.value)) ?? [],
+    }, DEFAULT_SCORING_PARAMS, { computeFullScore: true });
+
+    // Build the entry with computed score
     const entry: RankedEntry = {
       address: normalized,
       rank: 9999, // Custom accounts get a high rank (sorted separately in UI)
-      score: 0,
+      score: scoringResult.score,
       weight: 0, // Custom accounts don't contribute to weighted selection
-      winRate: stats?.winRate ?? 0,
-      executedOrders: (stats?.openPosCount ?? 0) + (stats?.closePosCount ?? 0),
-      realizedPnl: stats?.totalPnl ?? 0,
-      efficiency: stats?.totalPnl && stats.closePosCount ? stats.totalPnl / Math.max(1, stats.closePosCount) : 0,
-      pnlConsistency: 0,
+      winRate: rawWinRate,
+      executedOrders: rawExecutedOrders,
+      realizedPnl: rawRealizedPnl,
+      efficiency: rawRealizedPnl && rawExecutedOrders ? rawRealizedPnl / Math.max(1, rawExecutedOrders) : 0,
+      pnlConsistency: scoringResult.details.stabilityScore,
       remark: nickname ?? null,
       labels: ['custom'],
       statOpenPositions: stats?.openPosCount ?? null,
       statClosedPositions: stats?.closePosCount ?? null,
       statAvgPosDuration: stats?.avgPosDuration ?? null,
       statTotalPnl: stats?.totalPnl ?? null,
-      statMaxDrawdown: stats?.maxDrawdown ?? null,
-      meta: { custom: true, fetchedAt: nowIso() },
+      statMaxDrawdown: scoringResult.details.maxDrawdown ?? stats?.maxDrawdown ?? null,
+      meta: {
+        custom: true,
+        fetchedAt: nowIso(),
+        scoringDetails: scoringResult.details,
+        filtered: scoringResult.filtered,
+        filterReason: scoringResult.filterReason,
+      },
     };
 
     // Upsert into hl_leaderboard_entries

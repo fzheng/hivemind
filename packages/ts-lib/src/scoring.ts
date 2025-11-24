@@ -2,11 +2,11 @@
  * Performance Scoring Module
  *
  * Implements a composite performance score for ranking trading accounts.
- * The formula balances:
- * 1. Smooth PnL Score - performance over time (monotonicity, drawdowns)
- * 2. Win Rate - with Laplace smoothing (penalize 100% win rates)
- * 3. Realized PnL - modest weight (whales can make bad trades)
- * 4. Trade Count - prefer moderate activity (not too many)
+ * The formula prioritizes:
+ * 1. Stability Score - smooth, controlled drawdown profit ability (most important)
+ * 2. Win Rate - with progressive penalty for win rate < 60%
+ * 3. Trade Count - progressive penalty for > 150 trades per 30 days
+ * 4. Realized PnL - tiebreaker for accounts with similar stability scores
  *
  * @module scoring
  */
@@ -16,40 +16,28 @@
  */
 export interface ScoringParams {
   /**
-   * Weight for smooth PnL score component (0-1).
-   * Default: 0.45
+   * Weight for stability score component (0-1).
+   * Default: 0.50 (most important)
    */
-  smoothPnlWeight: number;
+  stabilityWeight: number;
 
   /**
-   * Weight for adjusted win rate component (0-1).
-   * Default: 0.30
+   * Weight for win rate component (0-1).
+   * Default: 0.25
    */
   winRateWeight: number;
 
   /**
-   * Weight for normalized PnL component (0-1).
-   * Default: 0.15
-   */
-  pnlWeight: number;
-
-  /**
    * Weight for trade frequency component (0-1).
-   * Default: 0.10
+   * Default: 0.15
    */
   tradeFreqWeight: number;
 
   /**
-   * Optimal number of trades (trades around this are preferred).
-   * Default: 100
+   * Weight for normalized PnL component (0-1).
+   * Default: 0.10 (tiebreaker for large accounts)
    */
-  optimalTrades: number;
-
-  /**
-   * Spread for trade count preference (Gaussian-like decay).
-   * Default: 150
-   */
-  tradeSigma: number;
+  pnlWeight: number;
 
   /**
    * Reference PnL for log normalization.
@@ -58,31 +46,59 @@ export interface ScoringParams {
   pnlReference: number;
 
   /**
-   * Maximum allowed drawdown (0-1). Accounts exceeding this are filtered out.
-   * Default: 0.80 (80%)
+   * Minimum trades required (per 30 days).
+   * Default: 3
    */
-  maxDrawdownLimit: number;
+  minTrades: number;
 
   /**
-   * Trade count threshold above which scalping penalties apply.
+   * Maximum trades allowed (per 30 days). Hard filter.
+   * Default: 200
+   */
+  maxTrades: number;
+
+  /**
+   * Trade count threshold above which penalties apply (per 30 days).
    * Default: 100
    */
-  scalpingThreshold: number;
+  tradeCountThreshold: number;
+
+  /**
+   * Win rate threshold below which penalties apply.
+   * Default: 0.60 (60%)
+   */
+  winRateThreshold: number;
+
+  /**
+   * Drawdown tolerance scale for stability score (D0).
+   * Lower = stricter. Practical range: 0.15-0.35
+   * Default: 0.20
+   */
+  drawdownTolerance: number;
+
+  /**
+   * Downside volatility tolerance scale for stability score (S0).
+   * Lower = stricter. Practical range: 0.02-0.05
+   * Default: 0.03
+   */
+  downsideTolerance: number;
 }
 
 /**
  * Default scoring parameters
  */
 export const DEFAULT_SCORING_PARAMS: ScoringParams = {
-  smoothPnlWeight: 0.45,
-  winRateWeight: 0.30,
-  pnlWeight: 0.15,
-  tradeFreqWeight: 0.10,
-  optimalTrades: 100,
-  tradeSigma: 150,
+  stabilityWeight: 0.50,
+  winRateWeight: 0.25,
+  tradeFreqWeight: 0.15,
+  pnlWeight: 0.10,
   pnlReference: 100000,
-  maxDrawdownLimit: 0.80,    // 80% max drawdown - hard filter
-  scalpingThreshold: 100,    // trades/month above this get penalized
+  minTrades: 3,
+  maxTrades: 200,
+  tradeCountThreshold: 100,
+  winRateThreshold: 0.60,
+  drawdownTolerance: 0.20,   // D0 - strict for BTC volatility
+  downsideTolerance: 0.03,   // S0 - moderate tolerance
 };
 
 /**
@@ -110,7 +126,7 @@ export interface AccountStats {
   /** Number of losing trades */
   numLosses: number;
 
-  /** PnL time series for smooth PnL calculation */
+  /** PnL time series for stability score calculation */
   pnlList?: PnlPoint[];
 }
 
@@ -121,47 +137,56 @@ export interface ScoringResult {
   /** Final composite performance score (higher = better) */
   score: number;
 
-  /** Whether account was filtered out (MDD > limit or scalping) */
+  /** Whether account was filtered out */
   filtered: boolean;
 
   /** Reason for filtering if applicable */
-  filterReason?: 'max_drawdown_exceeded' | 'scalping_penalty';
+  filterReason?: 'not_profitable' | 'insufficient_data';
 
   /** Intermediate calculation values for debugging/display */
   details: {
-    /** Smooth PnL score [0, 1] */
-    smoothPnlScore: number;
+    /** Stability score [0, 1] - from pnlList analysis */
+    stabilityScore: number;
 
     /** Maximum drawdown from PnL series [0, 1] */
     maxDrawdown: number;
 
+    /** Ulcer index (RMS of drawdowns) */
+    ulcerIndex: number;
+
+    /** Fraction of up moves [0, 1] */
+    upFraction: number;
+
+    /** Downside volatility */
+    downsideVolatility: number;
+
     /** Raw win rate before adjustments */
     rawWinRate: number;
 
-    /** Adjusted win rate with Laplace smoothing and 100% penalty */
-    adjWinRate: number;
+    /** Win rate score after progressive penalty */
+    winRateScore: number;
+
+    /** Trade frequency score after progressive penalty */
+    tradeFreqScore: number;
 
     /** Normalized PnL score [0, 1] */
     normalizedPnl: number;
 
-    /** Trade frequency score [0, 1] */
-    tradeFreqScore: number;
-
     /** Component scores weighted */
     weightedComponents: {
-      smoothPnl: number;
+      stability: number;
       winRate: number;
-      pnl: number;
       tradeFreq: number;
+      pnl: number;
     };
   };
 }
 
 /**
- * Result of smooth PnL calculation including drawdown metrics
+ * Result of stability score calculation
  */
-export interface SmoothPnlResult {
-  /** Smooth PnL score [0, ~0.5] */
+export interface StabilityResult {
+  /** Stability score [0, 1] - higher = smoother, more stable */
   score: number;
   /** Maximum drawdown [0, 1] */
   maxDrawdown: number;
@@ -169,35 +194,56 @@ export interface SmoothPnlResult {
   ulcerIndex: number;
   /** Fraction of up moves [0, 1] */
   upFraction: number;
+  /** Downside volatility (std of negative deltas) */
+  downsideVolatility: number;
+  /** Whether the account is profitable */
+  isProfitable: boolean;
 }
 
 /**
- * Computes the Smooth PnL Score from a PnL time series.
+ * Computes the Stability Score from a cumulative PnL time series.
  *
- * The metric rewards:
- * - Higher final PnL
- * - More monotonic up moves
- * - Smaller & shorter drawdowns
+ * This score measures how smooth and controlled the profit generation is:
+ * - Rewards frequent up moves
+ * - Penalizes large drawdowns
+ * - Penalizes volatile downside movements
+ * - Returns 0 for non-profitable accounts
  *
  * @param pnlList - Array of PnL points in time order
- * @returns Object with score, maxDrawdown, ulcerIndex, and upFraction
+ * @param D0 - Drawdown tolerance scale (0.15-0.35, lower = stricter)
+ * @param S0 - Downside volatility tolerance scale (0.02-0.05, lower = stricter)
+ * @returns StabilityResult with score and intermediate metrics
  */
-export function computeSmoothPnlScore(pnlList: PnlPoint[]): SmoothPnlResult {
-  // Extract numeric PnL values in time order
-  const values: number[] = [];
+export function computeStabilityScore(
+  pnlList: PnlPoint[],
+  D0: number = 0.20,
+  S0: number = 0.03
+): StabilityResult {
+  const zeroResult: StabilityResult = {
+    score: 0,
+    maxDrawdown: 0,
+    ulcerIndex: 0,
+    upFraction: 0,
+    downsideVolatility: 0,
+    isProfitable: false,
+  };
 
-  for (const pt of pnlList) {
+  if (!pnlList || pnlList.length < 2) {
+    return zeroResult;
+  }
+
+  // Extract numeric PnL values
+  const values: number[] = [];
+  for (const point of pnlList) {
     let v: number | string | undefined;
 
-    if (Array.isArray(pt)) {
+    if (Array.isArray(point)) {
       // [timestamp, pnl] - take last element
-      v = pt[pt.length - 1];
-    } else if (typeof pt === 'object' && pt !== null) {
-      // Try common keys
-      v = pt.pnl ?? pt.value;
+      v = point[point.length - 1];
+    } else if (typeof point === 'object' && point !== null) {
+      v = point.pnl ?? point.value;
     } else {
-      // Assume it's already a number/string
-      v = pt;
+      v = point;
     }
 
     const parsed = typeof v === 'string' ? parseFloat(v) : v;
@@ -206,189 +252,293 @@ export function computeSmoothPnlScore(pnlList: PnlPoint[]): SmoothPnlResult {
     }
   }
 
-  // Not enough data -> no meaningful score
-  if (values.length < 2) {
-    return { score: 0, maxDrawdown: 0, ulcerIndex: 0, upFraction: 0 };
+  const n = values.length;
+  if (n < 2) {
+    return zeroResult;
   }
 
-  // Normalize series to start at 0 (focus on shape & change)
+  // Work with net PnL change (make series start at 0)
   const base = values[0];
-  const x = values.map((v) => v - base); // x[0] == 0
+  const X = values.map((v) => v - base);
 
-  const n = x.length;
-
-  // Drawdown series, Max Drawdown (MDD), Ulcer Index
-  let peak = x[0];
-  let mdd = 0;
-  let ddSqSum = 0;
-
-  for (const xi of x) {
-    if (xi > peak) {
-      peak = xi;
-    }
-
-    let dd = 0;
-    if (peak > 0) {
-      dd = (peak - xi) / peak; // fractional drawdown from peak
-      if (dd < 0) dd = 0;
-    }
-
-    mdd = Math.max(mdd, dd);
-    ddSqSum += dd * dd;
+  // If not profitable (final PnL <= initial), return 0
+  if (X[X.length - 1] <= 0) {
+    return { ...zeroResult, isProfitable: false };
   }
 
-  const ulcer = Math.sqrt(ddSqSum / n); // Ulcer Index
+  // Check for no movement
+  const xmin = Math.min(...X);
+  const xmax = Math.max(...X);
+  const span = xmax - xmin;
+  if (span <= 0) {
+    return zeroResult;
+  }
 
-  // Monotonicity: fraction of up steps
-  let upCount = 0;
+  // Normalize to pseudo-equity in [0, 1]
+  const eps = 1e-12;
+  const E = X.map((x) => (x - xmin) / (span + eps));
+
+  // Compute step changes (pseudo "returns")
+  const deltas: number[] = [];
   for (let i = 1; i < n; i++) {
-    if (x[i] > x[i - 1]) {
-      upCount++;
+    deltas.push(E[i] - E[i - 1]);
+  }
+
+  // Up-fraction: how often equity moves up
+  const upMoves = deltas.filter((d) => d > 0).length;
+  const upFraction = upMoves / (n - 1);
+
+  // Downside volatility: std of negative deltas
+  const negDeltas = deltas.filter((d) => d < 0);
+  let downsideVolatility = 0;
+  if (negDeltas.length > 0) {
+    const meanSquareNeg = negDeltas.reduce((sum, d) => sum + d * d, 0) / negDeltas.length;
+    downsideVolatility = Math.sqrt(meanSquareNeg);
+  }
+
+  // Drawdown and Ulcer Index on normalized equity
+  let peak = E[0];
+  let maxDrawdown = 0;
+  let sumDd2 = 0;
+
+  for (const e of E) {
+    if (e > peak) {
+      peak = e;
     }
-  }
-  const upFrac = upCount / (n - 1);
-
-  // Return component (scale-invariant, based on final vs path range)
-  const last = x[n - 1];
-  const maxAbs = Math.max(...x.map((v) => Math.abs(v)));
-
-  let R = 0;
-  if (last > 0 && maxAbs > 0) {
-    // 0..1: how close final PnL is to the best level reached
-    R = last / maxAbs;
+    // Drawdown as fraction of peak
+    const dd = peak > eps ? (peak - e) / peak : 0;
+    if (dd > maxDrawdown) {
+      maxDrawdown = dd;
+    }
+    sumDd2 += dd * dd;
   }
 
-  // Final SmoothPnlScore
-  // Denominator includes 1 to keep it stable even with tiny drawdowns
-  const score = (Math.max(0, R) * upFrac) / (1 + mdd + ulcer);
+  const ulcerIndex = Math.sqrt(sumDd2 / n);
+
+  // Final Stability Score with exponential penalties
+  const penaltyDrawdown = Math.exp(-maxDrawdown / D0);
+  const penaltyUlcer = Math.exp(-ulcerIndex / D0);
+  const penaltySigma = Math.exp(-downsideVolatility / S0);
+
+  const score = upFraction * penaltyDrawdown * penaltyUlcer * penaltySigma;
 
   return {
     score: Number.isFinite(score) ? score : 0,
-    maxDrawdown: mdd,
-    ulcerIndex: ulcer,
-    upFraction: upFrac,
+    maxDrawdown,
+    ulcerIndex,
+    upFraction,
+    downsideVolatility,
+    isProfitable: true,
   };
 }
 
 /**
- * Computes adjusted win rate with Laplace smoothing and 100% penalty.
+ * Computes progressive win rate penalty for win rates below threshold.
+ * 100% win rate returns 0 (filtered out as suspicious).
  *
- * @param numWins - Number of winning trades
- * @param numLosses - Number of losing trades
- * @returns Adjusted win rate [0, 1]
+ * @param winRate - Raw win rate [0, 1]
+ * @param threshold - Threshold below which penalties apply (default 0.60)
+ * @returns Win rate score [0, 1], or 0 for 100% win rate
  */
-export function computeAdjustedWinRate(numWins: number, numLosses: number): number {
-  // Laplace (add-one) smoothing to prevent extreme values with few trades
-  const baseWinRate = (numWins + 1) / (numWins + numLosses + 2);
-
-  // Penalize suspicious 100% win rates (too good to be true)
-  if (numLosses === 0 && numWins > 0) {
-    return 0.7 * baseWinRate; // 30% penalty for zero losses
+export function computeWinRateScore(winRate: number, threshold: number = 0.60): number {
+  // Filter out 100% win rate as suspicious
+  if (winRate >= 0.999) {
+    return 0;
   }
 
-  // Also penalize very high win rates with many trades (likely manipulation)
-  if (baseWinRate > 0.95 && numWins + numLosses > 20) {
-    return 0.8 * baseWinRate;
+  if (winRate >= threshold) {
+    // No penalty above threshold, but cap at 1.0
+    return Math.min(1.0, winRate);
   }
 
-  return baseWinRate;
+  // Progressive penalty below threshold (increased penalties)
+  // At threshold: score = threshold (no penalty)
+  // At 55%: mild penalty
+  // At 50%: moderate penalty
+  // At 45%: severe penalty
+  // At 40%: very severe penalty
+  // Below 35%: extreme penalty
+
+  const deficit = threshold - winRate;
+
+  if (deficit <= 0.05) {
+    // 55-60%: mild penalty (0.85x)
+    return winRate * 0.85;
+  } else if (deficit <= 0.10) {
+    // 50-55%: moderate penalty (0.7x)
+    return winRate * 0.7;
+  } else if (deficit <= 0.15) {
+    // 45-50%: severe penalty (0.5x)
+    return winRate * 0.5;
+  } else if (deficit <= 0.20) {
+    // 40-45%: very severe penalty (0.3x)
+    return winRate * 0.3;
+  } else if (deficit <= 0.25) {
+    // 35-40%: extreme penalty (0.15x)
+    return winRate * 0.15;
+  } else {
+    // Below 35%: near zero (0.05x)
+    return winRate * 0.05;
+  }
+}
+
+/**
+ * Computes progressive trade frequency penalty.
+ * - Minimum 3 trades required (returns 0 if below)
+ * - Maximum 200 trades allowed (returns 0 if above)
+ * - Progressive penalty for trades > 100
+ *
+ * @param numTrades - Number of trades in the period
+ * @param minTrades - Minimum trades required (default 3)
+ * @param maxTrades - Maximum trades allowed (default 200)
+ * @param penaltyThreshold - Threshold above which penalties apply (default 100)
+ * @returns Trade frequency score [0, 1]
+ */
+export function computeTradeFreqScore(
+  numTrades: number,
+  minTrades: number = 3,
+  maxTrades: number = 200,
+  penaltyThreshold: number = 100
+): number {
+  // Hard filter: minimum trades required
+  if (numTrades < minTrades) {
+    return 0;
+  }
+
+  // Hard filter: maximum trades exceeded
+  if (numTrades > maxTrades) {
+    return 0;
+  }
+
+  // No penalty if under threshold
+  if (numTrades <= penaltyThreshold) {
+    return 1.0;
+  }
+
+  // Progressive penalty for trades > 100 (up to 200)
+  const excess = numTrades - penaltyThreshold;
+  const maxExcess = maxTrades - penaltyThreshold; // 100 trades of penalty range
+
+  if (excess <= 25) {
+    // 100-125 trades: mild penalty (0.85x)
+    return 0.85;
+  } else if (excess <= 50) {
+    // 125-150 trades: moderate penalty (0.7x)
+    return 0.7;
+  } else if (excess <= 75) {
+    // 150-175 trades: severe penalty (0.5x)
+    return 0.5;
+  } else {
+    // 175-200 trades: very severe penalty (0.3x)
+    return 0.3;
+  }
 }
 
 /**
  * Computes normalized PnL score using log scaling.
+ * This gives modest weight to large accounts as a tiebreaker.
  *
  * @param realizedPnl - Realized PnL (can be negative)
- * @param reference - Reference PnL for normalization
- * @returns Score [0, 1] where 1 = excellent, 0 = poor/negative
+ * @param reference - Reference PnL for normalization (default 100000)
+ * @returns Normalized score [0, 1]
  */
-export function computeNormalizedPnl(realizedPnl: number, reference: number): number {
-  if (realizedPnl <= 0) {
+export function computeNormalizedPnl(realizedPnl: number, reference: number = 100000): number {
+  if (!Number.isFinite(realizedPnl) || realizedPnl <= 0) {
     return 0;
   }
-
-  // Log scale: log10(pnl) normalized by log10(reference)
-  // This gives diminishing returns for extremely large PnLs
-  const logPnl = Math.log10(realizedPnl + 1);
-  const logRef = Math.log10(reference);
-
-  // Clamp to [0, 1]
-  return Math.min(1, Math.max(0, logPnl / logRef));
+  // Log scale: log(1 + pnl/ref) / log(1 + 10)
+  // At pnl = ref: score ≈ 0.3
+  // At pnl = 10*ref: score ≈ 1.0
+  const logScore = Math.log(1 + realizedPnl / reference) / Math.log(11);
+  return Math.min(1, Math.max(0, logScore));
 }
 
 /**
- * Computes trade frequency score with severe scalping penalties.
- * Prefers moderate activity - not too few (unreliable) or too many (overtrading/scalping).
- *
- * Penalty structure for trades > threshold (default 100/month):
- * - 100-150: mild penalty (0.7x)
- * - 150-200: moderate penalty (0.4x)
- * - 200-300: severe penalty (0.2x)
- * - 300+: extreme penalty (0.05x) - essentially filtered out
- *
- * @param numTrades - Number of trades
- * @param optimal - Optimal number of trades
- * @param sigma - Spread for preference decay
- * @param scalpingThreshold - Threshold above which scalping penalties apply (default: 100)
- * @returns Score [0, 1] centered around optimal, with scalping penalties
+ * Creates a zero-score result for invalid inputs
  */
-export function computeTradeFreqScore(
-  numTrades: number,
-  optimal: number,
-  sigma: number,
-  scalpingThreshold: number = 100
-): number {
-  if (numTrades <= 0) {
-    return 0;
-  }
+function createZeroResult(): ScoringResult {
+  return {
+    score: 0,
+    filtered: false,
+    details: {
+      stabilityScore: 0,
+      maxDrawdown: 0,
+      ulcerIndex: 0,
+      upFraction: 0,
+      downsideVolatility: 0,
+      rawWinRate: 0,
+      winRateScore: 0,
+      tradeFreqScore: 0,
+      normalizedPnl: 0,
+      weightedComponents: {
+        stability: 0,
+        winRate: 0,
+        tradeFreq: 0,
+        pnl: 0,
+      },
+    },
+  };
+}
 
-  // Gaussian-like decay from optimal
-  const diff = numTrades - optimal;
-  let score = Math.exp(-(diff * diff) / (2 * sigma * sigma));
-
-  // Progressive scalping penalties for trades > threshold
-  if (numTrades > scalpingThreshold) {
-    const excess = numTrades - scalpingThreshold;
-
-    if (excess <= 50) {
-      // 100-150 trades: mild penalty (0.7x)
-      score *= 0.7;
-    } else if (excess <= 100) {
-      // 150-200 trades: moderate penalty (0.4x)
-      score *= 0.4;
-    } else if (excess <= 200) {
-      // 200-300 trades: severe penalty (0.2x)
-      score *= 0.2;
-    } else {
-      // 300+ trades: extreme penalty (0.05x) - essentially filtered out
-      score *= 0.05;
-    }
-  }
-
-  return score;
+/**
+ * Creates a filtered result for accounts that fail criteria
+ */
+function createFilteredResult(
+  reason: 'not_profitable' | 'insufficient_data',
+  stabilityResult?: StabilityResult
+): ScoringResult {
+  return {
+    score: 0,
+    filtered: true,
+    filterReason: reason,
+    details: {
+      stabilityScore: stabilityResult?.score ?? 0,
+      maxDrawdown: stabilityResult?.maxDrawdown ?? 0,
+      ulcerIndex: stabilityResult?.ulcerIndex ?? 0,
+      upFraction: stabilityResult?.upFraction ?? 0,
+      downsideVolatility: stabilityResult?.downsideVolatility ?? 0,
+      rawWinRate: 0,
+      winRateScore: 0,
+      tradeFreqScore: 0,
+      normalizedPnl: 0,
+      weightedComponents: {
+        stability: 0,
+        winRate: 0,
+        tradeFreq: 0,
+        pnl: 0,
+      },
+    },
+  };
 }
 
 /**
  * Computes the composite performance score for a single account.
  *
- * Formula:
- * score = smoothPnlWeight * smoothPnlScore
- *       + winRateWeight * adjWinRate
- *       + pnlWeight * normalizedPnl
+ * Formula (weighted sum):
+ * score = stabilityWeight * stabilityScore
+ *       + winRateWeight * winRateScore
  *       + tradeFreqWeight * tradeFreqScore
+ *       + pnlWeight * normalizedPnl
  *
- * Hard filters:
- * - Max drawdown > 80%: filtered out (score = 0)
- * - Scalping penalty: progressive reduction for trades > 100/month
+ * Priority:
+ * 1. Stability Score (50%) - most important, measures smooth profit generation
+ * 2. Win Rate (25%) - with progressive penalty for < 60%
+ * 3. Trade Frequency (15%) - with progressive penalty for > 150 trades
+ * 4. Realized PnL (10%) - tiebreaker for large accounts
  *
  * @param stats - Account statistics for the period
  * @param params - Scoring hyperparameters (optional, uses defaults)
+ * @param options - Additional options for score computation
+ * @param options.computeFullScore - If true, compute full score even when filtered
  * @returns Scoring result with final score, filter status, and intermediate details
  */
 export function computePerformanceScore(
   stats: AccountStats,
-  params: ScoringParams = DEFAULT_SCORING_PARAMS
+  params: ScoringParams = DEFAULT_SCORING_PARAMS,
+  options: { computeFullScore?: boolean } = {}
 ): ScoringResult {
   const { realizedPnl, numTrades, numWins, numLosses, pnlList } = stats;
+  const { computeFullScore = false } = options;
 
   // Validate inputs
   if (!Number.isFinite(numTrades) || numTrades < 0) {
@@ -401,115 +551,78 @@ export function computePerformanceScore(
     return createZeroResult();
   }
 
-  // 1. Compute smooth PnL score from time series (includes maxDrawdown)
-  const smoothPnlResult = pnlList && pnlList.length >= 2
-    ? computeSmoothPnlScore(pnlList)
-    : { score: 0, maxDrawdown: 0, ulcerIndex: 0, upFraction: 0 };
+  // 1. Compute stability score from PnL time series
+  const stabilityResult = pnlList && pnlList.length >= 2
+    ? computeStabilityScore(pnlList, params.drawdownTolerance, params.downsideTolerance)
+    : { score: 0, maxDrawdown: 0, ulcerIndex: 0, upFraction: 0, downsideVolatility: 0, isProfitable: false };
 
-  const smoothPnlScore = smoothPnlResult.score;
-  const maxDrawdown = smoothPnlResult.maxDrawdown;
+  // Track filtering
+  let filtered = false;
+  let filterReason: 'not_profitable' | 'insufficient_data' | undefined;
 
-  // HARD FILTER: Max drawdown > 80% - account is filtered out
-  if (maxDrawdown > params.maxDrawdownLimit) {
-    return createFilteredResult(maxDrawdown, 'max_drawdown_exceeded');
+  // Check if account is profitable (based on pnlList)
+  if (pnlList && pnlList.length >= 2 && !stabilityResult.isProfitable) {
+    filtered = true;
+    filterReason = 'not_profitable';
+    if (!computeFullScore) {
+      return createFilteredResult('not_profitable', stabilityResult);
+    }
   }
 
-  // 2. Compute adjusted win rate
+  // Check for insufficient data
+  if (!pnlList || pnlList.length < 2) {
+    filtered = true;
+    filterReason = 'insufficient_data';
+    if (!computeFullScore) {
+      return createFilteredResult('insufficient_data');
+    }
+  }
+
+  // 2. Compute win rate score with progressive penalty
   const rawWinRate = numWins + numLosses > 0
     ? numWins / (numWins + numLosses)
     : 0;
-  const adjWinRate = computeAdjustedWinRate(numWins, numLosses);
+  const winRateScore = computeWinRateScore(rawWinRate, params.winRateThreshold);
 
-  // 3. Compute normalized PnL
-  const normalizedPnl = computeNormalizedPnl(
-    realizedPnl ?? 0,
-    params.pnlReference
-  );
-
-  // 4. Compute trade frequency score (with scalping penalties built in)
+  // 3. Compute trade frequency score with progressive penalty
   const tradeFreqScore = computeTradeFreqScore(
     numTrades,
-    params.optimalTrades,
-    params.tradeSigma,
-    params.scalpingThreshold
+    params.minTrades,
+    params.maxTrades,
+    params.tradeCountThreshold
   );
 
+  // 4. Compute normalized PnL (tiebreaker)
+  const normalizedPnl = computeNormalizedPnl(realizedPnl ?? 0, params.pnlReference);
+
   // 5. Compute weighted components
-  const weightedSmooth = params.smoothPnlWeight * smoothPnlScore;
-  const weightedWinRate = params.winRateWeight * adjWinRate;
+  const weightedStability = params.stabilityWeight * stabilityResult.score;
+  const weightedWinRate = params.winRateWeight * winRateScore;
+  const weightedTradeFreq = params.tradeFreqWeight * tradeFreqScore;
   const weightedPnl = params.pnlWeight * normalizedPnl;
-  const weightedFreq = params.tradeFreqWeight * tradeFreqScore;
 
   // 6. Final composite score
-  const score = weightedSmooth + weightedWinRate + weightedPnl + weightedFreq;
+  const score = weightedStability + weightedWinRate + weightedTradeFreq + weightedPnl;
 
   return {
     score: Number.isFinite(score) ? score : 0,
-    filtered: false,
+    filtered,
+    filterReason,
     details: {
-      smoothPnlScore,
-      maxDrawdown,
+      stabilityScore: stabilityResult.score,
+      maxDrawdown: stabilityResult.maxDrawdown,
+      ulcerIndex: stabilityResult.ulcerIndex,
+      upFraction: stabilityResult.upFraction,
+      downsideVolatility: stabilityResult.downsideVolatility,
       rawWinRate,
-      adjWinRate,
-      normalizedPnl,
+      winRateScore,
       tradeFreqScore,
+      normalizedPnl,
       weightedComponents: {
-        smoothPnl: weightedSmooth,
+        stability: weightedStability,
         winRate: weightedWinRate,
+        tradeFreq: weightedTradeFreq,
         pnl: weightedPnl,
-        tradeFreq: weightedFreq,
-      },
-    },
-  };
-}
-
-/**
- * Creates a zero-score result for invalid inputs
- */
-function createZeroResult(): ScoringResult {
-  return {
-    score: 0,
-    filtered: false,
-    details: {
-      smoothPnlScore: 0,
-      maxDrawdown: 0,
-      rawWinRate: 0,
-      adjWinRate: 0,
-      normalizedPnl: 0,
-      tradeFreqScore: 0,
-      weightedComponents: {
-        smoothPnl: 0,
-        winRate: 0,
-        pnl: 0,
-        tradeFreq: 0,
-      },
-    },
-  };
-}
-
-/**
- * Creates a filtered result for accounts that fail hard filters
- */
-function createFilteredResult(
-  maxDrawdown: number,
-  reason: 'max_drawdown_exceeded' | 'scalping_penalty'
-): ScoringResult {
-  return {
-    score: 0,
-    filtered: true,
-    filterReason: reason,
-    details: {
-      smoothPnlScore: 0,
-      maxDrawdown,
-      rawWinRate: 0,
-      adjWinRate: 0,
-      normalizedPnl: 0,
-      tradeFreqScore: 0,
-      weightedComponents: {
-        smoothPnl: 0,
-        winRate: 0,
-        pnl: 0,
-        tradeFreq: 0,
       },
     },
   };
@@ -532,196 +645,72 @@ export interface RankableAccount {
  */
 export interface RankedAccount {
   address: string;
-  rank: number;
   score: number;
-  stats: AccountStats;
-  details: ScoringResult['details'];
-  isCustom: boolean;
+  rank: number;
+  weight: number;
   filtered: boolean;
-  filterReason?: 'max_drawdown_exceeded' | 'scalping_penalty';
+  filterReason?: string;
+  details: ScoringResult['details'];
+  isCustom?: boolean;
   meta?: Record<string, unknown>;
 }
 
 /**
- * Computes scores for multiple accounts and returns them sorted by score descending.
- * Filtered accounts (MDD > 80%) are excluded from ranking but can be tracked separately.
+ * Ranks a list of accounts by their performance scores.
  *
- * @param accounts - Array of accounts with their statistics
- * @param params - Scoring hyperparameters (optional)
- * @param includeFiltered - If true, include filtered accounts at the end with rank 0 (default: false)
- * @returns Array of ranked accounts sorted by score (highest first)
+ * @param accounts - Array of accounts to rank
+ * @param params - Scoring parameters
+ * @param options - Ranking options
+ * @returns Sorted array of ranked accounts (highest score first)
  */
 export function rankAccounts(
   accounts: RankableAccount[],
   params: ScoringParams = DEFAULT_SCORING_PARAMS,
-  includeFiltered: boolean = false
+  options: { topN?: number; computeFullScore?: boolean } = {}
 ): RankedAccount[] {
-  // Compute scores for all accounts
-  const allScored = accounts.map((account) => {
-    const result = computePerformanceScore(account.stats, params);
+  const { topN, computeFullScore = false } = options;
+
+  // Score all accounts
+  const scored = accounts.map((account) => {
+    const result = computePerformanceScore(account.stats, params, { computeFullScore });
     return {
       address: account.address,
       score: result.score,
-      stats: account.stats,
-      details: result.details,
-      isCustom: account.isCustom ?? false,
+      rank: 0, // Will be assigned after sorting
+      weight: 0, // Will be computed after ranking
       filtered: result.filtered,
       filterReason: result.filterReason,
+      details: result.details,
+      isCustom: account.isCustom,
       meta: account.meta,
     };
   });
 
-  // Separate filtered and valid accounts
-  const validAccounts = allScored.filter((a) => !a.filtered);
-  const filteredAccounts = allScored.filter((a) => a.filtered);
+  // Sort by score descending
+  scored.sort((a, b) => b.score - a.score);
 
-  // Sort valid accounts by score descending
-  validAccounts.sort((a, b) => b.score - a.score);
-
-  // Assign ranks (1-based) to valid accounts only
-  const ranked = validAccounts.map((account, index) => ({
-    ...account,
-    rank: index + 1,
-  }));
-
-  // Optionally append filtered accounts with rank 0
-  if (includeFiltered && filteredAccounts.length > 0) {
-    const unrankedFiltered = filteredAccounts.map((account) => ({
-      ...account,
-      rank: 0, // Filtered accounts have no rank
-    }));
-    return [...ranked, ...unrankedFiltered];
+  // Assign ranks
+  for (let i = 0; i < scored.length; i++) {
+    scored[i].rank = i + 1;
   }
 
-  return ranked;
-}
+  // Compute weights for top N (excluding filtered)
+  const eligible = scored.filter((a) => !a.filtered);
+  const top = topN ? eligible.slice(0, topN) : eligible;
+  const sumScores = top.reduce((sum, a) => sum + a.score, 0);
 
-/**
- * Selects top N system accounts and merges with custom accounts.
- * Custom accounts are always included and ranked together with system accounts.
- * Filtered accounts (MDD > 80%) are excluded from selection.
- *
- * @param systemAccounts - Array of system-selected accounts
- * @param customAccounts - Array of user-added custom accounts (max 3)
- * @param topN - Number of top system accounts to include (default: 10)
- * @param params - Scoring hyperparameters
- * @returns Combined and ranked array (10-13 accounts)
- */
-export function selectAndRankAccounts(
-  systemAccounts: RankableAccount[],
-  customAccounts: RankableAccount[],
-  topN: number = 10,
-  params: ScoringParams = DEFAULT_SCORING_PARAMS
-): RankedAccount[] {
-  // Score all system accounts first
-  const scoredSystem = systemAccounts.map((account) => {
-    const result = computePerformanceScore(account.stats, params);
-    return {
-      ...account,
-      score: result.score,
-      details: result.details,
-      filtered: result.filtered,
-      filterReason: result.filterReason,
-      isCustom: false,
-    };
-  });
-
-  // Filter out accounts that failed hard filters, then sort and take top N
-  const validSystem = scoredSystem.filter((a) => !a.filtered);
-  validSystem.sort((a, b) => b.score - a.score);
-  const topSystem = validSystem.slice(0, topN);
-
-  // Score custom accounts (custom accounts are always included but may be flagged)
-  const scoredCustom = customAccounts.slice(0, 3).map((account) => {
-    const result = computePerformanceScore(account.stats, params);
-    return {
-      ...account,
-      score: result.score,
-      details: result.details,
-      filtered: result.filtered,
-      filterReason: result.filterReason,
-      isCustom: true,
-    };
-  });
-
-  // Merge and re-rank all accounts together
-  const allAccounts = [...topSystem, ...scoredCustom];
-
-  // Remove duplicates (prefer custom if address appears in both)
-  const customAddresses = new Set(scoredCustom.map((a) => a.address.toLowerCase()));
-  const deduped = allAccounts.filter((account) => {
-    if (account.isCustom) return true;
-    return !customAddresses.has(account.address.toLowerCase());
-  });
-
-  // Sort by score and assign final ranks
-  deduped.sort((a, b) => b.score - a.score);
-
-  return deduped.map((account, index) => ({
-    address: account.address,
-    rank: index + 1,
-    score: account.score,
-    stats: account.stats,
-    details: account.details,
-    isCustom: account.isCustom,
-    filtered: account.filtered,
-    filterReason: account.filterReason,
-    meta: account.meta,
-  }));
-}
-
-/**
- * Maps raw leaderboard entry data to AccountStats format.
- * Handles field name differences and provides defaults for missing data.
- *
- * @param entry - Raw leaderboard entry from database or API
- * @returns AccountStats object ready for scoring
- */
-export function mapToAccountStats(entry: {
-  realizedPnl?: number;
-  realized_pnl?: number;
-  numTrades?: number;
-  num_trades?: number;
-  executedOrders?: number;
-  executed_orders?: number;
-  statClosedPositions?: number;
-  stat_closed_positions?: number;
-  numWins?: number;
-  num_wins?: number;
-  numLosses?: number;
-  num_losses?: number;
-  winRate?: number;
-  win_rate?: number;
-  pnlList?: PnlPoint[];
-  pnl_list?: PnlPoint[];
-}): AccountStats {
-  // Get realized PnL
-  const realizedPnl = entry.realizedPnl ?? entry.realized_pnl ?? 0;
-
-  // Get number of trades
-  const numTrades = entry.numTrades ?? entry.num_trades ??
-    entry.executedOrders ?? entry.executed_orders ??
-    entry.statClosedPositions ?? entry.stat_closed_positions ?? 0;
-
-  // Get wins and losses
-  let numWins = entry.numWins ?? entry.num_wins ?? 0;
-  let numLosses = entry.numLosses ?? entry.num_losses ?? 0;
-
-  // If wins/losses not available, estimate from win rate and numTrades
-  if (numWins === 0 && numLosses === 0 && numTrades > 0) {
-    const winRate = entry.winRate ?? entry.win_rate ?? 0.5;
-    numWins = Math.round(numTrades * winRate);
-    numLosses = numTrades - numWins;
+  for (const account of scored) {
+    if (top.includes(account) && sumScores > 0) {
+      account.weight = account.score / sumScores;
+    } else {
+      account.weight = 0;
+    }
   }
 
-  // Get PnL list
-  const pnlList = entry.pnlList ?? entry.pnl_list ?? [];
+  return topN ? scored.slice(0, topN) : scored;
+}
 
-  return {
-    realizedPnl,
-    numTrades,
-    numWins,
-    numLosses,
-    pnlList,
-  };
+// Helper function to clamp value between min and max
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
 }
