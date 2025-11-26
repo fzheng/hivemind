@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Any
 from collections import OrderedDict
 
@@ -101,7 +101,7 @@ async def restore_tracked_addresses() -> int:
 
 def evict_stale_entries():
     """Remove stale entries to prevent unbounded memory growth."""
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     stale_cutoff = now - timedelta(hours=STALE_THRESHOLD_HOURS)
 
     # Remove stale tracked addresses
@@ -124,7 +124,7 @@ async def handle_candidate(msg):
     with score_latency.time():
         data = CandidateEvent.model_validate_json(msg.data.decode())
         candidate_counter.inc()
-        leaderboard_meta = data.meta.get("leaderboard") if isinstance(data.meta, dict) else {}
+        leaderboard_meta = (data.meta.get("leaderboard") if isinstance(data.meta, dict) else None) or {}
         weight = float(leaderboard_meta.get("weight") or data.score_hint or 0.1)
         weight = max(0.05, min(1.0, weight))
         rank = int(leaderboard_meta.get("rank") or 999)
@@ -140,7 +140,7 @@ async def handle_candidate(msg):
             "rank": rank,
             "period": period,
             "position": 0.0,
-            "updated": datetime.utcnow(),
+            "updated": datetime.now(timezone.utc),
         }
         tracked_addresses[addr_lower] = state
 
@@ -164,7 +164,7 @@ async def handle_fill(msg):
     side_multiplier = 1 if data.side == "buy" else -1
     delta = side_multiplier * float(data.size or 0)
     state["position"] = state.get("position", 0.0) + delta
-    state["updated"] = datetime.utcnow()
+    state["updated"] = datetime.now(timezone.utc)
 
     # Persist updated position to database
     await persist_tracked_address(addr_lower, state)
@@ -176,7 +176,7 @@ async def handle_fill(msg):
         weight=state["weight"],
         rank=state["rank"],
         window_s=60,
-        ts=datetime.utcnow(),
+        ts=datetime.now(timezone.utc),
         meta={
             "source": "leaderboard",
             "period": state["period"],

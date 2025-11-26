@@ -21,3 +21,7 @@ CREATE INDEX IF NOT EXISTS hl_leaderboard_pnl_points_ts_idx
 -- Note: Cannot create a partial index for open tickets using NOT EXISTS
 -- PostgreSQL doesn't support subqueries in partial index predicates
 -- This would require application-level filtering or a materialized view
+
+-- Index for hl_current_positions lookups by address (used in ANY() queries)
+CREATE INDEX IF NOT EXISTS hl_current_positions_address_idx
+  ON hl_current_positions (address);

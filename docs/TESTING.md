@@ -23,7 +23,7 @@ npm test -- --verbose
 
 ## Test Coverage
 
-Current test coverage: **40% overall**, with critical modules at **80%+**
+Current test coverage: **47% overall**, with critical modules at **98%+**
 
 ### Covered Modules
 
@@ -31,8 +31,8 @@ Current test coverage: **40% overall**, with critical modules at **80%+**
 |--------|----------|-------------|
 | **validation.ts** | 100% | Input validation (addresses, nicknames) |
 | **queue.ts** | 100% | Event queue for WebSocket streaming |
-| **pagination.ts** | 92% | Trade pagination and deduplication |
-| **scoring.ts** | 70% | Leaderboard scoring algorithms |
+| **scoring.ts** | 99% | Performance scoring (stability, win rate, trade freq) |
+| **pagination.ts** | 93% | Trade pagination and deduplication |
 | **leaderboard.ts** | 18% | Leaderboard service (needs integration tests) |
 
 ## Test Suites

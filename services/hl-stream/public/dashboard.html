@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Hyperliquid Scout Dashboard</title>
+    <title>HL Trader Intelligence</title>
     <link rel="stylesheet" href="/dashboard/static/dashboard.css" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -15,7 +15,7 @@
   <body>
     <header>
       <div class="header-left">
-        <h1>Hyperliquid Ops Dashboard</h1>
+        <h1>HL Trader Intelligence</h1>
         <p id="dashboard-status">Loading stats…</p>
       </div>
       <div style="display: flex; gap: 12px; align-items: center;">
@@ -98,9 +98,14 @@
       </section>
 
       <section class="grid-2">
-        <div class="card">
-          <h3>Live Fills</h3>
-          <div class="table-wrapper">
+        <div class="card fills-card">
+          <div class="card-header">
+            <h3>Live Fills (BTC/ETH)</h3>
+            <div class="fills-meta">
+              <span id="fills-time-range" class="time-range">No fills yet</span>
+            </div>
+          </div>
+          <div class="table-wrapper fills-scroll-container" id="fills-scroll-container">
             <table class="stats-table fills-table">
               <thead>
                 <tr>
@@ -115,6 +120,13 @@
               </thead>
               <tbody id="fills-table"></tbody>
             </table>
+            <div id="fills-load-more" class="load-more-indicator" style="display: none;">
+              <span class="load-more-spinner"></span>
+              <span>Loading more fills...</span>
+            </div>
+            <div id="fills-load-history" class="load-history-btn-container">
+              <button id="load-history-btn" class="load-history-btn">Load Historical Fills</button>
+            </div>
           </div>
         </div>
         <div class="card">

@@ -7,12 +7,11 @@ Phase 1 refactors the legacy single-process tracker into a four-service monore
 ```
 services/
   hl-scout   TypeScript  — address ingest + seeding + candidate emitter
-  hl-stream  TypeScript  — watcher/WS + fake fill publisher
+  hl-stream  TypeScript  — watcher/WS + real-time fill publisher + dashboard
   hl-sage    Python      — scoring + ranks API
   hl-decide  Python      — decision engine + tickets/outcomes
 contracts/              — jsonschema + generated zod & pydantic bindings
 docker/postgres-init    — SQL auto-run when Postgres initializes a fresh volume
-db/migrations           — archived schema snapshots
 ```
 
 ## Quick Start
@@ -69,12 +68,16 @@ Run `npm run contracts:generate` to refresh bindings (automatically wired as `pr
 
 ## Database
 
-When the Postgres container receives a fresh data directory it automatically executes every `.sql` file in `docker/postgres-init/` (currently `001_base.sql`). That script creates all shared tables (`addresses`, `hl_events`, `hl_current_positions`, `marks_1m`, `tickets`, `ticket_outcomes`, `hl_leaderboard_entries`, …), so you do **not** need to run `npm run migrate`. To reset the schema, run `docker compose down -v` and bring the stack back up—Postgres will reapply the base schema during initialization.
+When the Postgres container receives a fresh data directory it automatically executes every `.sql` file in `docker/postgres-init/` in alphabetical order. These scripts create all shared tables (`addresses`, `hl_events`, `hl_current_positions`, `marks_1m`, `tickets`, `ticket_outcomes`, `hl_leaderboard_entries`, `sage_tracked_addresses`, `decide_scores`, `decide_fills`, …) and performance indexes, so you do **not** need to run any manual migrations. To reset the schema, run `docker compose down -v` and bring the stack back up—Postgres will reapply the full schema during initialization.
 
-For long-running clusters, apply any new SQL under `db/migrations/` before rolling out updated containers. For example:
+**Note**: Init scripts only run on first container creation. To apply new schema changes to an existing database:
 
 ```bash
-psql "$DATABASE_URL" -f db/migrations/002_leaderboard_stats.sql
+# Apply a specific migration
+docker compose exec postgres psql -U hlbot -d hlbot -f /docker-entrypoint-initdb.d/008_add_hl_events_indexes.sql
+
+# Or reset everything (drops all data)
+docker compose down -v && docker compose up --build
 ```
 
 ## Environment
@@ -157,11 +160,15 @@ docker compose down && docker compose build --no-cache && docker compose up -d
 - Swagger UI at http://localhost:4101/docs.
 
 ### hl-stream (TS)
-- Pulls the weighted leaderboard selection from hl-scout and mirrors those addresses’ Hyperliquid realtime feeds.
+- Pulls the weighted leaderboard selection from hl-scout and mirrors those addresses' Hyperliquid realtime feeds.
 - Exposes `/ws` with the legacy event queue semantics.
-- Emits authentic fills for tracked addresses → `c.fills.v1` + WS broadcast.
+- Emits authentic BTC/ETH fills for tracked addresses → `c.fills.v1` + WS broadcast.
 - Swagger UI at http://localhost:4102/docs.
-- Serves the operator dashboard at `/dashboard` and proxies summary/fills/decision data.
+- Serves the operator dashboard at `/dashboard` with:
+  - Real-time position tracking with status polling
+  - Infinite scroll fills history with aggregation
+  - Historical fills backfill from Hyperliquid API
+  - Links to [Hypurrscan](https://hypurrscan.io) for address details
 
 ### hl-sage (Py/FastAPI)
 - Subscribes to `a.candidates.v1`, computes deterministic equal weights, emits `b.scores.v1`.
@@ -177,11 +184,17 @@ docker compose down && docker compose build --no-cache && docker compose up -d
 ### Operator Dashboard
 Open http://localhost:4102/dashboard to monitor the stack:
 
-- TradingView BTC/ETH toggle chart (official widget).
-- Address performance table (win rate, trades, efficiency, realized PnL, Hyperliquid tx counts).
-- Live fills feed streamed from Hyperliquid userEvents via `/ws`.
-- Decision panel (tickets + outcomes) and a recommendation card highlighting the best-performing address. Address rows include Hyperliquid profile metadata (via the `userDetails` Info API). The highlighted address also powers the “push to user” recommendation data returned by `GET /dashboard/summary`.
-- Shows top performance over the last 30 days with composite scoring.
+- **TradingView Chart**: BTC/ETH toggle with official TradingView widget
+- **Top Performance Table**: Win rate, trades, efficiency, realized PnL, live BTC/ETH holdings
+- **Live Fills Feed**:
+  - Real-time BTC/ETH fills streamed via WebSocket
+  - Fill aggregation (groups trades within 1-minute windows)
+  - Infinite scroll with pagination for historical data
+  - "Load Historical Fills" button to backfill from Hyperliquid API
+  - Time range indicator showing oldest to newest fill
+- **Decision Panel**: Tickets + outcomes with recommendation card
+- **Custom Accounts**: Track up to 3 custom addresses alongside system-selected ones
+- **Position Status**: Automatic polling until positions are loaded (max 60s timeout)
 
 ## Leaderboard Ingest
 
@@ -209,9 +222,10 @@ A comprehensive code review identified and fixed 20 issues across critical secur
 - ✅ **Input Validation**: New validation module for Ethereum addresses with format checking
 - ✅ **Transaction Safety**: Leaderboard updates wrapped in database transactions (prevents data loss)
 - ✅ **Error Handling**: Comprehensive error logging throughout all services
+- ✅ **Python datetime fix**: Replaced deprecated `datetime.utcnow()` with `datetime.now(timezone.utc)`
 
 ### Performance Optimizations
-- ✅ **Database Indexes**: Added 4 strategic indexes for 25-50% faster queries
+- ✅ **Database Indexes**: Added strategic indexes for faster queries (trades, positions, leaderboard)
 - ✅ **Memory Management**: Python services now use LRU caching with configurable limits
 - ✅ **WebSocket Cleanup**: Fixed memory leaks with proper interval and connection management
 - ✅ **Query Optimization**: Removed code duplication in pagination functions
@@ -221,7 +235,15 @@ A comprehensive code review identified and fixed 20 issues across critical secur
 - ✅ **Promise Handling**: All background promises now have proper error handlers
 - ✅ **Configuration**: Added environment variables for memory limits in Python services
 
-See [CODE_REVIEW_FIXES.md](CODE_REVIEW_FIXES.md) for detailed technical documentation.
+### Dashboard & API Enhancements
+- ✅ **ETH Support**: Now tracks both BTC and ETH perpetual fills (not just BTC)
+- ✅ **Fill Aggregation**: Groups multiple fills within 1-minute windows for cleaner display
+- ✅ **Infinite Scroll**: Paginated fills with automatic loading on scroll
+- ✅ **Historical Backfill**: Fetch historical fills from Hyperliquid API on demand
+- ✅ **Position Polling**: Dashboard polls for position readiness with 60s timeout
+- ✅ **External Links**: Address links now point to Hypurrscan for detailed on-chain info
+
+See [CODE_REVIEW_FIXES.md](docs/CODE_REVIEW_FIXES.md) for detailed technical documentation.
 
 ### New Environment Variables
 

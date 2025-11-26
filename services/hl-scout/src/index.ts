@@ -8,7 +8,7 @@ import {
   CandidateEvent,
   CandidateEventSchema,
   createLogger,
-  fetchUserBtcFills,
+  fetchUserFills,
   fetchUserProfile,
   fetchPerpMarkPrice,
   getOwnerToken,
@@ -16,6 +16,7 @@ import {
   getPort,
   initMetrics,
   createHistogram,
+  metricsHandler,
   insertTradeIfNew,
   listAddresses,
   publishJson,
@@ -244,7 +245,8 @@ async function publishCandidate(
 }
 
 async function backfillRecent(address: string, limit = 50): Promise<number> {
-  const fills = await fetchUserBtcFills(address, { aggregateByTime: true });
+  // Fetch both BTC and ETH fills from Hyperliquid API
+  const fills = await fetchUserFills(address, { aggregateByTime: true, symbols: ['BTC', 'ETH'] });
   let inserted = 0;
   for (const f of (fills || []).slice(0, limit)) {
     const delta = f.side === 'B' ? +f.sz : -f.sz;
@@ -256,7 +258,7 @@ async function backfillRecent(address: string, limit = 50): Promise<number> {
     const payload = {
       at: new Date(f.time).toISOString(),
       address,
-      symbol: 'BTC',
+      symbol: f.coin, // Use actual coin (BTC or ETH)
       action,
       size: Math.abs(f.sz),
       startPosition: f.startPosition,
@@ -769,13 +771,6 @@ async function main() {
   app.listen(port, () => {
     logger.info('hl-scout listening', { port });
   });
-}
-
-function metricsHandler(ctx: ReturnType<typeof initMetrics>) {
-  return async (_req: Request, res: Response) => {
-    res.setHeader('Content-Type', ctx.registry.contentType);
-    res.send(await ctx.registry.metrics());
-  };
 }
 
 main().catch((err) => {

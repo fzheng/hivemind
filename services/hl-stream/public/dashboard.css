@@ -793,6 +793,16 @@ td {
   font-size: 0.875rem;
 }
 
+.placeholder.loading {
+  color: #60a5fa;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
 /* Mobile-first responsive design */
 @media (max-width: 640px) {
   header {
@@ -966,4 +976,144 @@ td {
   main {
     padding: 24px;
   }
+}
+
+/* Fills card enhancements */
+.fills-card .card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.fills-card .card-header h3 {
+  margin: 0;
+}
+
+.fills-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.time-range {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  background: var(--bg-input);
+  padding: 4px 10px;
+  border-radius: 12px;
+  border: 1px solid var(--border-primary);
+}
+
+/* Scrollable fills container */
+.fills-scroll-container {
+  max-height: 400px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--text-muted) transparent;
+}
+
+.fills-scroll-container::-webkit-scrollbar {
+  width: 6px;
+}
+
+.fills-scroll-container::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.fills-scroll-container::-webkit-scrollbar-thumb {
+  background: var(--text-muted);
+  border-radius: 3px;
+}
+
+.fills-scroll-container::-webkit-scrollbar-thumb:hover {
+  background: var(--text-secondary);
+}
+
+/* Aggregation badge */
+.agg-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 2px 6px;
+  font-size: 0.65rem;
+  font-weight: 600;
+  background: rgba(99, 102, 241, 0.2);
+  color: var(--accent-text);
+  border-radius: 8px;
+  vertical-align: middle;
+}
+
+.aggregated-row {
+  background: rgba(99, 102, 241, 0.05);
+}
+
+.aggregated-row:hover {
+  background: rgba(99, 102, 241, 0.1);
+}
+
+/* Load more indicator */
+.load-more-indicator {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 16px;
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+}
+
+.load-more-spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--border-secondary);
+  border-top-color: var(--accent-primary);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* End of fills reached */
+.no-more-fills {
+  text-align: center;
+  padding: 12px;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+/* Load history button */
+.load-history-btn-container {
+  display: flex;
+  justify-content: center;
+  padding: 16px;
+}
+
+.load-history-btn {
+  padding: 10px 20px;
+  background: var(--accent-primary);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.load-history-btn:hover:not(:disabled) {
+  background: var(--accent-hover);
+  transform: translateY(-1px);
+}
+
+.load-history-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.load-history-btn-container.hidden {
+  display: none;
 }

@@ -648,3 +648,130 @@ export async function getLastRefreshTime(period: number): Promise<string | null>
     return null;
   }
 }
+
+// =====================
+// Fills Backfill
+// =====================
+
+export interface BackfillFill {
+  id: number;
+  time_utc: string;
+  address: string;
+  symbol: string;
+  action: string;
+  size_signed: number | null;
+  previous_position: number | null;
+  price_usd: number | null;
+  closed_pnl_usd: number | null;
+  tx_hash: string | null;
+}
+
+/**
+ * Get fills for backfill, filtered to BTC/ETH only
+ * @param beforeTime ISO timestamp to fetch fills before
+ * @param limit Maximum number of fills to return
+ * @param addresses Optional array of addresses to filter by
+ */
+export async function getBackfillFills(opts: {
+  beforeTime?: string | null;
+  limit?: number;
+  addresses?: string[];
+}): Promise<{ fills: BackfillFill[]; hasMore: boolean; oldestTime: string | null }> {
+  const safeLimit = Math.max(1, Math.min(100, opts.limit ?? 50));
+  try {
+    const p = await getPool();
+    const params: (string | number | string[])[] = [];
+    const clauses: string[] = [
+      "type = 'trade'",
+      "(payload->>'symbol' IN ('BTC', 'ETH') OR (payload->>'symbol' IS NULL))" // Include BTC/ETH or legacy null symbol (assumed BTC)
+    ];
+    let idx = 1;
+
+    if (opts.addresses && opts.addresses.length > 0) {
+      clauses.push(`address = ANY($${idx++})`);
+      params.push(opts.addresses.map(a => a.toLowerCase()));
+    }
+
+    if (opts.beforeTime) {
+      clauses.push(`COALESCE((payload->>'at')::timestamptz, at) < $${idx++}`);
+      params.push(opts.beforeTime);
+    }
+
+    params.push(safeLimit + 1); // Fetch one extra to check hasMore
+
+    const sql = `
+      SELECT
+        id,
+        COALESCE((payload->>'at')::timestamptz, at) AS time_utc,
+        address,
+        COALESCE(payload->>'symbol', 'BTC') AS symbol,
+        payload->>'action' AS action,
+        CASE payload->>'action'
+          WHEN 'Increase Long'  THEN (payload->>'size')::numeric
+          WHEN 'Decrease Short' THEN (payload->>'size')::numeric
+          WHEN 'Close Short'    THEN (payload->>'size')::numeric
+          WHEN 'Decrease Long'  THEN -(payload->>'size')::numeric
+          WHEN 'Close Long'     THEN -(payload->>'size')::numeric
+          WHEN 'Increase Short' THEN -(payload->>'size')::numeric
+          ELSE (payload->>'size')::numeric
+        END AS size_signed,
+        (payload->>'startPosition')::numeric AS previous_position,
+        (payload->>'priceUsd')::numeric AS price_usd,
+        (payload->>'realizedPnlUsd')::numeric AS closed_pnl_usd,
+        payload->>'hash' AS tx_hash
+      FROM hl_events
+      WHERE ${clauses.join(' AND ')}
+      ORDER BY time_utc DESC, id DESC
+      LIMIT $${idx}
+    `;
+
+    const { rows } = await p.query(sql, params);
+
+    const hasMore = rows.length > safeLimit;
+    const fills = rows.slice(0, safeLimit).map((row: Record<string, unknown>) => ({
+      id: Number(row.id),
+      time_utc: String(row.time_utc),
+      address: String(row.address),
+      symbol: String(row.symbol || 'BTC'),
+      action: String(row.action || ''),
+      size_signed: row.size_signed != null ? Number(row.size_signed) : null,
+      previous_position: row.previous_position != null ? Number(row.previous_position) : null,
+      price_usd: row.price_usd != null ? Number(row.price_usd) : null,
+      closed_pnl_usd: row.closed_pnl_usd != null ? Number(row.closed_pnl_usd) : null,
+      tx_hash: row.tx_hash ? String(row.tx_hash) : null,
+    }));
+
+    const oldestTime = fills.length > 0 ? fills[fills.length - 1].time_utc : null;
+
+    return { fills, hasMore, oldestTime };
+  } catch (e) {
+    console.error('[persist] getBackfillFills failed:', e);
+    return { fills: [], hasMore: false, oldestTime: null };
+  }
+}
+
+/**
+ * Get the oldest fill time we have in DB for given addresses
+ */
+export async function getOldestFillTime(addresses?: string[]): Promise<string | null> {
+  try {
+    const p = await getPool();
+    let sql = `
+      SELECT MIN(COALESCE((payload->>'at')::timestamptz, at)) AS oldest
+      FROM hl_events
+      WHERE type = 'trade'
+        AND (payload->>'symbol' IN ('BTC', 'ETH') OR payload->>'symbol' IS NULL)
+    `;
+    const params: string[][] = [];
+
+    if (addresses && addresses.length > 0) {
+      sql += ' AND address = ANY($1)';
+      params.push(addresses.map(a => a.toLowerCase()));
+    }
+
+    const { rows } = await p.query(sql, params);
+    return rows[0]?.oldest ? String(rows[0].oldest) : null;
+  } catch (_e) {
+    return null;
+  }
+}

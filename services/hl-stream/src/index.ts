@@ -15,11 +15,16 @@ import {
   getOwnerToken,
   getPort,
   initMetrics,
+  metricsHandler,
   normalizeAddress,
   connectNats,
   ensureStream,
   publishJson,
-  FillEventSchema
+  FillEventSchema,
+  getBackfillFills,
+  getOldestFillTime,
+  fetchUserFills,
+  insertTradeIfNew
 } from '@hl/ts-lib';
 
 const OWNER_TOKEN = getOwnerToken();
@@ -280,7 +285,11 @@ async function main() {
       );
     }
   });
-  tracker.start().catch((err) => logger.error('realtime_start_failed', { err: err?.message }));
+
+  // Start tracker and await position priming to ensure holdings are available immediately
+  logger.info('starting_realtime_tracker', { watchlist: watchlist.length });
+  await tracker.start({ awaitPositions: true });
+  logger.info('realtime_tracker_ready', { watchlist: watchlist.length });
 
   const app = express();
   app.use(cors());
@@ -296,6 +305,10 @@ async function main() {
   app.get('/healthz', (_req, res) => res.json({ status: 'ok', watchlist: watchlist.length }));
   app.get('/metrics', metricsHandler(metrics));
   app.get('/watchlist', (_req, res) => res.json({ addresses: watchlist }));
+  app.get('/positions/status', (_req, res) => res.json({
+    positionsReady: tracker?.positionsReady ?? false,
+    watchlistCount: watchlist.length
+  }));
 
   app.post('/watchlist/refresh', ownerOnly, async (_req, res) => {
     watchlist = await fetchWatchlist();
@@ -307,6 +320,10 @@ async function main() {
   app.get('/dashboard/api/fills', (req, res) => proxyScout('/dashboard/fills', req, res));
   app.get('/dashboard/api/decisions', (req, res) => proxyScout('/dashboard/decisions', req, res));
   app.get('/dashboard/api/price', (req, res) => proxyScout('/dashboard/price', req, res));
+  app.get('/dashboard/api/positions-status', (_req, res) => res.json({
+    positionsReady: tracker?.positionsReady ?? false,
+    watchlistCount: watchlist.length
+  }));
 
   // Custom accounts proxy routes
   app.get('/dashboard/api/custom-accounts', (req, res) => proxyScout('/custom-accounts', req, res));
@@ -374,6 +391,21 @@ async function main() {
       });
       const body = await response.text();
       const type = response.headers.get('content-type') || 'application/json';
+
+      // After leaderboard refresh succeeds, immediately refresh watchlist and positions
+      // This ensures holdings are populated before the dashboard queries them
+      if (response.ok && tracker) {
+        try {
+          watchlist = await fetchWatchlist();
+          await tracker.refresh({ awaitPositions: true });
+          await tracker.forceRefreshAllPositions();
+          logger.info('watchlist_and_positions_synced_after_refresh', { count: watchlist.length });
+        } catch (syncErr: any) {
+          logger.warn('post_refresh_sync_failed', { err: syncErr?.message });
+          // Don't fail the request, the leaderboard refresh itself succeeded
+        }
+      }
+
       res.status(response.status).setHeader('Content-Type', type).send(body);
     } catch (err: any) {
       logger.error('leaderboard_refresh_proxy_failed', { err: err?.message });
@@ -381,6 +413,116 @@ async function main() {
     }
   });
   app.get('/dashboard/api/leaderboard/refresh-status', (req, res) => proxyScout('/leaderboard/refresh-status', req, res));
+
+  // Backfill fills endpoint for infinite scroll
+  app.get('/dashboard/api/fills/backfill', async (req, res) => {
+    try {
+      const beforeTime = req.query.before ? String(req.query.before) : null;
+      const limit = req.query.limit ? Math.min(100, Math.max(1, parseInt(String(req.query.limit), 10))) : 30;
+
+      // Get current watchlist addresses for filtering
+      const addresses = watchlist.length > 0 ? watchlist : undefined;
+
+      const result = await getBackfillFills({
+        beforeTime,
+        limit,
+        addresses
+      });
+
+      res.json({
+        fills: result.fills,
+        hasMore: result.hasMore,
+        oldestTime: result.oldestTime
+      });
+    } catch (err: any) {
+      logger.error('backfill_fills_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to fetch backfill fills' });
+    }
+  });
+
+  // Get oldest fill time for the current watchlist
+  app.get('/dashboard/api/fills/oldest', async (_req, res) => {
+    try {
+      const addresses = watchlist.length > 0 ? watchlist : undefined;
+      const oldestTime = await getOldestFillTime(addresses);
+      res.json({ oldestTime });
+    } catch (err: any) {
+      logger.error('oldest_fill_time_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to get oldest fill time' });
+    }
+  });
+
+  // Fetch historical fills from Hyperliquid API and store in database
+  app.post('/dashboard/api/fills/fetch-history', async (req, res) => {
+    try {
+      const limit = req.body?.limit ? Math.min(100, Math.max(1, parseInt(String(req.body.limit), 10))) : 50;
+      const addresses = watchlist.length > 0 ? watchlist : [];
+
+      if (addresses.length === 0) {
+        return res.json({ inserted: 0, message: 'No addresses in watchlist' });
+      }
+
+      let totalInserted = 0;
+      const results: Array<{ address: string; inserted: number }> = [];
+
+      // Fetch fills for each address (limit concurrency)
+      for (const address of addresses) {
+        try {
+          const fills = await fetchUserFills(address, { aggregateByTime: true, symbols: ['BTC', 'ETH'] });
+          let inserted = 0;
+
+          for (const f of (fills || []).slice(0, limit)) {
+            const delta = f.side === 'B' ? +f.sz : -f.sz;
+            const newPos = f.startPosition + delta;
+            let action = '';
+            if (f.startPosition === 0) action = delta > 0 ? 'Open Long (Open New)' : 'Open Short (Open New)';
+            else if (f.startPosition > 0) action = delta > 0 ? 'Increase Long' : (newPos === 0 ? 'Close Long (Close All)' : 'Decrease Long');
+            else action = delta < 0 ? 'Increase Short' : (newPos === 0 ? 'Close Short (Close All)' : 'Decrease Short');
+
+            const payload = {
+              at: new Date(f.time).toISOString(),
+              address,
+              symbol: f.coin,
+              action,
+              size: Math.abs(f.sz),
+              startPosition: f.startPosition,
+              priceUsd: f.px,
+              realizedPnlUsd: f.closedPnl ?? null,
+              fee: f.fee ?? null,
+              feeToken: f.feeToken ?? null,
+              hash: f.hash ?? null,
+            };
+
+            const result = await insertTradeIfNew(address, payload);
+            if (result.inserted) inserted += 1;
+          }
+
+          results.push({ address, inserted });
+          totalInserted += inserted;
+        } catch (err: any) {
+          logger.warn('fetch_history_address_failed', { address, err: err?.message });
+          results.push({ address, inserted: 0 });
+        }
+      }
+
+      logger.info('fetch_history_complete', { totalInserted, addressCount: addresses.length });
+
+      // Return the fills from DB after backfill
+      const dbFills = await getBackfillFills({ limit: 40, addresses });
+
+      res.json({
+        inserted: totalInserted,
+        addressCount: addresses.length,
+        results,
+        fills: dbFills.fills,
+        hasMore: dbFills.hasMore,
+        oldestTime: dbFills.oldestTime
+      });
+    } catch (err: any) {
+      logger.error('fetch_history_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to fetch historical fills' });
+    }
+  });
 
   const server = http.createServer(app);
   configureWebSocket(server);
@@ -399,13 +541,6 @@ async function main() {
 
   const port = getPort(8080);
   server.listen(port, () => logger.info('hl-stream listening', { port }));
-}
-
-function metricsHandler(ctx: ReturnType<typeof initMetrics>) {
-  return async (_req: Request, res: Response) => {
-    res.setHeader('Content-Type', ctx.registry.contentType);
-    res.send(await ctx.registry.metrics());
-  };
 }
 
 main().catch((err) => {

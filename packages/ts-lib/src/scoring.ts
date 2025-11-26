@@ -709,8 +709,3 @@ export function rankAccounts(
 
   return topN ? scored.slice(0, topN) : scored;
 }
-
-// Helper function to clamp value between min and max
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
-}

@@ -35,6 +35,7 @@ export class RealtimeTracker {
   private primeInflight: Map<Address, Promise<void>>;
   private lastPrimeAt: Map<Address, number>;
   private onTrade?: (payload: { address: string; event: ChangeEvent }) => void;
+  private _positionsReady: boolean = false;
 
   constructor(getAddresses: () => Promise<Address[]>, queue: EventQueue, opts?: RealtimeOptions) {
     this.getAddresses = getAddresses;
@@ -46,9 +47,30 @@ export class RealtimeTracker {
     this.onTrade = opts?.onTrade;
   }
 
-  async start() {
+  /** Returns true when initial position priming is complete */
+  get positionsReady(): boolean {
+    return this._positionsReady;
+  }
+
+  async start(opts?: { awaitPositions?: boolean }) {
     await this.ensureSharedTransports();
+    // Subscribe to addresses (WebSocket connections)
     await this.refresh();
+    // If awaitPositions, wait for HTTP position priming with timeout
+    if (opts?.awaitPositions) {
+      const timeout = 30000; // 30 second timeout
+      const primePromise = this.forceRefreshAllPositions();
+      const timeoutPromise = new Promise<void>((_, reject) =>
+        setTimeout(() => reject(new Error('Position priming timeout')), timeout)
+      );
+      try {
+        await Promise.race([primePromise, timeoutPromise]);
+      } catch (e) {
+        console.warn('[realtime] Position priming timed out or failed:', e);
+      }
+    }
+    // Mark positions as ready (even if timed out, we've made our best effort)
+    this._positionsReady = true;
   }
 
   private async ensureSharedTransports() {
@@ -72,9 +94,10 @@ export class RealtimeTracker {
     this.subs.clear();
   }
 
-  async refresh() {
+  async refresh(opts?: { awaitPositions?: boolean }) {
     const addrs = (await this.getAddresses()).map((a) => a.toLowerCase());
     const current = new Set(this.subs.keys());
+    const newAddrs: string[] = [];
 
     // Unsubscribe removed addresses
     for (const addr of current) {
@@ -88,11 +111,31 @@ export class RealtimeTracker {
       }
     }
 
-    // Subscribe new addresses
+    // Subscribe new addresses (in parallel with timeout)
     for (const addr of addrs) {
       if (!this.subs.has(addr)) {
-        await this.subscribeAddress(addr);
+        newAddrs.push(addr);
       }
+    }
+    if (newAddrs.length > 0) {
+      const subscribeTimeout = 15000; // 15 seconds per address
+      const subscribePromises = newAddrs.map(async (addr) => {
+        const timeoutPromise = new Promise<void>((_, reject) =>
+          setTimeout(() => reject(new Error(`Subscribe timeout for ${addr}`)), subscribeTimeout)
+        );
+        try {
+          await Promise.race([this.subscribeAddress(addr), timeoutPromise]);
+        } catch (e) {
+          console.warn('[realtime] subscribeAddress failed or timed out:', addr, e);
+        }
+      });
+      await Promise.allSettled(subscribePromises);
+    }
+
+    // If awaitPositions is true, wait for all position data to be populated
+    if (opts?.awaitPositions && newAddrs.length > 0) {
+      const primePromises = newAddrs.map(addr => this.primeFromHttp(addr, { force: true }));
+      await Promise.allSettled(primePromises);
     }
   }
 
@@ -448,5 +491,16 @@ export class RealtimeTracker {
     } catch {
       // best-effort safeguard; ignore failures
     }
+  }
+
+  /**
+   * Force refresh positions for all tracked addresses via HTTP.
+   * Awaits all position data to be populated in the database before returning.
+   * Use after leaderboard refresh to ensure positions are immediately available.
+   */
+  async forceRefreshAllPositions(): Promise<void> {
+    const addrs = (await this.getAddresses()).map((a) => a.toLowerCase());
+    const tasks = addrs.map(addr => this.primeFromHttp(addr, { force: true }));
+    await Promise.allSettled(tasks);
   }
 }

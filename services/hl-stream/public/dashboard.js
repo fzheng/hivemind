@@ -64,6 +64,16 @@ let dashboardPeriod = 30;
 let addressMeta = {};
 let customAccountCount = 0;
 const MAX_CUSTOM_ACCOUNTS = 3;
+let positionsReady = false; // Track whether positions have been loaded
+
+// Fills time range tracking
+let fillsOldestTime = null;
+let fillsNewestTime = null;
+let isLoadingMore = false;
+let hasMoreFills = true;
+
+// Fill aggregation settings
+const AGGREGATION_WINDOW_MS = 60000; // 1 minute
 
 function placeholder(text = 'No live data') {
   return `<span class="placeholder">${text}</span>`;
@@ -101,7 +111,9 @@ function shortAddress(address) {
 
 function formatHolding(entry) {
   if (!entry || !Number.isFinite(entry.size) || Math.abs(entry.size) < 0.0001) {
-    return placeholder('No live position');
+    // This function is only called for actual position entries
+    // Empty/invalid entries should show "No BTC/ETH position"
+    return placeholder('No BTC/ETH position');
   }
   const size = Number(entry.size);
   const symbol = (entry.symbol || '').toUpperCase();
@@ -152,6 +164,130 @@ function formatActionLabel(fill) {
   return action ? action.toUpperCase() : 'TRADE';
 }
 
+// Aggregate fills within a time window (same address, symbol, side/action)
+function aggregateFills(fills) {
+  if (!fills.length) return [];
+
+  const aggregated = [];
+  let currentGroup = null;
+
+  // Sort by time descending (newest first)
+  const sorted = [...fills].sort((a, b) => new Date(b.time_utc) - new Date(a.time_utc));
+
+  for (const fill of sorted) {
+    const fillTime = new Date(fill.time_utc).getTime();
+    const symbol = (fill.symbol || 'BTC').toUpperCase();
+    const action = fill.action || '';
+    const address = fill.address;
+
+    // Check if this fill should be grouped with current group
+    if (currentGroup) {
+      const groupTime = new Date(currentGroup.time_utc).getTime();
+      const timeDiff = Math.abs(groupTime - fillTime);
+      const sameAddress = currentGroup.address === address;
+      const sameSymbol = currentGroup.symbol === symbol;
+      const sameAction = currentGroup.action === action;
+
+      if (sameAddress && sameSymbol && sameAction && timeDiff <= AGGREGATION_WINDOW_MS) {
+        // Add to current group
+        currentGroup.fills.push(fill);
+        currentGroup.totalSize += Math.abs(fill.size_signed || 0);
+        currentGroup.totalPnl += fill.closed_pnl_usd || 0;
+        if (fill.price_usd) {
+          currentGroup.prices.push(fill.price_usd);
+        }
+        // Update time range
+        if (fillTime < new Date(currentGroup.oldest_time).getTime()) {
+          currentGroup.oldest_time = fill.time_utc;
+        }
+        continue;
+      }
+    }
+
+    // Finalize current group and start new one
+    if (currentGroup) {
+      finalizeGroup(currentGroup);
+      aggregated.push(currentGroup);
+    }
+
+    // Start new group
+    currentGroup = {
+      time_utc: fill.time_utc,
+      oldest_time: fill.time_utc,
+      address: address,
+      symbol: symbol,
+      action: action,
+      fills: [fill],
+      totalSize: Math.abs(fill.size_signed || 0),
+      totalPnl: fill.closed_pnl_usd || 0,
+      prices: fill.price_usd ? [fill.price_usd] : [],
+      previous_position: fill.previous_position,
+      isAggregated: false,
+    };
+  }
+
+  // Don't forget the last group
+  if (currentGroup) {
+    finalizeGroup(currentGroup);
+    aggregated.push(currentGroup);
+  }
+
+  return aggregated;
+}
+
+function finalizeGroup(group) {
+  group.isAggregated = group.fills.length > 1;
+  group.fillCount = group.fills.length;
+  group.avgPrice = group.prices.length > 0
+    ? group.prices.reduce((a, b) => a + b, 0) / group.prices.length
+    : null;
+  // Determine signed size based on action
+  const isShort = group.action.toLowerCase().includes('short');
+  const isDecrease = group.action.toLowerCase().includes('decrease') || group.action.toLowerCase().includes('close');
+  group.size_signed = isShort || isDecrease ? -group.totalSize : group.totalSize;
+  group.closed_pnl_usd = group.totalPnl || null;
+  group.price_usd = group.avgPrice;
+}
+
+// Update time range display
+function updateTimeRangeDisplay() {
+  const timeRangeEl = document.getElementById('fills-time-range');
+  if (!timeRangeEl) return;
+
+  if (!fillsNewestTime && !fillsOldestTime) {
+    timeRangeEl.textContent = 'No fills yet';
+    return;
+  }
+
+  const formatTimeShort = (ts) => {
+    const d = new Date(ts);
+    const now = new Date();
+    const isToday = d.toDateString() === now.toDateString();
+    if (isToday) {
+      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
+    return d.toLocaleString([], { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+  };
+
+  const newestStr = fillsNewestTime ? formatTimeShort(fillsNewestTime) : 'now';
+  const oldestStr = fillsOldestTime ? formatTimeShort(fillsOldestTime) : '—';
+
+  timeRangeEl.textContent = `${oldestStr} → ${newestStr}`;
+}
+
+// Show/hide load history button based on fills state
+function updateLoadHistoryVisibility() {
+  const container = document.getElementById('fills-load-history');
+  if (!container) return;
+
+  // Hide if we have fills or if there's no more history
+  if (fillsCache.length > 0 || !hasMoreFills) {
+    container.classList.add('hidden');
+  } else {
+    container.classList.remove('hidden');
+  }
+}
+
 async function fetchJson(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Request failed: ${res.status}`);
@@ -188,7 +324,7 @@ function renderAddresses(stats = [], profiles = {}, holdings = {}) {
       const holdingPositions = holdings[holdingKey] || [];
       const holdingCell = holdingPositions.length > 0
         ? holdingPositions.map(pos => formatHolding(pos)).join(' ')
-        : placeholder('No live position');
+        : placeholder('No BTC/ETH position');
       const pnlCell = typeof row.realizedPnl === 'number' ? fmtUsdShort(row.realizedPnl) : placeholder();
       const scoreCell = typeof row.score === 'number' ? fmtScore(row.score) : placeholder();
       const isCustom = row.isCustom === true;
@@ -202,7 +338,7 @@ function renderAddresses(stats = [], profiles = {}, holdings = {}) {
           <td data-label="Address" title="Hyperliquid tx count: ${txCount}">
             <span class="custom-indicator">
               ${customIndicator}
-              <a href="https://hyperbot.network/trader/${row.address}" target="_blank" rel="noopener noreferrer">
+              <a href="https://hypurrscan.io/address/${row.address}" target="_blank" rel="noopener noreferrer">
                 ${shortAddress(row.address)}
               </a>
               ${removeBtn}
@@ -269,21 +405,56 @@ function renderRecommendation(summary) {
 }
 
 function renderFills(list) {
-  fillsTable.innerHTML = list
-    .slice(0, 10)
+  // Filter to BTC/ETH only
+  const btcEthFills = list.filter(fill => {
+    const symbol = (fill.symbol || 'BTC').toUpperCase();
+    return symbol === 'BTC' || symbol === 'ETH';
+  });
+
+  // Update time range tracking
+  if (btcEthFills.length > 0) {
+    const times = btcEthFills.map(f => new Date(f.time_utc).getTime()).filter(t => !isNaN(t));
+    if (times.length > 0) {
+      const newestInBatch = new Date(Math.max(...times)).toISOString();
+      const oldestInBatch = new Date(Math.min(...times)).toISOString();
+
+      if (!fillsNewestTime || new Date(newestInBatch) > new Date(fillsNewestTime)) {
+        fillsNewestTime = newestInBatch;
+      }
+      if (!fillsOldestTime || new Date(oldestInBatch) < new Date(fillsOldestTime)) {
+        fillsOldestTime = oldestInBatch;
+      }
+    }
+    updateTimeRangeDisplay();
+  }
+
+  // Aggregate fills
+  const aggregated = aggregateFills(btcEthFills);
+
+  const rows = aggregated
     .map((fill) => {
       const symbol = (fill.symbol || 'BTC').toUpperCase();
-      const size = typeof fill.size_signed === 'number' ? `${fill.size_signed >= 0 ? '+' : ''}${fill.size_signed.toFixed(5)} ${symbol}` : '—';
+      const sizeVal = fill.isAggregated ? fill.totalSize : Math.abs(fill.size_signed || 0);
+      const sizeSign = fill.size_signed >= 0 ? '+' : '-';
+      const size = typeof sizeVal === 'number' ? `${sizeSign}${sizeVal.toFixed(5)} ${symbol}` : '—';
       const prev = typeof fill.previous_position === 'number' ? `${fill.previous_position.toFixed(5)} ${symbol}` : '—';
-      const price = fmtUsdShort(fill.price_usd ?? null);
+      const price = fill.isAggregated && fill.avgPrice
+        ? `~${fmtUsdShort(fill.avgPrice)}`
+        : fmtUsdShort(fill.price_usd ?? null);
       const pnl = fmtUsdShort(fill.closed_pnl_usd ?? null);
       const action = fill.action || '—';
       const sideClass = action.toLowerCase().includes('short') ? 'sell' : 'buy';
+
+      // Show aggregation indicator
+      const aggBadge = fill.isAggregated
+        ? `<span class="agg-badge" title="${fill.fillCount} fills aggregated">×${fill.fillCount}</span>`
+        : '';
+
       return `
-        <tr>
+        <tr class="${fill.isAggregated ? 'aggregated-row' : ''}">
           <td data-label="Time">${fmtDateTime(fill.time_utc)}</td>
-          <td data-label="Address"><a href="https://hyperbot.network/trader/${fill.address}" target="_blank" rel="noopener noreferrer">${shortAddress(fill.address)}</a></td>
-          <td data-label="Action"><span class="pill ${sideClass}">${action}</span></td>
+          <td data-label="Address"><a href="https://hypurrscan.io/address/${fill.address}" target="_blank" rel="noopener noreferrer">${shortAddress(fill.address)}</a></td>
+          <td data-label="Action"><span class="pill ${sideClass}">${action}</span>${aggBadge}</td>
           <td data-label="Size">${size}</td>
           <td data-label="Previous Position">${prev}</td>
           <td data-label="Price">${price}</td>
@@ -292,6 +463,16 @@ function renderFills(list) {
       `;
     })
     .join('');
+
+  fillsTable.innerHTML = rows;
+
+  // Show empty state if no fills
+  if (!fillsTable.innerHTML.trim()) {
+    fillsTable.innerHTML = `<tr><td colspan="7" class="placeholder">No BTC/ETH fills yet</td></tr>`;
+  }
+
+  // Update load history button visibility
+  updateLoadHistoryVisibility();
 }
 
 function renderDecisions(list) {
@@ -323,6 +504,38 @@ function updateCustomAccountCount(count, max) {
   customCountEl.textContent = count;
   // Disable add button if at max
   addCustomBtn.disabled = count >= max;
+}
+
+// Check positions status and poll until ready
+const MAX_POSITION_POLL_RETRIES = 30; // Max 30 retries (60 seconds total)
+let positionPollRetries = 0;
+
+async function checkPositionsStatus() {
+  try {
+    const data = await fetchJson(`${API_BASE}/positions-status`);
+    positionsReady = data.positionsReady === true;
+    return positionsReady;
+  } catch (err) {
+    console.error('Failed to check positions status:', err);
+    return false;
+  }
+}
+
+async function pollPositionsUntilReady() {
+  const isReady = await checkPositionsStatus();
+  if (!isReady && positionPollRetries < MAX_POSITION_POLL_RETRIES) {
+    positionPollRetries++;
+    // Poll every 2 seconds until positions ready or max retries reached
+    setTimeout(async () => {
+      await checkPositionsStatus();
+      await refreshSummary();
+      if (!positionsReady && positionPollRetries < MAX_POSITION_POLL_RETRIES) {
+        pollPositionsUntilReady();
+      } else if (positionPollRetries >= MAX_POSITION_POLL_RETRIES) {
+        console.warn('Position polling max retries reached, continuing without positions');
+      }
+    }, 2000);
+  }
 }
 
 async function refreshSummary() {
@@ -393,7 +606,10 @@ function connectWs() {
         events
           .filter((e) => e.type === 'trade')
           .forEach((e) => {
-            const symbol = e.symbol || 'BTC';
+            const symbol = (e.symbol || 'BTC').toUpperCase();
+            // Only process BTC and ETH fills
+            if (symbol !== 'BTC' && symbol !== 'ETH') return;
+
             const sizeSigned = e.size ?? e.payload?.size ?? 0;
             const startPos = e.startPosition ?? e.payload?.startPosition ?? null;
             const row = {
@@ -728,15 +944,141 @@ function initRefreshButton() {
   refreshBtn.addEventListener('click', triggerLeaderboardRefresh);
 }
 
-function init() {
+// Infinite scroll for fills
+async function loadMoreFills() {
+  if (isLoadingMore || !hasMoreFills) return;
+
+  isLoadingMore = true;
+  const loadMoreEl = document.getElementById('fills-load-more');
+  if (loadMoreEl) loadMoreEl.style.display = 'flex';
+
+  try {
+    const beforeTime = fillsOldestTime || new Date().toISOString();
+    const url = `${API_BASE}/fills/backfill?before=${encodeURIComponent(beforeTime)}&limit=30`;
+    const data = await fetchJson(url);
+
+    if (data.fills && data.fills.length > 0) {
+      // Append to cache
+      fillsCache = [...fillsCache, ...data.fills];
+      hasMoreFills = data.hasMore;
+
+      // Update oldest time
+      if (data.oldestTime) {
+        fillsOldestTime = data.oldestTime;
+      }
+
+      // Re-render with all fills (aggregation will be applied)
+      renderFills(fillsCache);
+      updateTimeRangeDisplay();
+    } else {
+      hasMoreFills = false;
+    }
+
+    // Show "no more" message if we've reached the end
+    if (!hasMoreFills && loadMoreEl) {
+      loadMoreEl.innerHTML = '<span class="no-more-fills">No more fills to load</span>';
+      loadMoreEl.style.display = 'block';
+    }
+  } catch (err) {
+    console.error('Load more fills error:', err);
+    hasMoreFills = false;
+  } finally {
+    isLoadingMore = false;
+    if (hasMoreFills) {
+      const loadMoreEl = document.getElementById('fills-load-more');
+      if (loadMoreEl) loadMoreEl.style.display = 'none';
+    }
+  }
+}
+
+// Initialize infinite scroll
+function initInfiniteScroll() {
+  const container = document.getElementById('fills-scroll-container');
+  if (!container) return;
+
+  container.addEventListener('scroll', () => {
+    // Check if we're near the bottom (within 50px)
+    const { scrollTop, scrollHeight, clientHeight } = container;
+    if (scrollHeight - scrollTop - clientHeight < 50) {
+      loadMoreFills();
+    }
+  });
+}
+
+// Fetch historical fills from Hyperliquid API
+async function fetchHistoricalFills() {
+  try {
+    const response = await fetch(`${API_BASE}/fills/fetch-history`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ limit: 50 })
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return await response.json();
+  } catch (err) {
+    console.error('Fetch historical fills error:', err);
+    return null;
+  }
+}
+
+// Initialize load history button
+function initLoadHistoryButton() {
+  const btn = document.getElementById('load-history-btn');
+  if (!btn) return;
+
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    btn.textContent = 'Fetching from Hyperliquid...';
+
+    // First, try to fetch historical fills from Hyperliquid API
+    const result = await fetchHistoricalFills();
+
+    if (result && result.fills && result.fills.length > 0) {
+      // Update cache with fetched fills
+      fillsCache = result.fills;
+      hasMoreFills = result.hasMore;
+      fillsOldestTime = result.oldestTime;
+      renderFills(fillsCache);
+      updateTimeRangeDisplay();
+      btn.textContent = `Loaded ${result.inserted} new fills`;
+    } else if (result && result.inserted === 0) {
+      // No new fills, but API call succeeded - try loading from DB
+      btn.textContent = 'Loading from DB...';
+      await loadMoreFills();
+      btn.textContent = 'No new fills found';
+    } else {
+      // API call failed, fall back to DB
+      btn.textContent = 'Loading from DB...';
+      await loadMoreFills();
+    }
+
+    updateLoadHistoryVisibility();
+    btn.disabled = false;
+
+    // Reset button text after a delay
+    setTimeout(() => {
+      btn.textContent = 'Load Historical Fills';
+    }, 2000);
+  });
+}
+
+async function init() {
   initChartControls();
   initCustomAccountsControls();
   initRefreshButton();
+  initInfiniteScroll();
+  initLoadHistoryButton();
   renderChart('BTCUSDT');
+  // Check positions status FIRST before loading data
+  await checkPositionsStatus();
   refreshSummary();
   refreshFills();
   refreshDecisions();
   connectWs();
+  // Continue polling until positions are ready (if not already)
+  if (!positionsReady) {
+    pollPositionsUntilReady();
+  }
   setInterval(refreshSummary, 30_000);
   setInterval(refreshFills, 20_000);
   setInterval(refreshDecisions, 45_000);
