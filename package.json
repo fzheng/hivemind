@@ -22,7 +22,7 @@
   },
   "dependencies": {
     "@hl/ts-lib": "file:packages/ts-lib",
-    "@nktkas/hyperliquid": "^0.25.8",
+    "@nktkas/hyperliquid": "^0.27.1",
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "nats": "^2.25.2",
