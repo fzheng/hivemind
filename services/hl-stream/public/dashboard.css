@@ -805,19 +805,52 @@ td {
 
 /* Mobile-first responsive design */
 @media (max-width: 640px) {
+  /* iPhone safe area support */
+  body {
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
   header {
     padding: 12px 16px;
-    gap: 12px;
+    padding-top: calc(12px + env(safe-area-inset-top));
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .header-left {
+    flex: 1 1 100%;
+    margin-bottom: 8px;
+  }
+
+  .header-left h1 {
+    font-size: 1.25rem;
   }
 
   .header-left p {
     font-size: 0.75rem;
   }
 
+  /* Period and theme toggles on same row */
+  header > div:last-child {
+    flex: 1 1 100%;
+    justify-content: space-between;
+  }
+
+  .period-toggle {
+    font-size: 0.75rem;
+  }
+
   .period-toggle button {
-    padding: 6px 12px;
+    padding: 8px 14px;
     font-size: 0.75rem;
     min-width: 50px;
+  }
+
+  .theme-toggle button {
+    padding: 8px 10px;
+    min-width: 40px;
   }
 
   main {
@@ -826,7 +859,7 @@ td {
   }
 
   .card {
-    padding: 16px;
+    padding: 14px;
     border-radius: 12px;
   }
 
@@ -849,8 +882,9 @@ td {
   }
 
   .refresh-btn {
-    font-size: 0.7rem;
-    padding: 5px 10px;
+    font-size: 0.75rem;
+    padding: 8px 12px;
+    min-height: 36px;
   }
 
   .custom-accounts-section {
@@ -859,10 +893,14 @@ td {
 
   .custom-accounts-form {
     flex-direction: column;
+    gap: 10px;
   }
 
   .custom-accounts-form input {
     min-width: 100%;
+    padding: 12px;
+    font-size: 16px; /* Prevents iOS zoom on focus */
+    min-height: 44px;
   }
 
   #custom-address-input,
@@ -873,16 +911,25 @@ td {
 
   .add-custom-btn {
     width: 100%;
+    min-height: 44px;
+    font-size: 0.875rem;
+  }
+
+  .toggle-group {
+    width: 100%;
+    display: flex;
+    margin-bottom: 12px;
   }
 
   .toggle-group button {
-    padding: 8px 16px;
-    font-size: 0.75rem;
-    min-width: 60px;
+    flex: 1;
+    padding: 10px 12px;
+    font-size: 0.875rem;
+    min-height: 44px;
   }
 
   .chart-container {
-    height: 250px;
+    height: 280px;
   }
 
   /* Mobile table layout - Convert to cards */
@@ -900,10 +947,10 @@ td {
 
   .stats-table tr {
     display: block;
-    margin-bottom: 16px;
-    padding: 12px;
+    margin-bottom: 12px;
+    padding: 14px;
     background: rgba(148, 163, 184, 0.03);
-    border-radius: 8px;
+    border-radius: 10px;
     border: 1px solid rgba(148, 163, 184, 0.1);
   }
 
@@ -912,49 +959,92 @@ td {
   }
 
   .stats-table td {
-    display: block;
-    padding: 6px 0;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 0;
     border: none;
-    text-align: left !important;
+    text-align: right;
+    font-size: 0.9rem;
   }
 
   .stats-table td:before {
     content: attr(data-label);
     font-weight: 600;
     color: #94a3b8;
-    font-size: 0.7rem;
+    font-size: 0.75rem;
     text-transform: uppercase;
-    letter-spacing: 0.05em;
-    display: block;
-    margin-bottom: 4px;
+    letter-spacing: 0.03em;
+    text-align: left;
+    flex-shrink: 0;
+    margin-right: 12px;
   }
 
   .stats-table td:first-child {
-    font-size: 1rem;
+    display: block;
+    text-align: left;
+    font-size: 0.95rem;
     font-weight: 600;
-    padding-bottom: 8px;
+    padding-bottom: 10px;
     border-bottom: 1px solid rgba(148, 163, 184, 0.1);
-    margin-bottom: 8px;
+    margin-bottom: 6px;
   }
 
-  .fills-table {
-    font-size: 0.8rem;
+  .stats-table td:first-child:before {
+    display: none;
+  }
+
+  /* Fills table mobile */
+  .fills-table td {
+    font-size: 0.85rem;
+  }
+
+  .fills-table td:first-child {
+    font-size: 0.85rem;
+    font-weight: 500;
   }
 
   .holds-cell {
-    /* No special mobile styles needed - uses standard table cell alignment */
+    justify-content: flex-end;
   }
 
   .metric-hint {
-    font-size: 0.7rem;
+    font-size: 0.75rem;
+    line-height: 1.5;
   }
 
   .recommendation {
-    padding: 12px;
+    padding: 14px;
   }
 
   .recommendation strong {
     font-size: 1rem;
+  }
+
+  /* Better touch targets */
+  .pill {
+    padding: 6px 14px;
+    font-size: 0.75rem;
+  }
+
+  .holding-chip {
+    padding: 6px 12px;
+    font-size: 0.8rem;
+  }
+
+  /* Fills scroll container */
+  .fills-scroll-container {
+    max-height: 350px;
+  }
+
+  .load-history-btn {
+    width: 100%;
+    min-height: 44px;
+  }
+
+  /* Grid layout - single column on mobile */
+  .grid-2 {
+    grid-template-columns: 1fr;
   }
 }
 

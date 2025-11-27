@@ -189,10 +189,15 @@ export class RealtimeTracker {
     try {
       const positions = evt?.clearinghouseState?.assetPositions || [];
 
+      // Track which coins we see in this update
+      const coinsInUpdate = new Set<string>();
+
       // Process both BTC and ETH positions
       for (const ap of positions as any[]) {
         const coin = String((ap as any)?.position?.coin ?? '').toUpperCase();
         if (coin !== 'BTC' && coin !== 'ETH') continue;
+
+        coinsInUpdate.add(coin);
 
         const szi = Number(ap?.position?.szi ?? 0);
         const entry = Number(ap?.position?.entryPx ?? NaN);
@@ -224,7 +229,7 @@ export class RealtimeTracker {
             ? snapshot.size * (mark - snapshot.entryPriceUsd)
             : null;
 
-          const evt = this.q.push({
+          const posEvt = this.q.push({
             type: 'position',
             at: updatedAt,
             address: addr,
@@ -236,7 +241,7 @@ export class RealtimeTracker {
             leverage: snapshot.leverage,
             pnlUsd: pnl,
           });
-          insertEvent({ type: 'position', at: evt.at, address: addr, symbol: coin, payload: evt })
+          insertEvent({ type: 'position', at: posEvt.at, address: addr, symbol: coin, payload: posEvt })
             .catch((err) => console.error('[realtime] insertEvent failed:', err));
           upsertCurrentPosition({
             address: addr,
@@ -248,6 +253,49 @@ export class RealtimeTracker {
             pnlUsd: pnl,
             updatedAt,
           }).catch((err) => console.error('[realtime] upsertCurrentPosition failed:', err));
+        }
+      }
+
+      // Handle closed positions: if we had a position for BTC or ETH but it's not in this update,
+      // it means the position was closed (size = 0)
+      for (const coin of ['BTC', 'ETH'] as const) {
+        const snapshotKey = `${addr}:${coin}`;
+        const prev = this.snapshots.get(snapshotKey)?.data;
+        // If we had a non-zero position but coin is not in update, position was closed
+        if (prev && prev.size !== 0 && !coinsInUpdate.has(coin)) {
+          const updatedAt = new Date().toISOString();
+          const closedSnapshot: PositionSnapshot = {
+            size: 0,
+            entryPriceUsd: null,
+            liquidationPriceUsd: null,
+            leverage: null,
+          };
+          this.snapshots.set(snapshotKey, { data: closedSnapshot, updatedAt });
+
+          const posEvt = this.q.push({
+            type: 'position',
+            at: updatedAt,
+            address: addr,
+            symbol: coin,
+            size: 0,
+            side: 'flat',
+            entryPriceUsd: null,
+            liquidationPriceUsd: null,
+            leverage: null,
+            pnlUsd: null,
+          });
+          insertEvent({ type: 'position', at: posEvt.at, address: addr, symbol: coin, payload: posEvt })
+            .catch((err) => console.error('[realtime] insertEvent (closed) failed:', err));
+          upsertCurrentPosition({
+            address: addr,
+            symbol: coin,
+            size: 0,
+            entryPriceUsd: null,
+            liquidationPriceUsd: null,
+            leverage: null,
+            pnlUsd: null,
+            updatedAt,
+          }).catch((err) => console.error('[realtime] upsertCurrentPosition (closed) failed:', err));
         }
       }
     } catch (e) {
@@ -418,10 +466,15 @@ export class RealtimeTracker {
       );
       const positions = data.assetPositions || [];
 
+      // Track which coins we see in this response
+      const coinsInResponse = new Set<string>();
+
       // Process both BTC and ETH positions
       for (const ap of positions as any[]) {
         const coin = String((ap as any)?.position?.coin ?? '').toUpperCase();
         if (coin !== 'BTC' && coin !== 'ETH') continue;
+
+        coinsInResponse.add(coin);
 
         const szi = Number(ap?.position?.szi ?? 0);
         const entry = Number(ap?.position?.entryPx ?? NaN);
@@ -445,7 +498,7 @@ export class RealtimeTracker {
           ? snapshot.size * (mark - snapshot.entryPriceUsd)
           : null;
 
-        const evt = this.q.push({
+        const posEvt = this.q.push({
           type: 'position',
           at: updatedAt,
           address: addr,
@@ -457,7 +510,7 @@ export class RealtimeTracker {
           leverage: snapshot.leverage,
           pnlUsd: pnl,
         });
-        insertEvent({ type: 'position', at: evt.at, address: addr, symbol: coin, payload: evt })
+        insertEvent({ type: 'position', at: posEvt.at, address: addr, symbol: coin, payload: posEvt })
           .catch((err) => console.error('[realtime] performPrime insertEvent failed:', err));
         upsertCurrentPosition({
           address: addr,
@@ -469,6 +522,51 @@ export class RealtimeTracker {
           pnlUsd: pnl,
           updatedAt,
         }).catch((err) => console.error('[realtime] performPrime upsertCurrentPosition failed:', err));
+      }
+
+      // Handle closed positions: if we had a position for BTC or ETH but it's not in this response,
+      // it means the position was closed (size = 0)
+      for (const coin of ['BTC', 'ETH'] as const) {
+        if (!coinsInResponse.has(coin)) {
+          const snapshotKey = `${addr}:${coin}`;
+          const prev = this.snapshots.get(snapshotKey)?.data;
+          // If we had a non-zero position but coin is not in response, position was closed
+          if (prev && prev.size !== 0) {
+            const updatedAt = new Date().toISOString();
+            const closedSnapshot: PositionSnapshot = {
+              size: 0,
+              entryPriceUsd: null,
+              liquidationPriceUsd: null,
+              leverage: null,
+            };
+            this.snapshots.set(snapshotKey, { data: closedSnapshot, updatedAt });
+
+            const posEvt = this.q.push({
+              type: 'position',
+              at: updatedAt,
+              address: addr,
+              symbol: coin,
+              size: 0,
+              side: 'flat',
+              entryPriceUsd: null,
+              liquidationPriceUsd: null,
+              leverage: null,
+              pnlUsd: null,
+            });
+            insertEvent({ type: 'position', at: posEvt.at, address: addr, symbol: coin, payload: posEvt })
+              .catch((err) => console.error('[realtime] performPrime insertEvent (closed) failed:', err));
+            upsertCurrentPosition({
+              address: addr,
+              symbol: coin,
+              size: 0,
+              entryPriceUsd: null,
+              liquidationPriceUsd: null,
+              leverage: null,
+              pnlUsd: null,
+              updatedAt,
+            }).catch((err) => console.error('[realtime] performPrime upsertCurrentPosition (closed) failed:', err));
+          }
+        }
       }
     } catch (e) {
       console.error('[realtime] performPrime failed:', { address: addr, error: e });
