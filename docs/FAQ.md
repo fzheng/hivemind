@@ -1,0 +1,175 @@
+# Frequently Asked Questions
+
+## General
+
+### What is HyperMind?
+
+HyperMind is a collective intelligence trading system that monitors top traders on Hyperliquid and generates consensus-based trading signals. Instead of copy-trading a single wallet, it aggregates patterns from multiple top performers.
+
+### Is this financial advice?
+
+No. HyperMind is an experimental research tool. All signals are for informational purposes only. Always do your own research before making trading decisions.
+
+### Which assets are supported?
+
+Currently BTC and ETH perpetual contracts on Hyperliquid.
+
+---
+
+## Setup
+
+### How do I start HyperMind?
+
+```bash
+npm install
+cp .env.example .env
+docker compose up --build
+```
+
+Then visit http://localhost:4102/dashboard
+
+### What ports are used?
+
+| Port | Service |
+|------|---------|
+| 4101 | hl-scout (API) |
+| 4102 | hl-stream (Dashboard + API) |
+| 4103 | hl-sage (Python) |
+| 4104 | hl-decide (Python) |
+| 5432 | PostgreSQL |
+| 4222 | NATS |
+
+### How do I configure the system?
+
+Copy `.env.example` to `.env` and edit as needed. Key settings:
+
+- `OWNER_TOKEN` - Auth token for admin endpoints
+- `LEADERBOARD_TOP_N` - How many traders to scan (default: 1000)
+- `LEADERBOARD_SELECT_COUNT` - How many to actively track (default: 12)
+
+### The dashboard shows "Waiting for fills..."
+
+This is normal on first startup. The system needs time to:
+1. Scan the leaderboard
+2. Connect to Hyperliquid WebSockets
+3. Wait for tracked traders to make trades
+
+You can also click "Load More" to fetch historical fills.
+
+---
+
+## Dashboard
+
+### What do the panels show?
+
+- **AI Signals** - Trading signals generated from tracked trader patterns (coming soon)
+- **Tracked Traders** - Top performers being monitored, with stats
+- **Trader Activity** - Real-time fills from tracked accounts
+
+### What does the ★ star mean?
+
+Starred accounts are custom accounts you added for tracking. You can add up to 3 custom accounts.
+
+### How do I add a custom account?
+
+Enter an Ethereum address (0x...) in the "Custom Accounts" input box and click +. Optionally add a nickname.
+
+### Why are some fills grouped together?
+
+Fills within 1 minute from the same trader and action are aggregated. Click the badge (e.g., "×3") to expand and see individual fills.
+
+### What does "30-day" mean in rankings?
+
+Traders are ranked based on their 30-day performance on Hyperliquid. This includes win rate, PnL, and consistency metrics.
+
+---
+
+## Technical
+
+### How do I run tests?
+
+```bash
+npm test                # Run all tests
+npm run test:coverage   # With coverage report
+```
+
+### How do I reset the database?
+
+```bash
+docker compose down -v
+docker compose up --build
+```
+
+This removes all data and recreates the database from scratch.
+
+### How do I view logs?
+
+```bash
+docker compose logs -f           # All services
+docker compose logs -f hl-stream # Specific service
+```
+
+### Where is the data stored?
+
+PostgreSQL stores all data in a Docker volume. Key tables:
+- `hl_events` - Trade and position events
+- `hl_leaderboard_entries` - Trader rankings
+- `hl_custom_accounts` - User's custom tracked accounts
+
+### Why is leaderboard.ts coverage low?
+
+The leaderboard service makes many external API calls which are mocked in tests. The unit tests focus on scoring logic. Integration tests with real APIs are not run in CI to avoid rate limits.
+
+---
+
+## Troubleshooting
+
+### "Connection refused" errors
+
+Make sure all containers are running:
+```bash
+docker compose ps
+```
+
+If a container is down, check its logs:
+```bash
+docker compose logs hl-scout
+```
+
+### "Forbidden" on API calls
+
+Protected endpoints require the `x-owner-key` header with your `OWNER_TOKEN`:
+```bash
+curl -H "x-owner-key: YOUR_TOKEN" http://localhost:4101/addresses
+```
+
+### Dashboard not loading
+
+1. Check hl-stream is running: `docker compose ps`
+2. Check browser console for errors
+3. Try hard refresh (Ctrl+Shift+R)
+
+### WebSocket disconnecting
+
+The WebSocket auto-reconnects after 2 seconds. If it keeps disconnecting:
+1. Check network connectivity
+2. Check hl-stream logs for errors
+3. Restart hl-stream: `docker compose restart hl-stream`
+
+---
+
+## Contributing
+
+### How can I contribute?
+
+See [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md) for the roadmap. Key areas:
+- Consensus signal engine (Phase 2)
+- Performance feedback loop (Phase 3)
+- AI learning layer (Phase 4)
+
+### What's the code style?
+
+- TypeScript with strict mode
+- ESLint for linting
+- Prettier for formatting
+- Jest for testing

@@ -6,139 +6,74 @@
 
 > "Be as smart as the smartest traders by learning from their collective behavior"
 
-## Key Features
+## What It Does
 
-- **Leaderboard Scanning**: Continuously scans top 1000+ traders on Hyperliquid
-- **Smart Scoring**: Composite ranking by win rate, PnL efficiency, and consistency
-- **Real-time Monitoring**: Live position and fill tracking for top performers
-- **Consensus Signals**: AI-generated signals when multiple top traders align (coming soon)
-- **Self-Learning**: System improves by analyzing past signal performance (coming soon)
-
-## Architecture
-
-```
-services/
-  hl-scout   TypeScript  — Leaderboard scanning + trader scoring
-  hl-stream  TypeScript  — Real-time feeds + dashboard + WebSocket
-  hl-sage    Python      — Score computation + ranking API
-  hl-decide  Python      — Signal generation + outcome tracking
-contracts/              — JSON Schema + generated Zod & Pydantic bindings
-docker/postgres-init    — SQL migrations (auto-run on fresh Postgres)
-```
+- **Scans Top Traders**: Continuously monitors 1000+ traders on Hyperliquid leaderboard
+- **Smart Ranking**: Scores traders by win rate, PnL consistency, and risk management
+- **Real-time Tracking**: Monitors positions and trades of top performers live
+- **AI Signals**: Generates trading signals when multiple top traders align (coming soon)
+- **Self-Learning**: Improves by analyzing past signal performance (coming soon)
 
 ## Quick Start
 
 ```bash
+# Install dependencies
 npm install
-cp .env.example .env          # Configure OWNER_TOKEN etc
+
+# Configure environment
+cp .env.example .env
+
+# Start all services
 docker compose up --build
 ```
 
-Dashboard: http://localhost:4102/dashboard
+**Dashboard**: http://localhost:4102/dashboard
 
-## Service Endpoints
-
-| Service   | Port | Role |
-|-----------|------|------|
-| hl-scout  | 4101 | Leaderboard scanning + trader scoring |
-| hl-stream | 4102 | Real-time feeds + dashboard |
-| hl-sage   | 4103 | Score computation |
-| hl-decide | 4104 | Signal generation |
-| Postgres  | 5432 | Data persistence |
-| NATS      | 4222 | Message bus |
-
-### API Documentation
-- hl-scout: http://localhost:4101/docs
-- hl-stream: http://localhost:4102/docs
-- hl-sage: http://localhost:4103/docs
-- hl-decide: http://localhost:4104/docs
-
-## Dashboard Features
-
-The operator dashboard at http://localhost:4102/dashboard provides:
-
-- **Live Clock**: Real-time clock with BTC/ETH price ticker
-- **TradingView Charts**: BTC/ETH charts with toggle
-- **AI Trade Signals**: Consensus-based signals (mock data currently)
-- **Top Performance**: Ranked traders with win rate, PnL, and 30-day curves
-- **Live Fills**: Real-time trade feed with smart aggregation
-- **Custom Tracking**: Monitor up to 3 custom addresses
-
-## Development
-
-### Local Development
-```bash
-npm run dev:scout      # Watch mode for hl-scout
-npm run dev:stream     # Watch mode for hl-stream
-```
-
-### Docker Commands
-```bash
-npm run docker:rebuild # Full rebuild with fresh images
-npm run docker:up      # Start containers
-npm run docker:down    # Stop containers
-npm run docker:logs    # Follow container logs
-npm run docker:ps      # Check status
-```
-
-### Testing
-```bash
-npm test               # Run all tests
-npm run test:coverage  # With coverage report
-npm run e2e-smoke      # End-to-end smoke test
-```
-
-## Message Flow
-
-| Topic            | Publisher → Consumer |
-|------------------|----------------------|
-| `a.candidates.v1`| hl-scout → hl-sage   |
-| `b.scores.v1`    | hl-sage → hl-decide  |
-| `c.fills.v1`     | hl-stream → hl-decide |
-| `d.signals.v1`   | hl-decide → persist  |
-| `d.outcomes.v1`  | hl-decide → persist  |
-
-## Configuration
-
-Key environment variables (see `.env.example`):
-
-| Variable | Description |
-|----------|-------------|
-| `OWNER_TOKEN` | HTTP auth token for admin endpoints |
-| `NATS_URL` | NATS connection string |
-| `DATABASE_URL` | Postgres connection string |
-| `LEADERBOARD_TOP_N` | Number of traders to scan (default: 1000) |
-| `LEADERBOARD_SELECT_COUNT` | Traders to actively track (default: 12) |
-| `LEADERBOARD_REFRESH_MS` | Scan interval in ms (default: 86400000) |
-
-## Database
-
-Postgres schema is auto-initialized from `docker/postgres-init/` on first run. To reset:
+## Build
 
 ```bash
-docker compose down -v && docker compose up --build
+npm install          # Install dependencies
+npm run build        # Build TypeScript
 ```
 
-To apply a new migration to existing data:
+## Run
+
 ```bash
-docker compose exec postgres psql -U hlbot -d hlbot -f /docker-entrypoint-initdb.d/XXX_migration.sql
+# Production (Docker)
+docker compose up -d
+
+# Development
+npm run dev:scout    # hl-scout in watch mode
+npm run dev:stream   # hl-stream in watch mode
 ```
 
-## Development Roadmap
+## Test
 
-See [docs/DEVELOPMENT_PLAN.md](docs/DEVELOPMENT_PLAN.md) for the complete development plan including:
-
-- **Phase 2**: Consensus Signal Engine (MVP)
-- **Phase 3**: Performance Feedback Loop
-- **Phase 4**: AI Learning Layer
-- **Phase 5**: Advanced Intelligence
+```bash
+npm test             # Run all 504 tests
+npm run test:coverage # With coverage report
+npm run e2e-smoke    # End-to-end smoke test
+```
 
 ## Documentation
 
-- [DEVELOPMENT_PLAN.md](docs/DEVELOPMENT_PLAN.md) - Product vision, phases, and open questions
-- [CLAUDE.md](CLAUDE.md) - Development guidance for AI assistants
-- [CODE_REVIEW_FIXES.md](docs/CODE_REVIEW_FIXES.md) - Security and performance improvements
+| Document | Description |
+|----------|-------------|
+| [API Reference](docs/API.md) | REST API endpoints and WebSocket |
+| [FAQ](docs/FAQ.md) | Frequently asked questions |
+| [Testing Guide](docs/TESTING.md) | Test suite documentation |
+| [Development Plan](docs/DEVELOPMENT_PLAN.md) | Roadmap and phases |
+
+## Services
+
+| Service | Port | Description |
+|---------|------|-------------|
+| Dashboard | [4102/dashboard](http://localhost:4102/dashboard) | Web UI |
+| hl-scout | 4101 | Leaderboard scanning |
+| hl-stream | 4102 | Real-time feeds |
+| hl-sage | 4103 | Score computation |
+| hl-decide | 4104 | Signal generation |
 
 ## License
 
-PolyForm Noncommercial 1.0.0 – free for personal/non-commercial use. For commercial licensing, please reach out.
+[PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/) – Free for personal and non-commercial use. For commercial licensing, please contact us.
