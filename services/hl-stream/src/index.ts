@@ -1,3 +1,21 @@
+/**
+ * HL-Stream Service
+ *
+ * Subscribes to Hyperliquid real-time WebSocket feeds for tracked addresses
+ * and streams position and trade events to connected dashboard clients.
+ * Also publishes fill events to NATS for downstream services.
+ *
+ * Key responsibilities:
+ * - Maintain WebSocket connections to Hyperliquid for each tracked address
+ * - Track position changes and trade fills in real-time
+ * - Stream events to browser clients via WebSocket
+ * - Publish fill events to `c.fills.v1` NATS topic
+ * - Serve the dashboard UI and proxy API requests to hl-scout
+ * - Handle historical fill backfill from Hyperliquid API
+ *
+ * @module hl-stream
+ */
+
 import cors from 'cors';
 import express, { Request, Response, NextFunction } from 'express';
 import http from 'http';
@@ -78,20 +96,37 @@ const swaggerDoc: OpenAPIV3.Document = {
   }
 };
 
+/** Event queue for streaming to WebSocket clients */
 const queue = new EventQueue(5000);
+/** Connected WebSocket clients */
 const clients = new Set<{ ws: WebSocket; lastSeq: number; alive: boolean }>();
+/** Currently tracked addresses */
 let watchlist: string[] = [];
+/** URL of hl-scout service for API proxying */
 const scoutUrl = process.env.SCOUT_URL || 'http://hl-scout:8080';
+/** Directory containing dashboard static files */
 const dashboardDir = path.resolve(__dirname, '..', 'public');
+/** NATS subject for fill events */
 const fillsSubject = 'c.fills.v1';
+/** Realtime tracker for Hyperliquid WebSocket subscriptions */
 let tracker: RealtimeTracker | null = null;
 
+/**
+ * Express middleware for owner-only endpoints.
+ * Requires x-owner-key header to match OWNER_TOKEN.
+ */
 function ownerOnly(req: Request, res: Response, next: NextFunction) {
   const token = (req.headers['x-owner-key'] || req.headers['x-owner-token'] || '').toString();
   if (token !== OWNER_TOKEN) return res.status(403).json({ error: 'forbidden' });
   return next();
 }
 
+/**
+ * Fetches the list of addresses to track from hl-scout.
+ * Combines top-ranked system accounts with user's custom accounts.
+ *
+ * @returns Array of normalized Ethereum addresses
+ */
 async function fetchWatchlist(): Promise<string[]> {
   const addresses: string[] = [];
 
@@ -151,6 +186,14 @@ async function fetchWatchlist(): Promise<string[]> {
   return [];
 }
 
+/**
+ * Proxies a request to the hl-scout service.
+ * Used for dashboard API endpoints that need data from hl-scout.
+ *
+ * @param pathname - Path on hl-scout to request
+ * @param req - Express request object
+ * @param res - Express response object
+ */
 async function proxyScout(pathname: string, req: Request, res: Response) {
   try {
     const target = new URL(pathname, scoutUrl);
@@ -168,6 +211,12 @@ async function proxyScout(pathname: string, req: Request, res: Response) {
   }
 }
 
+/**
+ * Converts a trade event to a FillEvent schema for NATS publishing.
+ *
+ * @param evt - Raw trade event from RealtimeTracker
+ * @returns Validated FillEvent payload
+ */
 function toFillEventPayload(evt: any) {
   return FillEventSchema.parse({
     fill_id: evt.hash || `${evt.address}-${evt.at}`,
@@ -184,6 +233,13 @@ function toFillEventPayload(evt: any) {
   });
 }
 
+/**
+ * Publishes a fill event to NATS JetStream.
+ * Called for each trade detected by the RealtimeTracker.
+ *
+ * @param js - JetStream client
+ * @param evt - Trade event to publish
+ */
 async function publishFillFromEvent(
   js: Awaited<ReturnType<typeof connectNats>>['js'],
   evt: any
@@ -198,6 +254,12 @@ async function publishFillFromEvent(
   }
 }
 
+/**
+ * Configures WebSocket server for streaming events to clients.
+ * Handles connection lifecycle, heartbeat, and event broadcasting.
+ *
+ * @param server - HTTP server to attach WebSocket server to
+ */
 function configureWebSocket(server: http.Server) {
   const wss = new WebSocketServer({ server, path: '/ws' });
   let pingInterval: NodeJS.Timeout | null = null;
@@ -313,6 +375,10 @@ function configureWebSocket(server: http.Server) {
   });
 }
 
+/**
+ * Main entry point for hl-stream service.
+ * Initializes NATS, RealtimeTracker, Express server, and WebSocket.
+ */
 async function main() {
   const natsUrl = process.env.NATS_URL || 'nats://localhost:4222';
   const nats = await connectNats(natsUrl);

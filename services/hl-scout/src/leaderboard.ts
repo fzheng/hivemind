@@ -1,3 +1,19 @@
+/**
+ * Leaderboard Service Module
+ *
+ * Polls and scores the Hyperliquid leaderboard to identify top-performing traders.
+ * Uses a composite scoring formula that prioritizes:
+ * 1. Stability Score (50%) - smooth, controlled profit generation
+ * 2. Win Rate (25%) - with penalty for rates below 60%
+ * 3. Trade Frequency (15%) - with penalty for excessive trading
+ * 4. Realized PnL (10%) - tiebreaker for large accounts
+ *
+ * Enriches top performers with detailed statistics from Hyperliquid's info API
+ * and persists results to PostgreSQL for dashboard display.
+ *
+ * @module leaderboard
+ */
+
 import {
   createLogger,
   getPool,
@@ -12,10 +28,15 @@ import {
 } from '@hl/ts-lib';
 import type { CandidateEvent } from '@hl/ts-lib';
 
+/** Base URL for Hyperbot leaderboard API */
 const DEFAULT_API_URL = 'https://hyperbot.network/api/leaderboard/smart';
+/** Hyperliquid info API endpoint */
 const HYPERLIQUID_INFO_URL = 'https://api.hyperliquid.xyz/info';
+/** Maps window names to period days */
 const WINDOW_PERIOD_MAP: Record<string, number> = { day: 1, week: 7, month: 30 };
+/** Concurrency limit for fetching address statistics */
 const DEFAULT_STATS_CONCURRENCY = Number(process.env.LEADERBOARD_STATS_CONCURRENCY ?? 4);
+/** Concurrency limit for fetching PnL series data */
 const DEFAULT_SERIES_CONCURRENCY = Number(process.env.LEADERBOARD_SERIES_CONCURRENCY ?? 2);
 
 /**
@@ -43,23 +64,38 @@ export enum LeaderboardSort {
 
 const DEFAULT_LEADERBOARD_SORT = LeaderboardSort.PNL;
 
+/**
+ * Raw entry from the Hyperbot leaderboard API.
+ * Contains basic trading statistics before scoring.
+ */
 type LeaderboardRawEntry = {
+  /** Ethereum address */
   address: string;
+  /** Win rate as decimal (0-1) */
   winRate?: number;
+  /** Total number of executed orders */
   executedOrders?: number;
+  /** Realized PnL in USD */
   realizedPnl?: number;
+  /** User remark/bio */
   remark?: string | null;
+  /** Account labels/tags */
   labels?: string[] | null;
+  /** Historical PnL time series */
   pnlList?: Array<{ timestamp: number; value: string }>;
-  // Additional fields for new scoring formula
+  /** Total account value in USD */
   accountValue?: number;
+  /** Starting equity for period */
   startingEquity?: number;
+  /** Maximum drawdown percentage */
   maxDrawdown?: number;
+  /** Number of winning trades */
   numWins?: number;
+  /** Number of losing trades */
   numLosses?: number;
   /** Timestamp (ms) of last operation - used for activity filtering */
   lastOperationAt?: number;
-  // Nested stats object from API (contains accurate maxDrawdown)
+  /** Nested stats object from API (contains accurate maxDrawdown) */
   stats?: {
     maxDrawdown?: number;
     totalPnl?: number;
@@ -70,28 +106,52 @@ type LeaderboardRawEntry = {
   };
 };
 
+/**
+ * Scored and ranked leaderboard entry.
+ * Contains composite score and all metrics for display.
+ */
 export type RankedEntry = {
+  /** Ethereum address */
   address: string;
+  /** Position in leaderboard (1 = best) */
   rank: number;
+  /** Composite performance score (higher = better) */
   score: number;
+  /** Weight for consensus calculations (score / sum of scores) */
   weight: number;
+  /** Whether entry was filtered out */
   filtered?: boolean;
+  /** Reason for filtering */
   filterReason?: 'not_profitable' | 'insufficient_data';
+  /** Win rate as decimal (0-1) */
   winRate: number;
+  /** Total executed orders */
   executedOrders: number;
+  /** Realized PnL in USD */
   realizedPnl: number;
+  /** PnL per trade efficiency */
   efficiency: number;
+  /** Consistency of PnL over time */
   pnlConsistency: number;
+  /** User remark/bio */
   remark: string | null;
+  /** Account labels */
   labels: string[];
+  /** Open position count from Hyperliquid stats */
   statOpenPositions: number | null;
+  /** Closed position count from Hyperliquid stats */
   statClosedPositions: number | null;
+  /** Average position duration in seconds */
   statAvgPosDuration: number | null;
+  /** Total PnL from Hyperliquid stats */
   statTotalPnl: number | null;
+  /** Max drawdown from Hyperliquid stats */
   statMaxDrawdown: number | null;
+  /** Additional metadata */
   meta: any;
 };
 
+/** Stats from Hyperliquid leaderboard stats API */
 type AddressStats = {
   winRate?: number;
   openPosCount?: number;
@@ -101,12 +161,14 @@ type AddressStats = {
   maxDrawdown?: number;
 };
 
+/** Portfolio PnL and equity history for a time window */
 type PortfolioWindowSeries = {
   window: string;
   pnlHistory: Array<{ ts: number; value: number }>;
   equityHistory: Array<{ ts: number; value: number }>;
 };
 
+/** Completed trade record from Hyperliquid */
 type CompletedTrade = {
   address: string;
   coin: string;
@@ -121,6 +183,7 @@ type CompletedTrade = {
   pnl: number;
 };
 
+/** Analysis of BTC and ETH trading performance */
 type BtcEthAnalysis = {
   btcPnl: number;
   ethPnl: number;
@@ -131,18 +194,51 @@ type BtcEthAnalysis = {
   reason?: string;
 };
 
+/**
+ * Configuration options for the LeaderboardService.
+ */
 export interface LeaderboardOptions {
+  /** Base URL for Hyperbot leaderboard API */
   apiUrl?: string;
+  /** Maximum entries to fetch from API */
   topN?: number;
+  /** Number of top entries to select for tracking */
   selectCount?: number;
+  /** Time periods to fetch (in days) */
   periods?: number[];
+  /** Page size for paginated API requests */
   pageSize?: number;
+  /** Refresh interval in milliseconds */
   refreshMs?: number;
+  /** Number of entries to enrich with detailed stats */
   enrichCount?: number;
   /** Sort order for leaderboard API (default: PNL) */
   sort?: LeaderboardSort;
 }
 
+/**
+ * Service for polling and scoring the Hyperliquid leaderboard.
+ *
+ * Responsibilities:
+ * - Periodically fetch leaderboard data from Hyperbot API
+ * - Score entries using composite performance formula
+ * - Enrich top performers with detailed Hyperliquid statistics
+ * - Persist results to PostgreSQL
+ * - Publish candidate events for downstream services
+ *
+ * @example
+ * ```typescript
+ * const service = new LeaderboardService({
+ *   topN: 1000,
+ *   selectCount: 12,
+ *   periods: [30],
+ *   refreshMs: 24 * 60 * 60 * 1000
+ * }, async (candidate) => {
+ *   await publishJson(js, 'a.candidates.v1', candidate);
+ * });
+ * service.start();
+ * ```
+ */
 export class LeaderboardService {
   private opts: Required<LeaderboardOptions>;
   private timer: NodeJS.Timeout | null = null;
@@ -153,6 +249,12 @@ export class LeaderboardService {
   private statsConcurrency: number;
   private seriesConcurrency: number;
 
+  /**
+   * Creates a new LeaderboardService.
+   *
+   * @param opts - Configuration options
+   * @param publishCandidate - Callback to publish candidate events to NATS
+   */
   constructor(opts: LeaderboardOptions, publishCandidate: (entry: CandidateEvent) => Promise<void>) {
     this.opts = {
       apiUrl: opts.apiUrl || DEFAULT_API_URL,

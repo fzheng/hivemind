@@ -1,12 +1,37 @@
-// Theme management
+/**
+ * HyperMind Dashboard JavaScript
+ *
+ * Real-time dashboard for monitoring top Hyperliquid traders.
+ * Features:
+ * - Live leaderboard with performance metrics
+ * - Real-time trade fills via WebSocket
+ * - TradingView charts for BTC and ETH
+ * - Custom account tracking
+ * - Infinite scroll for historical fills
+ *
+ * @module dashboard
+ */
+
+// =====================
+// Theme Management
+// =====================
 const themeButtons = document.querySelectorAll('.theme-toggle button');
 let currentTheme = localStorage.getItem('theme') || 'auto';
 let currentSymbol = 'BTCUSDT'; // Track current chart symbol
 
+/**
+ * Detects system color scheme preference.
+ * @returns {'dark'|'light'} System theme preference
+ */
 function getSystemTheme() {
   return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
 }
 
+/**
+ * Applies theme to document and updates UI state.
+ * @param {'auto'|'light'|'dark'} theme - Theme to apply
+ * @param {boolean} reloadChart - Whether to reload TradingView chart
+ */
 function applyTheme(theme, reloadChart = false) {
   const effectiveTheme = theme === 'auto' ? getSystemTheme() : theme;
   document.documentElement.setAttribute('data-theme', effectiveTheme);
@@ -42,8 +67,10 @@ themeButtons.forEach(btn => {
   });
 });
 
-// Status element removed - using live clock instead
-const statusEl = null;
+// =====================
+// DOM Element References
+// =====================
+const statusEl = null; // Status element removed - using live clock instead
 const addressTable = document.getElementById('address-table');
 const fillsTable = document.getElementById('fills-table');
 const aiRecommendationsTable = document.getElementById('ai-recommendations-table');
@@ -57,26 +84,42 @@ const customNicknameInput = document.getElementById('custom-nickname-input');
 const addCustomBtn = document.getElementById('add-custom-btn');
 const customErrorEl = document.getElementById('custom-accounts-error');
 
+// =====================
+// Configuration
+// =====================
 const API_BASE = '/dashboard/api';
 const SCOUT_API = '/api'; // hl-scout API base (proxied via hl-stream)
 const TOP_TABLE_LIMIT = 13; // 10 system + up to 3 custom
+const MAX_CUSTOM_ACCOUNTS = 3;
+
+// =====================
+// Application State
+// =====================
 let fillsCache = [];
 let dashboardPeriod = 30;
 let addressMeta = {};
 let customAccountCount = 0;
-const MAX_CUSTOM_ACCOUNTS = 3;
 let positionsReady = false; // Track whether positions have been loaded
 
-// Price ticker state
+// =====================
+// Price Ticker State
+// =====================
 let lastBtcPrice = null;
 let lastEthPrice = null;
 const btcPriceEl = document.getElementById('btc-price');
 const ethPriceEl = document.getElementById('eth-price');
 const btcPriceItem = document.getElementById('btc-price-item');
+const ethPriceItem = document.getElementById('eth-price-item');
 
-// Live clock
+// =====================
+// Live Clock
+// =====================
 const liveClockEl = document.getElementById('live-clock');
 
+/**
+ * Updates the live clock display with current time.
+ * Uses blinking separators for visual effect.
+ */
 function updateLiveClock() {
   if (!liveClockEl) return;
   const now = new Date();
@@ -91,22 +134,29 @@ function updateLiveClock() {
 updateLiveClock();
 setInterval(updateLiveClock, 1000);
 
-const ethPriceItem = document.getElementById('eth-price-item');
-
-// Fills time range tracking
+// =====================
+// Fill Aggregation
+// =====================
+// Time range tracking for infinite scroll
 let fillsOldestTime = null;
 let fillsNewestTime = null;
 let isLoadingMore = false;
 let hasMoreFills = true;
 
-// Fill aggregation settings
-const AGGREGATION_WINDOW_MS = 60000; // 1 minute
-const MAX_AGGREGATED_GROUPS = 50; // Max number of aggregated groups to keep
+// Aggregation settings: groups fills within 1-minute windows
+const AGGREGATION_WINDOW_MS = 60000; // 1 minute window
+const MAX_AGGREGATED_GROUPS = 50; // Max groups to keep in memory
 
 // Streaming aggregation state - stores pre-aggregated groups
 let aggregatedGroups = [];
 
-// Create a new aggregation group from a single fill
+/**
+ * Creates a new aggregation group from a single fill.
+ * Groups track multiple fills that can be merged together.
+ *
+ * @param {Object} fill - Fill event data
+ * @returns {Object} New aggregation group
+ */
 function createGroup(fill) {
   const symbol = (fill.symbol || 'BTC').toUpperCase();
   return {
@@ -130,7 +180,14 @@ function createGroup(fill) {
   };
 }
 
-// Check if a fill can be merged into an existing group
+/**
+ * Checks if a fill can be merged into an existing group.
+ * Fills must match address, symbol, action, and be within time window.
+ *
+ * @param {Object} group - Existing aggregation group
+ * @param {Object} fill - Fill to check for mergeability
+ * @returns {boolean} True if fill can be merged
+ */
 function canMergeIntoGroup(group, fill) {
   const fillTime = new Date(fill.time_utc).getTime();
   const groupNewestTime = new Date(group.time_utc).getTime();
@@ -149,7 +206,13 @@ function canMergeIntoGroup(group, fill) {
   return sameAddress && sameSymbol && sameAction && withinWindow;
 }
 
-// Merge a fill into an existing group
+/**
+ * Merges a fill into an existing aggregation group.
+ * Updates totals, time range, and computed fields.
+ *
+ * @param {Object} group - Group to merge into
+ * @param {Object} fill - Fill to merge
+ */
 function mergeIntoGroup(group, fill) {
   const fillTime = new Date(fill.time_utc).getTime();
 
@@ -190,7 +253,13 @@ function mergeIntoGroup(group, fill) {
   group.price_usd = group.avgPrice;
 }
 
-// Add a new fill to the streaming aggregation
+/**
+ * Adds a new fill to the streaming aggregation.
+ * Attempts to merge with existing group or creates new one.
+ * Only processes BTC and ETH fills.
+ *
+ * @param {Object} fill - Fill event to aggregate
+ */
 function addFillToAggregation(fill) {
   const symbol = (fill.symbol || 'BTC').toUpperCase();
   // Only process BTC and ETH

@@ -1,3 +1,20 @@
+"""
+HL-Decide Service
+
+Generates trading signals based on consensus scores from hl-sage.
+Tracks signal outcomes and persists results for performance analysis.
+
+Key responsibilities:
+- Consume `b.scores.v1` and `c.fills.v1` events from NATS
+- Generate trading signals when score and fill events align
+- Publish `d.signals.v1` events for signal emission
+- Track and close positions after timeout
+- Publish `d.outcomes.v1` events with P&L results
+- Persist tickets and outcomes to PostgreSQL
+
+@module hl-decide
+"""
+
 import asyncio
 import json
 import os
@@ -36,6 +53,14 @@ decision_latency = Histogram(
 
 
 async def ensure_stream(js, name: str, subjects):
+    """
+    Ensures a NATS JetStream stream exists, creating it if necessary.
+
+    Args:
+        js: JetStream client
+        name: Stream name
+        subjects: List of subject patterns to capture
+    """
     try:
         await js.stream_info(name)
     except Exception:
@@ -43,10 +68,27 @@ async def ensure_stream(js, name: str, subjects):
 
 
 def pick_side(score: ScoreEvent) -> str:
+    """
+    Determines trading direction based on score value.
+
+    Args:
+        score: ScoreEvent containing the consensus score
+
+    Returns:
+        "long" if score >= 0, "short" otherwise
+    """
     return "long" if score.score >= 0 else "short"
 
 
 async def persist_ticket(conn, ticket_id: str, signal: SignalEvent):
+    """
+    Persists a signal ticket to the database.
+
+    Args:
+        conn: Database connection
+        ticket_id: Unique ticket identifier
+        signal: SignalEvent to persist
+    """
     await conn.execute(
         """
         INSERT INTO tickets (id, ts, address, asset, side, payload)
@@ -62,6 +104,13 @@ async def persist_ticket(conn, ticket_id: str, signal: SignalEvent):
 
 
 async def persist_outcome(conn, outcome: OutcomeEvent):
+    """
+    Persists a ticket outcome to the database.
+
+    Args:
+        conn: Database connection
+        outcome: OutcomeEvent containing P&L and close reason
+    """
     await conn.execute(
         """
         INSERT INTO ticket_outcomes (ticket_id, closed_ts, result_r, closed_reason, notes)
@@ -120,6 +169,13 @@ async def get_current_price(asset: str) -> float:
 
 
 async def emit_signal(address: str):
+    """
+    Emits a trading signal if both score and fill data are available.
+    Creates a ticket and schedules outcome tracking.
+
+    Args:
+        address: Ethereum address to emit signal for
+    """
     score = scores.get(address)
     fill = fills.get(address)
     if not score or not fill:
@@ -155,6 +211,14 @@ async def emit_signal(address: str):
 
 
 async def schedule_close(ticket_id: str, signal: SignalEvent):
+    """
+    Schedules automatic position close after timeout period.
+    Calculates P&L and publishes outcome event.
+
+    Args:
+        ticket_id: Unique ticket identifier
+        signal: Original SignalEvent containing entry price
+    """
     try:
         await asyncio.sleep(10)
 
@@ -313,6 +377,13 @@ def enforce_limits():
 
 
 async def handle_score(msg):
+    """
+    Handles incoming score events from hl-sage.
+    Updates score state and attempts to emit signal.
+
+    Args:
+        msg: NATS message containing ScoreEvent JSON
+    """
     data = ScoreEvent.model_validate_json(msg.data.decode())
     # Move to end (most recently used)
     if data.address in scores:
@@ -327,6 +398,13 @@ async def handle_score(msg):
 
 
 async def handle_fill(msg):
+    """
+    Handles incoming fill events from hl-stream.
+    Updates fill state and attempts to emit signal.
+
+    Args:
+        msg: NATS message containing FillEvent JSON
+    """
     data = FillEvent.model_validate_json(msg.data.decode())
     # Move to end (most recently used)
     if data.address in fills:

@@ -1,3 +1,20 @@
+/**
+ * HL-Scout Service
+ *
+ * Ingests and scores Hyperliquid leaderboard data to identify top-performing traders.
+ * Publishes candidate events to NATS for downstream services and provides REST APIs
+ * for address management, leaderboard access, and custom account tracking.
+ *
+ * Key responsibilities:
+ * - Poll Hyperliquid leaderboard API and score traders
+ * - Enrich top performers with detailed statistics
+ * - Publish candidate events to `a.candidates.v1` topic
+ * - Manage custom accounts for user-specified address tracking
+ * - Expose REST APIs for dashboard data
+ *
+ * @module hl-scout
+ */
+
 import cors from 'cors';
 import express, { Request, Response, NextFunction } from 'express';
 import swaggerUi from 'swagger-ui-express';
@@ -208,17 +225,31 @@ const swaggerDoc: OpenAPIV3.Document = {
   }
 };
 
+/**
+ * Parses and validates a leaderboard period value.
+ * Falls back to the first configured period or default of 30 days.
+ *
+ * @param value - Period value from query parameter
+ * @returns Valid period number in days
+ */
 function parsePeriod(value: any): number {
   const n = Number(value);
   if (Number.isFinite(n) && n > 0) return n;
   return LEADERBOARD_PERIODS[0] || DEFAULT_LEADERBOARD_PERIOD || 30;
 }
 
+/** Request body for adding/updating an address */
 interface AddressPayload {
+  /** Ethereum address to add */
   address: string;
+  /** Optional display name */
   nickname?: string | null;
 }
 
+/**
+ * Express middleware for owner-only endpoints.
+ * Requires x-owner-key header to match OWNER_TOKEN environment variable.
+ */
 function ownerOnly(req: Request, res: Response, next: NextFunction) {
   const token = (req.headers['x-owner-key'] || req.headers['x-owner-token'] || '').toString();
   if (token !== OWNER_TOKEN) {
@@ -227,11 +258,20 @@ function ownerOnly(req: Request, res: Response, next: NextFunction) {
   return next();
 }
 
+/** Default seed addresses when database is empty */
 const DEFAULT_SEEDS = (process.env.SCOUT_SEEDS || '0x1111111111111111111111111111111111111111,0x2222222222222222222222222222222222222222,0x3333333333333333333333333333333333333333')
   .split(',')
   .map((addr) => addr.trim().toLowerCase())
   .filter((addr) => addr.startsWith('0x') && addr.length === 42);
 
+/**
+ * Publishes a candidate event to NATS JetStream.
+ * Validates the candidate schema and records latency metrics.
+ *
+ * @param subject - NATS subject to publish to
+ * @param js - JetStream client
+ * @param candidate - Candidate event data
+ */
 async function publishCandidate(
   subject: string,
   js: Awaited<ReturnType<typeof connectNats>>['js'],
@@ -244,6 +284,14 @@ async function publishCandidate(
   logger.info('candidate_published', { address: parsed.address, source: parsed.source });
 }
 
+/**
+ * Backfills historical trades for an address from Hyperliquid API.
+ * Fetches recent BTC and ETH fills and inserts them into the database.
+ *
+ * @param address - Ethereum address to backfill
+ * @param limit - Maximum number of fills to fetch (default 50)
+ * @returns Number of newly inserted trades
+ */
 async function backfillRecent(address: string, limit = 50): Promise<number> {
   // Fetch both BTC and ETH fills from Hyperliquid API
   const fills = await fetchUserFills(address, { aggregateByTime: true, symbols: ['BTC', 'ETH'] });
@@ -274,6 +322,14 @@ async function backfillRecent(address: string, limit = 50): Promise<number> {
   return inserted;
 }
 
+/**
+ * Bootstraps initial candidate events on service startup.
+ * Seeds default addresses if database is empty, then publishes
+ * the first 3 addresses as candidates.
+ *
+ * @param subject - NATS subject for candidate events
+ * @param js - JetStream client
+ */
 async function bootstrapCandidates(subject: string, js: Awaited<ReturnType<typeof connectNats>>['js']) {
   const rows = await listAddresses();
   if (rows.length === 0 && DEFAULT_SEEDS.length) {
@@ -293,6 +349,10 @@ async function bootstrapCandidates(subject: string, js: Awaited<ReturnType<typeo
   }
 }
 
+/**
+ * Main entry point for hl-scout service.
+ * Initializes database, NATS, leaderboard service, and Express server.
+ */
 async function main() {
   await getPool(); // ensure db connectivity
   const natsUrl = process.env.NATS_URL || 'nats://localhost:4222';

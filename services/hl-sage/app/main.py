@@ -1,3 +1,20 @@
+"""
+HL-Sage Service
+
+Scores and weights candidate addresses based on their leaderboard performance.
+Consumes candidate events from hl-scout and fill events from hl-stream,
+produces score events for hl-decide to generate trading signals.
+
+Key responsibilities:
+- Consume `a.candidates.v1` events from NATS
+- Track position changes from `c.fills.v1` events
+- Compute equal-weight scores based on leaderboard rank
+- Publish `b.scores.v1` events for downstream signal generation
+- Persist state to PostgreSQL for recovery after restarts
+
+@module hl-sage
+"""
+
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Any
@@ -38,6 +55,14 @@ score_latency = Histogram(
 
 
 async def ensure_stream(js, name: str, subjects: List[str]) -> None:
+    """
+    Ensures a NATS JetStream stream exists, creating it if necessary.
+
+    Args:
+        js: JetStream client
+        name: Stream name
+        subjects: List of subject patterns to capture
+    """
     try:
         await js.stream_info(name)
     except Exception:
@@ -121,6 +146,13 @@ def evict_stale_entries():
 
 
 async def handle_candidate(msg):
+    """
+    Handles incoming candidate events from hl-scout.
+    Extracts leaderboard weight and rank, stores in tracked_addresses.
+
+    Args:
+        msg: NATS message containing CandidateEvent JSON
+    """
     with score_latency.time():
         data = CandidateEvent.model_validate_json(msg.data.decode())
         candidate_counter.inc()
@@ -151,6 +183,13 @@ async def handle_candidate(msg):
 
 
 async def handle_fill(msg):
+    """
+    Handles incoming fill events from hl-stream.
+    Updates position state and emits score event to hl-decide.
+
+    Args:
+        msg: NATS message containing FillEvent JSON
+    """
     data = FillEvent.model_validate_json(msg.data.decode())
     addr_lower = data.address.lower()
     state = tracked_addresses.get(addr_lower)
