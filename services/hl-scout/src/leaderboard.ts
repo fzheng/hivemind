@@ -37,10 +37,99 @@ const HYPERBOT_REMARKS_URL = 'https://hyperbot.network/api/leaderboard/smart/que
 const HYPERLIQUID_INFO_URL = 'https://api.hyperliquid.xyz/info';
 /** Maps window names to period days */
 const WINDOW_PERIOD_MAP: Record<string, number> = { day: 1, week: 7, month: 30 };
-/** Concurrency limit for fetching address statistics */
-const DEFAULT_STATS_CONCURRENCY = Number(process.env.LEADERBOARD_STATS_CONCURRENCY ?? 4);
+/** Concurrency limit for fetching address statistics (reduced from 4 to 2 for rate limit safety) */
+const DEFAULT_STATS_CONCURRENCY = Number(process.env.LEADERBOARD_STATS_CONCURRENCY ?? 2);
 /** Concurrency limit for fetching PnL series data */
 const DEFAULT_SERIES_CONCURRENCY = Number(process.env.LEADERBOARD_SERIES_CONCURRENCY ?? 2);
+/** Delay between paginated leaderboard requests in ms */
+const PAGE_REQUEST_DELAY_MS = Number(process.env.LEADERBOARD_PAGE_DELAY_MS ?? 500);
+/** Delay between individual API requests in ms (rate limiting) */
+const REQUEST_DELAY_MS = Number(process.env.HYPERBOT_REQUEST_DELAY_MS ?? 200);
+/** Cache TTL for address stats in ms (1 hour) */
+const STATS_CACHE_TTL_MS = Number(process.env.HYPERBOT_STATS_CACHE_TTL_MS ?? 60 * 60 * 1000);
+/** Cache TTL for BTC/ETH analysis in ms (1 hour) */
+const BTC_ETH_CACHE_TTL_MS = Number(process.env.HYPERBOT_BTC_ETH_CACHE_TTL_MS ?? 60 * 60 * 1000);
+/** Maximum cache size for LRU eviction */
+const MAX_CACHE_SIZE = Number(process.env.HYPERBOT_MAX_CACHE_SIZE ?? 500);
+
+/**
+ * Simple LRU cache with TTL support for Hyperbot API responses.
+ * Prevents excessive API calls by caching frequently requested data.
+ */
+class LRUCache<T> {
+  private cache = new Map<string, { value: T; expiresAt: number }>();
+  private maxSize: number;
+  private ttlMs: number;
+
+  constructor(maxSize: number, ttlMs: number) {
+    this.maxSize = maxSize;
+    this.ttlMs = ttlMs;
+  }
+
+  get(key: string): T | undefined {
+    const entry = this.cache.get(key);
+    if (!entry) return undefined;
+    if (Date.now() > entry.expiresAt) {
+      this.cache.delete(key);
+      return undefined;
+    }
+    // Move to end (most recently used)
+    this.cache.delete(key);
+    this.cache.set(key, entry);
+    return entry.value;
+  }
+
+  set(key: string, value: T): void {
+    // Delete if exists to update position
+    this.cache.delete(key);
+    // Evict oldest if at capacity
+    while (this.cache.size >= this.maxSize) {
+      const firstKey = this.cache.keys().next().value;
+      if (firstKey !== undefined) {
+        this.cache.delete(firstKey);
+      }
+    }
+    this.cache.set(key, { value, expiresAt: Date.now() + this.ttlMs });
+  }
+
+  clear(): void {
+    this.cache.clear();
+  }
+
+  get size(): number {
+    return this.cache.size;
+  }
+}
+
+/** Cache for address stats from Hyperbot */
+const addressStatsCache = new LRUCache<AddressStats>(MAX_CACHE_SIZE, STATS_CACHE_TTL_MS);
+/** Cache for BTC/ETH analysis results */
+const btcEthAnalysisCache = new LRUCache<BtcEthAnalysis>(MAX_CACHE_SIZE, BTC_ETH_CACHE_TTL_MS);
+
+/**
+ * Rate limiter to prevent excessive API calls.
+ * Uses token bucket algorithm with configurable delay between requests.
+ */
+class RateLimiter {
+  private lastRequestTime = 0;
+  private delayMs: number;
+
+  constructor(delayMs: number) {
+    this.delayMs = delayMs;
+  }
+
+  async acquire(): Promise<void> {
+    const now = Date.now();
+    const elapsed = now - this.lastRequestTime;
+    if (elapsed < this.delayMs) {
+      await sleep(this.delayMs - elapsed);
+    }
+    this.lastRequestTime = Date.now();
+  }
+}
+
+/** Rate limiter for Hyperbot API requests */
+const hyperbotRateLimiter = new RateLimiter(REQUEST_DELAY_MS);
 
 /**
  * Hyperbot leaderboard sort options
@@ -297,6 +386,11 @@ export class LeaderboardService {
         this.logger.error('leaderboard_period_failed', { period, err: err?.message });
       }
     }
+    // Log cache statistics after refresh
+    this.logger.info('hyperbot_cache_stats', {
+      addressStatsSize: addressStatsCache.size,
+      btcEthAnalysisSize: btcEthAnalysisCache.size,
+    });
   }
 
   async refreshPeriod(period: number) {
@@ -355,6 +449,10 @@ export class LeaderboardService {
     const results: LeaderboardRawEntry[] = [];
     const pagesNeeded = Math.ceil(this.opts.topN / this.opts.pageSize);
     for (let page = 1; page <= pagesNeeded; page += 1) {
+      // Rate limit between paginated requests to avoid hitting API limits
+      if (page > 1) {
+        await sleep(PAGE_REQUEST_DELAY_MS);
+      }
       const url = `${this.opts.apiUrl}?pageNum=${page}&pageSize=${this.opts.pageSize}&period=${period}&sort=${this.opts.sort}`;
       const res = await fetch(url);
       if (!res.ok) throw new Error(`leaderboard HTTP ${res.status}`);
@@ -363,6 +461,11 @@ export class LeaderboardService {
       results.push(...data);
       if (data.length < this.opts.pageSize) break;
     }
+    this.logger.info('leaderboard_fetched', {
+      period,
+      pages: Math.min(pagesNeeded, Math.ceil(results.length / this.opts.pageSize)),
+      entries: results.length,
+    });
     return results.slice(0, this.opts.topN);
   }
 
@@ -561,12 +664,24 @@ export class LeaderboardService {
 
   private async fetchAddressStat(address: string, period: number): Promise<AddressStats | null> {
     const normalized = normalizeAddress(address);
+    const cacheKey = `${normalized}:${period}`;
+
+    // Check cache first
+    const cached = addressStatsCache.get(cacheKey);
+    if (cached) {
+      this.logger.debug?.('addr_stat_cache_hit', { address: normalized, period });
+      return cached;
+    }
+
+    // Rate limit before making request
+    await hyperbotRateLimiter.acquire();
+
     const url = `${this.smartApiBase}query-addr-stat/${encodeURIComponent(normalized)}?period=${period}`;
     try {
       const payload = await this.requestJson<any>(url, { method: 'GET' }, 2, 6000);
       const data = payload?.data;
       if (!data) return null;
-      return {
+      const stats: AddressStats = {
         winRate: typeof data.winRate === 'number' ? data.winRate : undefined,
         openPosCount: Number.isFinite(Number(data.openPosCount)) ? Number(data.openPosCount) : undefined,
         closePosCount: Number.isFinite(Number(data.closePosCount)) ? Number(data.closePosCount) : undefined,
@@ -574,6 +689,9 @@ export class LeaderboardService {
         totalPnl: Number.isFinite(Number(data.totalPnl)) ? Number(data.totalPnl) : undefined,
         maxDrawdown: Number.isFinite(Number(data.maxDrawdown)) ? Number(data.maxDrawdown) : undefined,
       };
+      // Cache the result
+      addressStatsCache.set(cacheKey, stats);
+      return stats;
     } catch (err: any) {
       this.logger.warn('addr_stat_fetch_failed', { address: normalized, period, err: err?.message });
       return null;
@@ -583,6 +701,7 @@ export class LeaderboardService {
   /**
    * Fetch address remarks (nicknames) from Hyperbot batch API.
    * Much faster than fetching the entire leaderboard.
+   * This is already a batch API, so it's naturally efficient.
    *
    * API: POST https://hyperbot.network/api/leaderboard/smart/query-addr-remarks
    * Payload: ["0xaddress1", "0xaddress2", ...]
@@ -593,6 +712,9 @@ export class LeaderboardService {
     if (!addresses.length) return result;
 
     const normalizedAddresses = addresses.map(a => normalizeAddress(a));
+
+    // Rate limit before making request
+    await hyperbotRateLimiter.acquire();
 
     try {
       const payload = await this.requestJson<{
@@ -679,11 +801,32 @@ export class LeaderboardService {
    * Fetch and analyze BTC/ETH trades for an address.
    * Returns analysis of BTC+ETH PnL contribution to total PnL.
    * Only considers trades lasting at least 10 minutes (excludes scalping).
+   * Results are cached to reduce API calls.
    *
    * API: GET https://hyperbot.network/api/leaderboard/smart/completed-trades/{address}?take=2000
    */
   private async analyzeBtcEthTrades(address: string, totalPnl: number): Promise<BtcEthAnalysis> {
     const normalized = normalizeAddress(address);
+
+    // Check cache first (cache key includes address only, not totalPnl since trades don't change)
+    const cached = btcEthAnalysisCache.get(normalized);
+    if (cached) {
+      this.logger.debug?.('btc_eth_cache_hit', { address: normalized });
+      // Recalculate ratio with current totalPnl (in case it changed)
+      const btcEthRatio = totalPnl !== 0 ? Math.abs(cached.btcEthPnl / totalPnl) : 0;
+      const qualified = cached.btcEthPnl >= 0 && btcEthRatio >= 0.10;
+      return {
+        ...cached,
+        totalPnl,
+        btcEthRatio,
+        qualified,
+        reason: !qualified ? (cached.btcEthPnl < 0 ? 'btc_eth_negative_pnl' : 'btc_eth_insufficient_contribution') : undefined,
+      };
+    }
+
+    // Rate limit before making request
+    await hyperbotRateLimiter.acquire();
+
     const url = `${this.smartApiBase}completed-trades/${encodeURIComponent(normalized)}?take=2000`;
     const MIN_TRADE_DURATION_MS = 10 * 60 * 1000; // 10 minutes
 
@@ -737,7 +880,7 @@ export class LeaderboardService {
         reason = 'btc_eth_insufficient_contribution';
       }
 
-      return {
+      const result: BtcEthAnalysis = {
         btcPnl,
         ethPnl,
         totalPnl,
@@ -746,6 +889,11 @@ export class LeaderboardService {
         qualified,
         reason,
       };
+
+      // Cache the result (store btcPnl, ethPnl, btcEthPnl for reuse)
+      btcEthAnalysisCache.set(normalized, result);
+
+      return result;
     } catch (err: any) {
       this.logger.warn('btc_eth_analysis_failed', { address: normalized, err: err?.message });
       // On error, assume not qualified to be conservative

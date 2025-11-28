@@ -144,6 +144,7 @@ let isLoadingMore = false;
 let hasMoreFills = true;
 let totalFillCount = 0;
 let isInitialLoad = true; // Prevent flashing during initial load
+let isFirstWsConnect = true; // Track first WebSocket connection
 
 // Aggregation settings: groups fills within 1-minute windows
 const AGGREGATION_WINDOW_MS = 60000; // 1 minute window
@@ -164,13 +165,17 @@ const expandedGroups = new Set();
  */
 function createGroup(fill) {
   const symbol = (fill.symbol || 'BTC').toUpperCase();
+  const normalizedAddress = (fill.address || '').toLowerCase();
+  const normalizedAction = (fill.action || '').trim().toLowerCase();
   return {
-    id: `${fill.address}-${fill.time_utc}-${Math.random().toString(36).slice(2, 8)}`,
+    id: `${normalizedAddress}-${fill.time_utc}-${Math.random().toString(36).slice(2, 8)}`,
     time_utc: fill.time_utc,
     oldest_time: fill.time_utc,
-    address: fill.address,
+    address: normalizedAddress, // Normalized for grouping
+    originalAddress: fill.address, // Original for display
     symbol: symbol,
-    action: fill.action || '',
+    action: normalizedAction, // Normalized for grouping
+    originalAction: fill.action, // Original for display
     fills: [fill],
     totalSize: Math.abs(fill.size_signed || 0),
     totalPnl: fill.closed_pnl_usd || 0,
@@ -204,9 +209,11 @@ function canMergeIntoGroup(group, fill) {
   const withinWindow = timeDiffFromNewest <= AGGREGATION_WINDOW_MS || timeDiffFromOldest <= AGGREGATION_WINDOW_MS;
 
   const symbol = (fill.symbol || 'BTC').toUpperCase();
-  const sameAddress = group.address === fill.address;
+  const normalizedFillAddress = (fill.address || '').toLowerCase();
+  const normalizedFillAction = (fill.action || '').trim().toLowerCase();
+  const sameAddress = group.address === normalizedFillAddress;
   const sameSymbol = group.symbol === symbol;
-  const sameAction = group.action === (fill.action || '');
+  const sameAction = group.action === normalizedFillAction;
 
   return sameAddress && sameSymbol && sameAction && withinWindow;
 }
@@ -513,8 +520,8 @@ function aggregateFills(fills) {
   for (const fill of sorted) {
     const fillTime = new Date(fill.time_utc).getTime();
     const symbol = (fill.symbol || 'BTC').toUpperCase();
-    const action = fill.action || '';
-    const address = fill.address;
+    const action = (fill.action || '').trim().toLowerCase(); // Normalize for comparison
+    const address = (fill.address || '').toLowerCase(); // Normalize address
 
     // Check if this fill should be grouped with current group
     if (currentGroup) {
@@ -560,9 +567,11 @@ function aggregateFills(fills) {
       id: `${address}-${fill.time_utc}-${Math.random().toString(36).slice(2, 8)}`,
       time_utc: fill.time_utc,
       oldest_time: fill.time_utc,
-      address: address,
+      address: address, // Normalized (lowercase)
+      originalAddress: fill.address, // Original for display
       symbol: symbol,
-      action: action,
+      action: action, // Normalized (lowercase) for grouping
+      originalAction: fill.action, // Original for display
       fills: [fill],
       totalSize: Math.abs(fill.size_signed || 0),
       totalPnl: fill.closed_pnl_usd || 0,
@@ -951,8 +960,11 @@ function renderGroupRow(group, isNew = false) {
     ? `~${fmtUsdShort(group.avgPrice)}`
     : fmtUsdShort(group.price_usd ?? null);
   const pnl = fmtUsdShort(group.closed_pnl_usd ?? null);
-  const action = group.action || '—';
-  const sideClass = action.toLowerCase().includes('short') ? 'sell' : 'buy';
+  // Use originalAction for display, fallback to action (for backwards compatibility)
+  const displayAction = group.originalAction || group.action || '—';
+  const sideClass = displayAction.toLowerCase().includes('short') ? 'sell' : 'buy';
+  // Use originalAddress for display/links, address for data attributes (normalized)
+  const displayAddress = group.originalAddress || group.address;
 
   const isExpanded = expandedGroups.has(group.id);
 
@@ -972,8 +984,8 @@ function renderGroupRow(group, isNew = false) {
   let html = `
     <tr class="${group.isAggregated ? 'aggregated-row' : ''} ${newClass}" data-group-id="${group.id || ''}" data-address="${addrLower}">
       <td data-label="Time">${fmtDateTime(group.time_utc)}</td>
-      <td data-label="Address"><a href="https://hypurrscan.io/address/${group.address}" target="_blank" rel="noopener noreferrer">${shortAddress(group.address)}</a></td>
-      <td data-label="Action"><span class="pill ${sideClass}">${action}</span>${aggBadge}</td>
+      <td data-label="Address"><a href="https://hypurrscan.io/address/${displayAddress}" target="_blank" rel="noopener noreferrer">${shortAddress(displayAddress)}</a></td>
+      <td data-label="Action"><span class="pill ${sideClass}">${displayAction}</span>${aggBadge}</td>
       <td data-label="Size">${size}</td>
       <td data-label="Previous Position">${prev}</td>
       <td data-label="Price">${price}</td>
@@ -1151,11 +1163,33 @@ async function refreshSummary() {
 async function refreshFills() {
   try {
     const data = await fetchJson(`${API_BASE}/fills?limit=40`);
-    fillsCache = data.fills || [];
+    const newFills = data.fills || [];
 
-    // Update hasMoreFills based on response
-    if (data.hasMore !== undefined) {
-      hasMoreFills = data.hasMore;
+    if (fillsCache.length === 0) {
+      // Initial load - just use the new fills
+      fillsCache = newFills;
+      hasMoreFills = data.hasMore !== false;
+    } else {
+      // Incremental update - merge new fills at the front, keeping loaded history
+      // Find fills that are newer than our current newest
+      const newestTime = fillsCache.length > 0 ? new Date(fillsCache[0].time_utc).getTime() : 0;
+      const trulyNewFills = newFills.filter(f => new Date(f.time_utc).getTime() > newestTime);
+
+      if (trulyNewFills.length > 0) {
+        // Add new fills to the front
+        fillsCache = [...trulyNewFills, ...fillsCache];
+        // Cap the cache to prevent unbounded growth
+        if (fillsCache.length > 500) {
+          fillsCache = fillsCache.slice(0, 500);
+        }
+      }
+      // Don't update hasMoreFills here - keep user's "Load More" progress
+    }
+
+    // Set fillsOldestTime from the oldest fill in cache
+    // This is needed for "Load More" pagination to work correctly
+    if (fillsCache.length > 0) {
+      fillsOldestTime = fillsCache[fillsCache.length - 1].time_utc;
     }
 
     renderFills(fillsCache);
@@ -1226,7 +1260,24 @@ function connectWs() {
       console.error('ws parse', err);
     }
   });
+  ws.addEventListener('open', () => {
+    // Refresh fills when WebSocket reconnects to ensure data consistency
+    // This prevents stale data showing after backend restart
+    // Skip on first connect since refreshFills() was already called in init()
+    if (isFirstWsConnect) {
+      isFirstWsConnect = false;
+    } else {
+      refreshFills();
+    }
+  });
   ws.addEventListener('close', () => {
+    // Clear stale fills data when connection is lost
+    // This prevents showing outdated data when backend restarts
+    fillsCache = [];
+    aggregatedGroups = [];
+    hasMoreFills = true; // Reset so "Load More" button is re-enabled after reconnect
+    fillsOldestTime = null;
+    renderAggregatedFills();
     setTimeout(connectWs, 2000);
   });
 }
@@ -1591,6 +1642,13 @@ async function loadMoreFills() {
     if (loadMoreEl) loadMoreEl.style.display = 'none';
     if (loadBtn) {
       loadBtn.classList.remove('loading');
+      // Reset button text based on state
+      if (!hasMoreFills) {
+        loadBtn.textContent = 'All loaded';
+        loadBtn.disabled = true;
+      } else {
+        loadBtn.textContent = 'Load More';
+      }
     }
   }
 }
@@ -1609,79 +1667,14 @@ function initInfiniteScroll() {
   });
 }
 
-// Fetch historical fills from Hyperliquid API
-async function fetchHistoricalFills() {
-  try {
-    const response = await fetch(`${API_BASE}/fills/fetch-history`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ limit: 50 })
-    });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    return await response.json();
-  } catch (err) {
-    console.error('Fetch historical fills error:', err);
-    return null;
-  }
-}
-
 // Initialize load history button
 function initLoadHistoryButton() {
   const btn = document.getElementById('load-history-btn');
   if (!btn) return;
 
   btn.addEventListener('click', async () => {
-    if (isLoadingMore) return;
-    isLoadingMore = true;
-
-    btn.disabled = true;
-    btn.classList.add('loading');
-    btn.textContent = 'Loading...';
-
-    try {
-      // Fetch historical fills from Hyperliquid API
-      const result = await fetchHistoricalFills();
-
-      if (result && result.fills && result.fills.length > 0) {
-        // Update cache with fetched fills
-        fillsCache = result.fills;
-        hasMoreFills = result.hasMore !== false;
-        fillsOldestTime = result.oldestTime;
-        renderFills(fillsCache);
-
-        // Show success message
-        const newCount = result.inserted || 0;
-        if (newCount > 0) {
-          btn.textContent = `✓ ${newCount} new fills`;
-        } else {
-          btn.textContent = `✓ ${result.fills.length} fills loaded`;
-        }
-        btn.classList.remove('loading');
-
-        // Reset button text after delay
-        setTimeout(() => {
-          updateFillsUI();
-        }, 2000);
-      } else if (result) {
-        // API returned but no fills - maybe all caught up
-        hasMoreFills = false;
-        btn.textContent = 'No more fills';
-        btn.classList.remove('loading');
-        updateFillsUI();
-      } else {
-        // API call failed, try loading from local DB
-        btn.textContent = 'Retrying...';
-        btn.classList.remove('loading');
-        await loadMoreFills();
-      }
-    } catch (err) {
-      console.error('Load history button error:', err);
-      btn.textContent = 'Error - retry';
-      btn.classList.remove('loading');
-    } finally {
-      isLoadingMore = false;
-      btn.disabled = false;
-    }
+    // Use loadMoreFills for pagination - it handles everything including UI updates
+    await loadMoreFills();
   });
 }
 
@@ -1701,7 +1694,8 @@ async function init() {
   // Check positions status FIRST before loading data
   await checkPositionsStatus();
   refreshSummary();
-  refreshFills();
+  // Await initial fills load to prevent double-render flash
+  await refreshFills();
   renderAIRecommendations();
   connectWs();
   // Continue polling until positions are ready (if not already)

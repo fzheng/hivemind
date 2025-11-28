@@ -297,6 +297,18 @@ main {
 
 .card-header h3 {
   margin: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* Panel subtitle - shows relationship between panels */
+.panel-subtitle {
+  font-size: 0.65rem;
+  font-weight: 400;
+  color: var(--text-muted);
+  opacity: 0.8;
 }
 
 .card-actions {
@@ -1185,6 +1197,12 @@ td {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
+}
+
+.fills-card .card-header h3 .panel-subtitle {
+  flex-basis: 100%;
+  margin-top: 2px;
 }
 
 /* Live indicator dot */

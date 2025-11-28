@@ -73,7 +73,8 @@
           <div class="card-header">
             <h3>
               <span class="ai-icon">⚡</span>
-              AI Trade Signals
+              AI Signals
+              <span class="panel-subtitle">Generated from tracked trader patterns</span>
             </h3>
             <div class="card-actions">
               <span class="ai-status" id="ai-status">
@@ -105,11 +106,14 @@
         </div>
       </section>
 
-      <!-- Row 3: Top Performance + Live Fills (side by side) -->
+      <!-- Row 3: Tracked Traders + Trader Activity (side by side) -->
       <section class="grid-bottom">
         <div class="card leaderboard-card">
           <div class="card-header">
-            <h3>Top Performance (30D)</h3>
+            <h3>
+              Tracked Traders
+              <span class="panel-subtitle">Top performers (30-day) + custom accounts</span>
+            </h3>
             <div class="card-actions">
               <span id="last-refresh" class="last-refresh">Updated: —</span>
               <button id="refresh-btn" class="refresh-btn" title="Refresh leaderboard">
@@ -119,7 +123,7 @@
               </button>
             </div>
           </div>
-          <span class="metric-hint">Ranked by composite score. <span class="custom-badge">★</span> = custom tracked</span>
+          <span class="metric-hint">AI analyzes these traders to generate signals. <span class="custom-badge">★</span> = custom</span>
 
           <!-- Custom Accounts Section -->
           <div class="custom-accounts-section">
@@ -154,7 +158,8 @@
           <div class="card-header">
             <h3>
               <span class="live-dot" title="Live"></span>
-              Live Fills
+              Trader Activity
+              <span class="panel-subtitle">Real-time fills from tracked accounts</span>
             </h3>
             <div class="fills-meta">
               <span id="fills-count" class="fills-count">0 fills</span>

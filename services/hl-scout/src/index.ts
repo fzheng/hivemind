@@ -648,8 +648,11 @@ async function main() {
 
   app.get('/dashboard/fills', async (req, res) => {
     const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 25));
-    const fills = await listLiveFills(limit);
-    res.json({ fills });
+    // Fetch one extra to check if there are more
+    const fills = await listLiveFills(limit + 1);
+    const hasMore = fills.length > limit;
+    const trimmedFills = fills.slice(0, limit);
+    res.json({ fills: trimmedFills, hasMore });
   });
 
   app.get('/dashboard/decisions', async (req, res) => {
