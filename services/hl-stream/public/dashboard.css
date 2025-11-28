@@ -1158,10 +1158,17 @@ td {
 
 /* Scrollable fills container */
 .fills-scroll-container {
-  max-height: 380px;
+  max-height: 450px;
+  min-height: 200px;
   overflow-y: auto;
   scrollbar-width: thin;
   scrollbar-color: var(--border-secondary) transparent;
+  display: flex;
+  flex-direction: column;
+}
+
+.fills-scroll-container .fills-table {
+  flex-shrink: 0;
 }
 
 .fills-scroll-container::-webkit-scrollbar {
@@ -1234,15 +1241,17 @@ td {
 .load-history-btn-container {
   display: flex;
   justify-content: center;
-  padding: 14px;
+  padding: 16px;
+  margin-top: auto;
+  border-top: 1px dashed var(--border-primary);
 }
 
 .load-history-btn {
-  padding: 8px 16px;
-  background: transparent;
+  padding: 10px 24px;
+  background: var(--bg-input);
   color: var(--text-secondary);
   border: 1px solid var(--border-secondary);
-  border-radius: 4px;
+  border-radius: 6px;
   font-size: 0.8rem;
   font-weight: 500;
   cursor: pointer;
@@ -1250,9 +1259,9 @@ td {
 }
 
 .load-history-btn:hover:not(:disabled) {
-  background: var(--bg-card-hover);
-  color: var(--text-primary);
-  border-color: var(--border-hover);
+  background: var(--accent-primary);
+  color: #fff;
+  border-color: var(--accent-primary);
 }
 
 .load-history-btn:disabled {
@@ -1262,6 +1271,29 @@ td {
 
 .load-history-btn-container.hidden {
   display: none;
+}
+
+/* Empty fills state */
+.fills-empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 16px;
+  color: var(--text-muted);
+  text-align: center;
+  flex: 1;
+}
+
+.fills-empty-state .empty-icon {
+  font-size: 2rem;
+  margin-bottom: 12px;
+  opacity: 0.5;
+}
+
+.fills-empty-state p {
+  margin: 0 0 16px 0;
+  font-size: 0.85rem;
 }
 
 /* ==================== MOBILE RESPONSIVE ==================== */

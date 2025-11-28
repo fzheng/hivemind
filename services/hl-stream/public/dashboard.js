@@ -621,8 +621,9 @@ function updateLoadHistoryVisibility() {
   const container = document.getElementById('fills-load-history');
   if (!container) return;
 
-  // Hide if we have fills or if there's no more history
-  if (fillsCache.length > 0 || !hasMoreFills) {
+  // Show button when there might be more history to load
+  // Hide only when we've confirmed there's no more history
+  if (!hasMoreFills) {
     container.classList.add('hidden');
   } else {
     container.classList.remove('hidden');
@@ -1471,7 +1472,7 @@ function initLoadHistoryButton() {
 
   btn.addEventListener('click', async () => {
     btn.disabled = true;
-    btn.textContent = 'Fetching from Hyperliquid...';
+    btn.textContent = 'Loading...';
 
     // First, try to fetch historical fills from Hyperliquid API
     const result = await fetchHistoricalFills();
@@ -1483,15 +1484,15 @@ function initLoadHistoryButton() {
       fillsOldestTime = result.oldestTime;
       renderFills(fillsCache);
       updateTimeRangeDisplay();
-      btn.textContent = `Loaded ${result.inserted} new fills`;
+      btn.textContent = `✓ Loaded ${result.inserted} fills`;
     } else if (result && result.inserted === 0) {
       // No new fills, but API call succeeded - try loading from DB
-      btn.textContent = 'Loading from DB...';
+      btn.textContent = 'Checking database...';
       await loadMoreFills();
-      btn.textContent = 'No new fills found';
+      btn.textContent = 'No more fills';
     } else {
       // API call failed, fall back to DB
-      btn.textContent = 'Loading from DB...';
+      btn.textContent = 'Checking database...';
       await loadMoreFills();
     }
 
@@ -1500,7 +1501,7 @@ function initLoadHistoryButton() {
 
     // Reset button text after a delay
     setTimeout(() => {
-      btn.textContent = 'Load Historical Fills';
+      btn.textContent = '↓ Load More Fills';
     }, 2000);
   });
 }
