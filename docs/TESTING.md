@@ -1,6 +1,6 @@
 # Testing Documentation
 
-This document describes the test suite for the hlbot platform.
+This document describes the test suite for the HyperMind platform.
 
 ## Running Tests
 

@@ -1,4 +1,4 @@
-/* Simple Postgres migration runner for hlbot */
+/* Simple Postgres migration runner for HyperMind */
 const fs = require('fs');
 const path = require('path');
 const { Client } = require('pg');
