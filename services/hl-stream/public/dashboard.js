@@ -1,12 +1,37 @@
-// Theme management
+/**
+ * HyperMind Dashboard JavaScript
+ *
+ * Real-time dashboard for monitoring top Hyperliquid traders.
+ * Features:
+ * - Live leaderboard with performance metrics
+ * - Real-time trade fills via WebSocket
+ * - TradingView charts for BTC and ETH
+ * - Custom account tracking
+ * - Infinite scroll for historical fills
+ *
+ * @module dashboard
+ */
+
+// =====================
+// Theme Management
+// =====================
 const themeButtons = document.querySelectorAll('.theme-toggle button');
 let currentTheme = localStorage.getItem('theme') || 'auto';
 let currentSymbol = 'BTCUSDT'; // Track current chart symbol
 
+/**
+ * Detects system color scheme preference.
+ * @returns {'dark'|'light'} System theme preference
+ */
 function getSystemTheme() {
   return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
 }
 
+/**
+ * Applies theme to document and updates UI state.
+ * @param {'auto'|'light'|'dark'} theme - Theme to apply
+ * @param {boolean} reloadChart - Whether to reload TradingView chart
+ */
 function applyTheme(theme, reloadChart = false) {
   const effectiveTheme = theme === 'auto' ? getSystemTheme() : theme;
   document.documentElement.setAttribute('data-theme', effectiveTheme);
@@ -42,11 +67,14 @@ themeButtons.forEach(btn => {
   });
 });
 
-const statusEl = document.getElementById('dashboard-status');
+// =====================
+// DOM Element References
+// =====================
+const statusEl = null; // Status element removed - using live clock instead
 const addressTable = document.getElementById('address-table');
 const fillsTable = document.getElementById('fills-table');
-const decisionsList = document.getElementById('decisions-list');
-const recommendationCard = document.getElementById('recommendation-card');
+const aiRecommendationsTable = document.getElementById('ai-recommendations-table');
+const aiStatusEl = document.getElementById('ai-status');
 const symbolButtons = document.querySelectorAll('.toggle-group button');
 const lastRefreshEl = document.getElementById('last-refresh');
 const refreshBtn = document.getElementById('refresh-btn');
@@ -56,27 +84,406 @@ const customNicknameInput = document.getElementById('custom-nickname-input');
 const addCustomBtn = document.getElementById('add-custom-btn');
 const customErrorEl = document.getElementById('custom-accounts-error');
 
+// =====================
+// Configuration
+// =====================
 const API_BASE = '/dashboard/api';
 const SCOUT_API = '/api'; // hl-scout API base (proxied via hl-stream)
 const TOP_TABLE_LIMIT = 13; // 10 system + up to 3 custom
+const MAX_CUSTOM_ACCOUNTS = 3;
+
+// =====================
+// Application State
+// =====================
 let fillsCache = [];
 let dashboardPeriod = 30;
 let addressMeta = {};
 let customAccountCount = 0;
-const MAX_CUSTOM_ACCOUNTS = 3;
 let positionsReady = false; // Track whether positions have been loaded
 
-// Fills time range tracking
+// =====================
+// Price Ticker State
+// =====================
+let lastBtcPrice = null;
+let lastEthPrice = null;
+const btcPriceEl = document.getElementById('btc-price');
+const ethPriceEl = document.getElementById('eth-price');
+const btcPriceItem = document.getElementById('btc-price-item');
+const ethPriceItem = document.getElementById('eth-price-item');
+
+// =====================
+// Live Clock
+// =====================
+const liveClockEl = document.getElementById('live-clock');
+
+/**
+ * Updates the live clock display with current time.
+ * Uses blinking separators for visual effect.
+ */
+function updateLiveClock() {
+  if (!liveClockEl) return;
+  const now = new Date();
+  const hours = String(now.getHours()).padStart(2, '0');
+  const minutes = String(now.getMinutes()).padStart(2, '0');
+  const seconds = String(now.getSeconds()).padStart(2, '0');
+  // Use spans for separators to enable blinking animation
+  liveClockEl.innerHTML = `${hours}<span class="clock-separator">:</span>${minutes}<span class="clock-separator">:</span>${seconds}`;
+}
+
+// Start clock immediately and update every second
+updateLiveClock();
+setInterval(updateLiveClock, 1000);
+
+// =====================
+// Fill Aggregation
+// =====================
+// Time range tracking for infinite scroll
 let fillsOldestTime = null;
 let fillsNewestTime = null;
 let isLoadingMore = false;
 let hasMoreFills = true;
+let totalFillCount = 0;
+let isInitialLoad = true; // Prevent flashing during initial load
+let isFirstWsConnect = true; // Track first WebSocket connection
 
-// Fill aggregation settings
-const AGGREGATION_WINDOW_MS = 60000; // 1 minute
+// Aggregation settings: groups fills within 1-minute windows
+const AGGREGATION_WINDOW_MS = 60000; // 1 minute window
+const MAX_AGGREGATED_GROUPS = 50; // Max groups to keep in memory
+
+// Streaming aggregation state - stores pre-aggregated groups
+let aggregatedGroups = [];
+
+// Track expanded groups for collapsible UI
+const expandedGroups = new Set();
+
+/**
+ * Creates a new aggregation group from a single fill.
+ * Groups track multiple fills that can be merged together.
+ *
+ * @param {Object} fill - Fill event data
+ * @returns {Object} New aggregation group
+ */
+function createGroup(fill) {
+  const symbol = (fill.symbol || 'BTC').toUpperCase();
+  const normalizedAddress = (fill.address || '').toLowerCase();
+  const normalizedAction = (fill.action || '').trim().toLowerCase();
+  return {
+    id: `${normalizedAddress}-${fill.time_utc}-${Math.random().toString(36).slice(2, 8)}`,
+    time_utc: fill.time_utc,
+    oldest_time: fill.time_utc,
+    address: normalizedAddress, // Normalized for grouping
+    originalAddress: fill.address, // Original for display
+    symbol: symbol,
+    action: normalizedAction, // Normalized for grouping
+    originalAction: fill.action, // Original for display
+    fills: [fill],
+    totalSize: Math.abs(fill.size_signed || 0),
+    totalPnl: fill.closed_pnl_usd || 0,
+    prices: fill.price_usd ? [fill.price_usd] : [],
+    // Store the resulting position from the newest fill (for calculating previous_position later)
+    resulting_position: fill.resulting_position,
+    previous_position: fill.previous_position,
+    isAggregated: false,
+    fillCount: 1,
+    avgPrice: fill.price_usd || null,
+    size_signed: fill.size_signed,
+    closed_pnl_usd: fill.closed_pnl_usd,
+    price_usd: fill.price_usd,
+  };
+}
+
+/**
+ * Checks if a fill can be merged into an existing group.
+ * Fills must match address, symbol, action, and be within time window.
+ *
+ * @param {Object} group - Existing aggregation group
+ * @param {Object} fill - Fill to check for mergeability
+ * @returns {boolean} True if fill can be merged
+ */
+function canMergeIntoGroup(group, fill) {
+  const fillTime = new Date(fill.time_utc).getTime();
+  const groupNewestTime = new Date(group.time_utc).getTime();
+  const groupOldestTime = new Date(group.oldest_time).getTime();
+
+  // Check if fill is within the aggregation window of the group
+  const timeDiffFromNewest = Math.abs(groupNewestTime - fillTime);
+  const timeDiffFromOldest = Math.abs(groupOldestTime - fillTime);
+  const withinWindow = timeDiffFromNewest <= AGGREGATION_WINDOW_MS || timeDiffFromOldest <= AGGREGATION_WINDOW_MS;
+
+  const symbol = (fill.symbol || 'BTC').toUpperCase();
+  const normalizedFillAddress = (fill.address || '').toLowerCase();
+  const normalizedFillAction = (fill.action || '').trim().toLowerCase();
+  const sameAddress = group.address === normalizedFillAddress;
+  const sameSymbol = group.symbol === symbol;
+  const sameAction = group.action === normalizedFillAction;
+
+  return sameAddress && sameSymbol && sameAction && withinWindow;
+}
+
+/**
+ * Calculates the previous_position for a group based on the resulting_position and totalSize.
+ * This is more reliable than tracking individual fill's previous_position because:
+ * - We know the resulting_position from the newest fill
+ * - We know the totalSize (sum of all fill sizes in the group)
+ * - We know the action type (determines direction of position change)
+ *
+ * Position sign conventions:
+ * - Long positions are POSITIVE (e.g., +5.0 BTC long)
+ * - Short positions are NEGATIVE (e.g., -5.0 BTC short)
+ *
+ * Action effects:
+ * - "Open Long" / "Increase Long": position becomes MORE positive
+ * - "Close Long" / "Decrease Long": position becomes LESS positive (toward 0)
+ * - "Open Short" / "Increase Short": position becomes MORE negative
+ * - "Close Short" / "Decrease Short": position becomes LESS negative (toward 0)
+ *
+ * @param {Object} group - The aggregation group to calculate previous_position for
+ */
+function calculateGroupPreviousPosition(group) {
+  const resultingPos = group.resulting_position;
+  const totalSize = group.totalSize;
+
+  // If we don't have a resulting position, we can't calculate
+  if (resultingPos == null || totalSize == null) {
+    return;
+  }
+
+  const action = (group.action || '').toLowerCase();
+  const isDecrease = action.includes('decrease') || action.includes('close');
+  const isShort = action.includes('short');
+
+  // Calculate previous_position by reversing the trade effect
+  if (isShort) {
+    // SHORT positions are negative
+    if (isDecrease) {
+      // "Close Short" / "Decrease Short" means buying to cover
+      // Position went from more negative to less negative (or 0)
+      // prev = result - totalSize (e.g., result=0, size=5 -> prev=-5)
+      group.previous_position = resultingPos - totalSize;
+    } else {
+      // "Open Short" / "Increase Short" means selling to go more negative
+      // Position went from less negative to more negative
+      // prev = result + totalSize (e.g., result=-10, size=5 -> prev=-5)
+      group.previous_position = resultingPos + totalSize;
+    }
+  } else {
+    // LONG positions are positive
+    if (isDecrease) {
+      // "Close Long" / "Decrease Long" means selling to reduce position
+      // Position went from more positive to less positive (or 0)
+      // prev = result + totalSize (e.g., result=0, size=5 -> prev=+5)
+      group.previous_position = resultingPos + totalSize;
+    } else {
+      // "Open Long" / "Increase Long" means buying to increase position
+      // Position went from less positive to more positive
+      // prev = result - totalSize (e.g., result=10, size=5 -> prev=+5)
+      group.previous_position = resultingPos - totalSize;
+    }
+  }
+}
+
+/**
+ * Merges a fill into an existing aggregation group.
+ * Updates totals, time range, and computed fields.
+ *
+ * @param {Object} group - Group to merge into
+ * @param {Object} fill - Fill to merge
+ */
+function mergeIntoGroup(group, fill) {
+  const fillTime = new Date(fill.time_utc).getTime();
+  const groupNewestTime = new Date(group.time_utc).getTime();
+  const groupOldestTime = new Date(group.oldest_time).getTime();
+
+  group.fills.push(fill);
+  group.totalSize += Math.abs(fill.size_signed || 0);
+  group.totalPnl += fill.closed_pnl_usd || 0;
+  if (fill.price_usd) {
+    group.prices.push(fill.price_usd);
+  }
+
+  // Update time range and track resulting_position from the newest fill
+  if (fillTime > groupNewestTime) {
+    group.time_utc = fill.time_utc;
+    // Update resulting_position from the newest fill
+    if (fill.resulting_position != null) {
+      group.resulting_position = fill.resulting_position;
+    }
+  }
+  if (fillTime < groupOldestTime) {
+    group.oldest_time = fill.time_utc;
+  }
+
+  // Update computed fields
+  group.fillCount = group.fills.length;
+  group.isAggregated = group.fills.length > 1;
+  group.avgPrice = group.prices.length > 0
+    ? group.prices.reduce((a, b) => a + b, 0) / group.prices.length
+    : null;
+
+  // Update signed size based on action
+  // Increase Long → positive (buying)
+  // Decrease Long → negative (selling)
+  // Increase Short → negative (selling to go short)
+  // Decrease Short → positive (buying to cover)
+  const isShort = group.action.toLowerCase().includes('short');
+  const isDecrease = group.action.toLowerCase().includes('decrease') || group.action.toLowerCase().includes('close');
+  // XOR logic: negative when (decrease AND long) OR (increase AND short)
+  const isNegative = isDecrease !== isShort; // XOR: true when exactly one is true
+  group.size_signed = isNegative ? -group.totalSize : group.totalSize;
+  group.closed_pnl_usd = group.totalPnl || null;
+  group.price_usd = group.avgPrice;
+
+  // Calculate previous_position from resulting_position and totalSize
+  // This is more reliable than tracking individual fill's previous_position
+  // because grouped fills may have incomplete previous_position values during backfill
+  calculateGroupPreviousPosition(group);
+}
+
+/**
+ * Adds a new fill to the streaming aggregation.
+ * Attempts to merge with existing group or creates new one.
+ * Only processes BTC and ETH fills.
+ *
+ * @param {Object} fill - Fill event to aggregate
+ */
+function addFillToAggregation(fill) {
+  const symbol = (fill.symbol || 'BTC').toUpperCase();
+  // Only process BTC and ETH
+  if (symbol !== 'BTC' && symbol !== 'ETH') return;
+
+  // Try to merge with existing groups (check recent groups within time window)
+  let merged = false;
+  for (let i = 0; i < aggregatedGroups.length; i++) {
+    const group = aggregatedGroups[i];
+
+    // Only check groups that could potentially match (within 2x window for safety)
+    const groupTime = new Date(group.time_utc).getTime();
+    const fillTime = new Date(fill.time_utc).getTime();
+    if (Math.abs(groupTime - fillTime) > AGGREGATION_WINDOW_MS * 2) {
+      // Groups are sorted by time, so if we're past the window, stop checking
+      if (fillTime > groupTime) continue;
+      break;
+    }
+
+    if (canMergeIntoGroup(group, fill)) {
+      mergeIntoGroup(group, fill);
+      merged = true;
+      break;
+    }
+  }
+
+  // If not merged, create a new group
+  if (!merged) {
+    const newGroup = createGroup(fill);
+    aggregatedGroups.unshift(newGroup);
+  }
+
+  // Sort groups by newest time (descending)
+  aggregatedGroups.sort((a, b) => new Date(b.time_utc) - new Date(a.time_utc));
+
+  // Trim to max size
+  if (aggregatedGroups.length > MAX_AGGREGATED_GROUPS) {
+    aggregatedGroups = aggregatedGroups.slice(0, MAX_AGGREGATED_GROUPS);
+  }
+
+  // Update time range tracking
+  updateAggregatedTimeRange();
+}
+
+// Initialize aggregation from a batch of fills (e.g., initial load)
+function initializeAggregation(fills) {
+  // Filter to BTC/ETH only
+  const btcEthFills = fills.filter(fill => {
+    const symbol = (fill.symbol || 'BTC').toUpperCase();
+    return symbol === 'BTC' || symbol === 'ETH';
+  });
+
+  // Use the existing batch aggregation for initial load
+  aggregatedGroups = aggregateFills(btcEthFills);
+
+  // Trim to max size
+  if (aggregatedGroups.length > MAX_AGGREGATED_GROUPS) {
+    aggregatedGroups = aggregatedGroups.slice(0, MAX_AGGREGATED_GROUPS);
+  }
+
+  // Update time range
+  updateAggregatedTimeRange();
+}
+
+// Update time range from aggregated groups
+function updateAggregatedTimeRange() {
+  if (aggregatedGroups.length === 0) {
+    fillsNewestTime = null;
+    fillsOldestTime = null;
+  } else {
+    // Newest is from first group's time_utc
+    fillsNewestTime = aggregatedGroups[0].time_utc;
+    // Oldest is from last group's oldest_time
+    fillsOldestTime = aggregatedGroups[aggregatedGroups.length - 1].oldest_time;
+  }
+  updateTimeRangeDisplay();
+}
 
 function placeholder(text = 'No live data') {
   return `<span class="placeholder">${text}</span>`;
+}
+
+// Format price for display (e.g., $97,234.56)
+// Always shows full price with 2 decimal places - no K/M abbreviation
+function fmtPrice(value) {
+  if (!Number.isFinite(value)) return '—';
+  return '$' + value.toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  });
+}
+
+// Format trade price for fills table (full price with 2 decimals, no K/M abbreviation)
+function fmtTradePrice(value) {
+  if (!Number.isFinite(value)) return 'N/A';
+  return '$' + value.toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  });
+}
+
+// Update price ticker display
+function updatePriceTicker(btc, eth) {
+  if (btcPriceEl && Number.isFinite(btc)) {
+    const prevBtc = lastBtcPrice;
+    btcPriceEl.textContent = fmtPrice(btc);
+
+    // Flash animation on price change
+    if (prevBtc !== null && btc !== prevBtc) {
+      btcPriceItem?.classList.remove('flash-up', 'flash-down');
+      void btcPriceItem?.offsetWidth; // Trigger reflow
+      btcPriceItem?.classList.add(btc > prevBtc ? 'flash-up' : 'flash-down');
+    }
+    lastBtcPrice = btc;
+  }
+
+  if (ethPriceEl && Number.isFinite(eth)) {
+    const prevEth = lastEthPrice;
+    ethPriceEl.textContent = fmtPrice(eth);
+
+    // Flash animation on price change
+    if (prevEth !== null && eth !== prevEth) {
+      ethPriceItem?.classList.remove('flash-up', 'flash-down');
+      void ethPriceItem?.offsetWidth; // Trigger reflow
+      ethPriceItem?.classList.add(eth > prevEth ? 'flash-up' : 'flash-down');
+    }
+    lastEthPrice = eth;
+  }
+}
+
+// Fetch initial prices
+async function fetchPrices() {
+  try {
+    const data = await fetchJson(`${API_BASE}/prices`);
+    updatePriceTicker(data.btc, data.eth);
+  } catch (err) {
+    console.error('Failed to fetch prices:', err);
+  }
 }
 
 function fmtPercent(value) {
@@ -121,7 +528,21 @@ function formatHolding(entry) {
   const magnitude = Math.abs(size);
   const precision = magnitude >= 1 ? 2 : 3;
   const signed = `${size >= 0 ? '+' : '-'}${magnitude.toFixed(precision)} ${symbol || ''}`.trim();
-  return `<span class="holding-chip ${direction}" title="Live Hyperliquid position">${signed}</span>`;
+
+  // Build tooltip with entry and liquidation prices
+  const tooltipParts = [];
+  if (entry.entryPrice != null && Number.isFinite(entry.entryPrice)) {
+    tooltipParts.push(`Entry: $${entry.entryPrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
+  }
+  if (entry.liquidationPrice != null && Number.isFinite(entry.liquidationPrice)) {
+    tooltipParts.push(`Liq: $${entry.liquidationPrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
+  }
+  if (entry.leverage != null && Number.isFinite(entry.leverage)) {
+    tooltipParts.push(`${entry.leverage}x`);
+  }
+  const tooltip = tooltipParts.length > 0 ? tooltipParts.join(' | ') : 'Live position';
+
+  return `<span class="holding-chip ${direction}" title="${tooltip}">${signed}</span>`;
 }
 
 function normalizeHoldings(raw = {}) {
@@ -134,12 +555,18 @@ function normalizeHoldings(raw = {}) {
       normalized[key] = positions.map(pos => ({
         symbol: (pos?.symbol || '').toUpperCase(),
         size: Number(pos?.size ?? 0),
+        entryPrice: pos?.entryPrice ?? null,
+        liquidationPrice: pos?.liquidationPrice ?? null,
+        leverage: pos?.leverage ?? null,
       }));
     } else {
       // Legacy single position format
       normalized[key] = [{
         symbol: (positions?.symbol || '').toUpperCase(),
         size: Number(positions?.size ?? 0),
+        entryPrice: positions?.entryPrice ?? null,
+        liquidationPrice: positions?.liquidationPrice ?? null,
+        leverage: positions?.leverage ?? null,
       }];
     }
   });
@@ -177,8 +604,8 @@ function aggregateFills(fills) {
   for (const fill of sorted) {
     const fillTime = new Date(fill.time_utc).getTime();
     const symbol = (fill.symbol || 'BTC').toUpperCase();
-    const action = fill.action || '';
-    const address = fill.address;
+    const action = (fill.action || '').trim().toLowerCase(); // Normalize for comparison
+    const address = (fill.address || '').toLowerCase(); // Normalize address
 
     // Check if this fill should be grouped with current group
     if (currentGroup) {
@@ -196,10 +623,12 @@ function aggregateFills(fills) {
         if (fill.price_usd) {
           currentGroup.prices.push(fill.price_usd);
         }
-        // Update time range
+        // Update oldest time
         if (fillTime < new Date(currentGroup.oldest_time).getTime()) {
           currentGroup.oldest_time = fill.time_utc;
         }
+        // Note: We don't track previous_position here anymore - it will be calculated
+        // from resulting_position in finalizeGroup
         continue;
       }
     }
@@ -210,18 +639,24 @@ function aggregateFills(fills) {
       aggregated.push(currentGroup);
     }
 
-    // Start new group
+    // Start new group - the first fill is the newest in this group
+    // so its resulting_position is the final position after all fills
     currentGroup = {
+      id: `${address}-${fill.time_utc}-${Math.random().toString(36).slice(2, 8)}`,
       time_utc: fill.time_utc,
       oldest_time: fill.time_utc,
-      address: address,
+      address: address, // Normalized (lowercase)
+      originalAddress: fill.address, // Original for display
       symbol: symbol,
-      action: action,
+      action: action, // Normalized (lowercase) for grouping
+      originalAction: fill.action, // Original for display
       fills: [fill],
       totalSize: Math.abs(fill.size_signed || 0),
       totalPnl: fill.closed_pnl_usd || 0,
       prices: fill.price_usd ? [fill.price_usd] : [],
-      previous_position: fill.previous_position,
+      // Store resulting_position from newest fill for calculating previous_position later
+      resulting_position: fill.resulting_position,
+      previous_position: fill.previous_position, // Fallback for single fills
       isAggregated: false,
     };
   }
@@ -242,11 +677,23 @@ function finalizeGroup(group) {
     ? group.prices.reduce((a, b) => a + b, 0) / group.prices.length
     : null;
   // Determine signed size based on action
+  // Increase Long → positive (buying)
+  // Decrease Long → negative (selling)
+  // Increase Short → negative (selling to go short)
+  // Decrease Short → positive (buying to cover)
   const isShort = group.action.toLowerCase().includes('short');
   const isDecrease = group.action.toLowerCase().includes('decrease') || group.action.toLowerCase().includes('close');
-  group.size_signed = isShort || isDecrease ? -group.totalSize : group.totalSize;
+  // XOR logic: negative when (decrease AND long) OR (increase AND short)
+  const isNegative = isDecrease !== isShort; // XOR: true when exactly one is true
+  group.size_signed = isNegative ? -group.totalSize : group.totalSize;
   group.closed_pnl_usd = group.totalPnl || null;
   group.price_usd = group.avgPrice;
+
+  // For aggregated groups, calculate previous_position from resulting_position
+  // This is more reliable than the individual fill's previous_position values
+  if (group.isAggregated && group.resulting_position != null) {
+    calculateGroupPreviousPosition(group);
+  }
 }
 
 // Update time range display
@@ -275,17 +722,76 @@ function updateTimeRangeDisplay() {
   timeRangeEl.textContent = `${oldestStr} → ${newestStr}`;
 }
 
-// Show/hide load history button based on fills state
-function updateLoadHistoryVisibility() {
-  const container = document.getElementById('fills-load-history');
-  if (!container) return;
+// Update fills count display
+function updateFillsCount() {
+  const countEl = document.getElementById('fills-count');
+  if (!countEl) return;
 
-  // Hide if we have fills or if there's no more history
-  if (fillsCache.length > 0 || !hasMoreFills) {
-    container.classList.add('hidden');
+  // Count total individual fills across all groups
+  totalFillCount = aggregatedGroups.reduce((sum, g) => sum + (g.fillCount || 1), 0);
+  const groupCount = aggregatedGroups.length;
+
+  if (totalFillCount === 0) {
+    countEl.textContent = '0 fills';
+  } else if (totalFillCount === groupCount) {
+    countEl.textContent = `${totalFillCount} fill${totalFillCount !== 1 ? 's' : ''}`;
   } else {
-    container.classList.remove('hidden');
+    countEl.textContent = `${totalFillCount} fills (${groupCount} groups)`;
   }
+}
+
+// Update fills status bar
+function updateFillsStatus() {
+  const statusBar = document.getElementById('fills-status-bar');
+  const statusMessage = document.getElementById('fills-status-message');
+  const loadBtn = document.getElementById('load-history-btn');
+
+  if (!statusBar || !statusMessage) return;
+
+  if (aggregatedGroups.length === 0) {
+    statusMessage.textContent = 'Waiting for live fills...';
+    if (loadBtn) {
+      loadBtn.textContent = 'Fetch History';
+      loadBtn.disabled = false;
+      loadBtn.classList.remove('loading');
+    }
+    statusBar.classList.remove('all-loaded');
+  } else if (!hasMoreFills) {
+    statusMessage.textContent = `All ${totalFillCount} fills loaded`;
+    statusBar.classList.add('all-loaded');
+  } else {
+    // Calculate time span
+    if (fillsOldestTime) {
+      const oldestDate = new Date(fillsOldestTime);
+      const now = new Date();
+      const hoursDiff = Math.round((now - oldestDate) / (1000 * 60 * 60));
+
+      if (hoursDiff < 1) {
+        statusMessage.textContent = `Showing last ${totalFillCount} fills (< 1 hour)`;
+      } else if (hoursDiff < 24) {
+        statusMessage.textContent = `Showing last ${totalFillCount} fills (~${hoursDiff}h)`;
+      } else {
+        const daysDiff = Math.round(hoursDiff / 24);
+        statusMessage.textContent = `Showing last ${totalFillCount} fills (~${daysDiff}d)`;
+      }
+    } else {
+      statusMessage.textContent = `Showing ${totalFillCount} fills`;
+    }
+
+    if (loadBtn) {
+      loadBtn.textContent = 'Load More';
+      loadBtn.disabled = false;
+      loadBtn.classList.remove('loading');
+    }
+    statusBar.classList.remove('all-loaded');
+  }
+}
+
+// Update all fills UI elements
+function updateFillsUI() {
+  updateFillsCount();
+  updateTimeRangeDisplay();
+  updateFillsStatus();
 }
 
 async function fetchJson(url) {
@@ -303,6 +809,45 @@ function fmtScore(score) {
   return score.toFixed(4);
 }
 
+// Generate SVG sparkline from pnlList data
+function generateSparkline(pnlList, width = 80, height = 24) {
+  if (!pnlList || !Array.isArray(pnlList) || pnlList.length < 2) {
+    return '<span class="placeholder">—</span>';
+  }
+
+  // Extract values and normalize
+  const values = pnlList.map(p => parseFloat(p.value) || 0);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || 1;
+
+  // Generate points for polyline
+  const points = values.map((v, i) => {
+    const x = (i / (values.length - 1)) * width;
+    const y = height - ((v - min) / range) * (height - 4) - 2; // 2px padding
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+
+  // Determine color based on trend (first vs last value)
+  const startVal = values[0];
+  const endVal = values[values.length - 1];
+  const isPositive = endVal >= startVal;
+  const strokeColor = isPositive ? 'var(--positive)' : 'var(--negative)';
+
+  return `
+    <svg class="sparkline" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+      <polyline
+        points="${points}"
+        fill="none"
+        stroke="${strokeColor}"
+        stroke-width="1.5"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      />
+    </svg>
+  `;
+}
+
 function renderAddresses(stats = [], profiles = {}, holdings = {}) {
   const rows = (stats || []).slice(0, TOP_TABLE_LIMIT);
   if (!rows.length) {
@@ -311,7 +856,7 @@ function renderAddresses(stats = [], profiles = {}, holdings = {}) {
   }
   addressTable.innerHTML = rows
     .map((row) => {
-      const txCount = profiles[row.address]?.txCount || 0;
+      const scoreValue = typeof row.score === 'number' ? row.score.toFixed(4) : 'N/A';
       const winRateCell = typeof row.winRate === 'number' ? fmtPercent(row.winRate) : placeholder();
       const tradesValue =
         typeof row.statClosedPositions === 'number'
@@ -326,16 +871,21 @@ function renderAddresses(stats = [], profiles = {}, holdings = {}) {
         ? holdingPositions.map(pos => formatHolding(pos)).join(' ')
         : placeholder('No BTC/ETH position');
       const pnlCell = typeof row.realizedPnl === 'number' ? fmtUsdShort(row.realizedPnl) : placeholder();
-      const scoreCell = typeof row.score === 'number' ? fmtScore(row.score) : placeholder();
+
+      // Generate sparkline from pnlList
+      const pnlList = row.meta?.raw?.pnlList || [];
+      const sparklineCell = generateSparkline(pnlList);
+
       const isCustom = row.isCustom === true;
       const customIndicator = isCustom ? '<span class="custom-star" title="Custom tracked account">★</span>' : '';
       const removeBtn = isCustom ? `<button class="remove-custom-btn" data-address="${row.address}" title="Remove custom account">×</button>` : '';
       const nicknameDisplay = row.remark
         ? `<span class="nickname-display" data-address="${row.address}" data-nickname="${escapeHtml(row.remark)}" title="Click to edit nickname">${escapeHtml(row.remark)}</span>`
         : (isCustom ? `<span class="nickname-display nickname-empty" data-address="${row.address}" data-nickname="" title="Click to add nickname">+ Add nickname</span>` : '');
+      const addrLower = (row.address || '').toLowerCase();
       return `
-        <tr class="${isCustom ? 'custom-row' : ''}">
-          <td data-label="Address" title="Hyperliquid tx count: ${txCount}">
+        <tr class="${isCustom ? 'custom-row' : ''}" data-address="${addrLower}">
+          <td data-label="Address" title="Score: ${scoreValue}">
             <span class="custom-indicator">
               ${customIndicator}
               <a href="https://hypurrscan.io/address/${row.address}" target="_blank" rel="noopener noreferrer">
@@ -351,7 +901,7 @@ function renderAddresses(stats = [], profiles = {}, holdings = {}) {
             ${holdingCell}
           </td>
           <td data-label="Realized PnL">${pnlCell}</td>
-          <td data-label="Score" class="score-cell">${scoreCell}</td>
+          <td data-label="30D PnL" class="sparkline-cell">${sparklineCell}</td>
         </tr>
       `;
     })
@@ -377,118 +927,253 @@ function renderAddresses(stats = [], profiles = {}, holdings = {}) {
   });
 }
 
-function renderRecommendation(summary) {
-  if (!summary?.recommendation) {
-    recommendationCard.innerHTML = '<p>No signal yet.</p>';
+// Mock AI recommendations data
+const mockAIRecommendations = [
+  {
+    time: new Date(Date.now() - 2 * 60000).toISOString(),
+    symbol: 'BTC',
+    action: 'LONG',
+    entry: 97250,
+    stopLoss: 96500,
+    takeProfit: 99000,
+    status: 'active'
+  },
+  {
+    time: new Date(Date.now() - 15 * 60000).toISOString(),
+    symbol: 'ETH',
+    action: 'SHORT',
+    entry: 3580,
+    stopLoss: 3650,
+    takeProfit: 3450,
+    status: 'active'
+  },
+  {
+    time: new Date(Date.now() - 45 * 60000).toISOString(),
+    symbol: 'BTC',
+    action: 'LONG',
+    entry: 96800,
+    stopLoss: 96200,
+    takeProfit: 97500,
+    status: 'tp_hit'
+  },
+  {
+    time: new Date(Date.now() - 2 * 3600000).toISOString(),
+    symbol: 'ETH',
+    action: 'LONG',
+    entry: 3520,
+    stopLoss: 3480,
+    takeProfit: 3600,
+    status: 'tp_hit'
+  },
+  {
+    time: new Date(Date.now() - 5 * 3600000).toISOString(),
+    symbol: 'BTC',
+    action: 'SHORT',
+    entry: 97100,
+    stopLoss: 97500,
+    takeProfit: 96200,
+    status: 'sl_hit'
+  }
+];
+
+function renderAIRecommendations() {
+  if (!aiRecommendationsTable) return;
+
+  const rows = mockAIRecommendations.map(rec => {
+    const actionClass = rec.action === 'LONG' ? 'buy' : 'sell';
+    let statusClass = '';
+    let statusText = '';
+
+    switch (rec.status) {
+      case 'active':
+        statusClass = 'status-active';
+        statusText = 'Active';
+        break;
+      case 'tp_hit':
+        statusClass = 'status-tp';
+        statusText = 'TP Hit';
+        break;
+      case 'sl_hit':
+        statusClass = 'status-sl';
+        statusText = 'SL Hit';
+        break;
+      case 'expired':
+        statusClass = 'status-expired';
+        statusText = 'Expired';
+        break;
+      default:
+        statusClass = '';
+        statusText = rec.status;
+    }
+
+    return `
+      <tr>
+        <td data-label="Time">${fmtTime(rec.time)}</td>
+        <td data-label="Symbol">${rec.symbol}</td>
+        <td data-label="Action"><span class="pill ${actionClass}">${rec.action}</span></td>
+        <td data-label="Entry">${fmtPrice(rec.entry)}</td>
+        <td data-label="SL">${fmtPrice(rec.stopLoss)}</td>
+        <td data-label="TP">${fmtPrice(rec.takeProfit)}</td>
+        <td data-label="Status"><span class="ai-status-badge ${statusClass}">${statusText}</span></td>
+      </tr>
+    `;
+  }).join('');
+
+  aiRecommendationsTable.innerHTML = rows;
+
+  // Update AI status
+  if (aiStatusEl) {
+    const activeCount = mockAIRecommendations.filter(r => r.status === 'active').length;
+    aiStatusEl.innerHTML = `
+      <span class="ai-status-dot"></span>
+      ${activeCount} Active Signal${activeCount !== 1 ? 's' : ''}
+    `;
+  }
+}
+
+// Toggle group expansion - exposed globally for onclick handlers
+window.toggleGroupExpansion = function(groupId) {
+  if (expandedGroups.has(groupId)) {
+    expandedGroups.delete(groupId);
+  } else {
+    expandedGroups.add(groupId);
+  }
+  renderAggregatedFills();
+};
+
+// Render a single aggregated group as a table row
+function renderGroupRow(group, isNew = false) {
+  const symbol = (group.symbol || 'BTC').toUpperCase();
+  const sizeVal = group.isAggregated ? group.totalSize : Math.abs(group.size_signed || 0);
+  const sizeSign = group.size_signed >= 0 ? '+' : '-';
+  const size = typeof sizeVal === 'number' ? `${sizeSign}${sizeVal.toFixed(5)} ${symbol}` : '—';
+  const prev = typeof group.previous_position === 'number' ? `${group.previous_position.toFixed(5)} ${symbol}` : '—';
+  const price = group.isAggregated && group.avgPrice
+    ? `~${fmtTradePrice(group.avgPrice)}`
+    : fmtTradePrice(group.price_usd ?? null);
+  const pnl = fmtUsdShort(group.closed_pnl_usd ?? null);
+  // Use originalAction for display, fallback to action (for backwards compatibility)
+  const displayAction = group.originalAction || group.action || '—';
+  const sideClass = displayAction.toLowerCase().includes('short') ? 'sell' : 'buy';
+  // Use originalAddress for display/links, address for data attributes (normalized)
+  const displayAddress = group.originalAddress || group.address;
+
+  const isExpanded = expandedGroups.has(group.id);
+
+  // Show aggregation badge with expand/collapse functionality
+  let aggBadge = '';
+  if (group.isAggregated) {
+    const expandIcon = isExpanded ? '▼' : '▶';
+    aggBadge = `<span class="agg-badge" onclick="toggleGroupExpansion('${group.id}')" title="Click to ${isExpanded ? 'collapse' : 'expand'} ${group.fillCount} fills">
+      <span class="expand-icon">${expandIcon}</span>×${group.fillCount}
+    </span>`;
+  }
+
+  // New fill animation class
+  const newClass = isNew ? 'new-fill-row' : '';
+
+  const addrLower = (group.address || '').toLowerCase();
+  let html = `
+    <tr class="${group.isAggregated ? 'aggregated-row' : ''} ${newClass}" data-group-id="${group.id || ''}" data-address="${addrLower}">
+      <td data-label="Time">${fmtDateTime(group.time_utc)}</td>
+      <td data-label="Address"><a href="https://hypurrscan.io/address/${displayAddress}" target="_blank" rel="noopener noreferrer">${shortAddress(displayAddress)}</a></td>
+      <td data-label="Action"><span class="pill ${sideClass}">${displayAction}</span>${aggBadge}</td>
+      <td data-label="Size">${size}</td>
+      <td data-label="Previous Position">${prev}</td>
+      <td data-label="Price">${price}</td>
+      <td data-label="Closed PnL">${pnl}</td>
+    </tr>
+  `;
+
+  // Add expandable details row for aggregated fills
+  if (group.isAggregated && isExpanded) {
+    const subFills = group.fills.map(fill => {
+      const fillSize = Math.abs(fill.size_signed || 0);
+      const fillPrice = fmtTradePrice(fill.price_usd ?? null);
+      const fillPnl = fmtUsdShort(fill.closed_pnl_usd ?? null);
+      const fillTime = fmtTime(fill.time_utc);
+      return `<div class="sub-fill">
+        <span>${fillTime}</span>
+        <span>${fillSize.toFixed(5)} ${symbol}</span>
+        <span>${fillPrice}</span>
+        <span>${fillPnl}</span>
+      </div>`;
+    }).join('');
+
+    html += `
+      <tr class="group-details expanded" data-parent-id="${group.id}">
+        <td colspan="7">
+          <div class="group-fills-list">${subFills}</div>
+        </td>
+      </tr>
+    `;
+  }
+
+  return html;
+}
+
+// Render all aggregated groups
+function renderAggregatedFills() {
+  if (aggregatedGroups.length === 0) {
+    fillsTable.innerHTML = `<tr><td colspan="7">
+      <div class="fills-empty-state">
+        <span class="empty-icon">📊</span>
+        <p>No BTC/ETH fills yet</p>
+        <span class="empty-hint">Fills will appear here as they happen</span>
+      </div>
+    </td></tr>`;
+    updateFillsUI();
     return;
   }
-  const rec = summary.recommendation;
-  const featured = summary.featured;
-  const profile = summary.profiles?.[rec.address];
-  const remark = addressMeta[rec.address?.toLowerCase()]?.remark || '';
-  const winRateText = typeof rec.winRate === 'number' ? fmtPercent(rec.winRate) : 'N/A (no live data)';
-  const realizedText = typeof rec.realizedPnl === 'number' ? fmtUsdShort(rec.realizedPnl) : 'N/A (no live data)';
-  const weightText = typeof rec.weight === 'number' ? `${(rec.weight * 100).toFixed(1)}%` : 'N/A';
-  recommendationCard.innerHTML = `
-    <span>Focus address</span>
-    <strong>${remark ? `${remark} (${shortAddress(rec.address)})` : rec.address}</strong>
-    <span>Win rate: ${winRateText} • Realized: ${realizedText}</span>
-    ${
-      featured
-        ? `<span>Latest fill: ${featured.side.toUpperCase()} ${featured.size} @ ${featured.priceUsd}</span>`
-        : ''
-    }
-    <span>Weight: ${weightText}</span>
-    ${profile ? `<span>Total HL transactions: ${profile.txCount || 0}</span>` : ''}
-    <em>${rec.message}</em>
-  `;
-}
 
-function renderFills(list) {
-  // Filter to BTC/ETH only
-  const btcEthFills = list.filter(fill => {
-    const symbol = (fill.symbol || 'BTC').toUpperCase();
-    return symbol === 'BTC' || symbol === 'ETH';
-  });
-
-  // Update time range tracking
-  if (btcEthFills.length > 0) {
-    const times = btcEthFills.map(f => new Date(f.time_utc).getTime()).filter(t => !isNaN(t));
-    if (times.length > 0) {
-      const newestInBatch = new Date(Math.max(...times)).toISOString();
-      const oldestInBatch = new Date(Math.min(...times)).toISOString();
-
-      if (!fillsNewestTime || new Date(newestInBatch) > new Date(fillsNewestTime)) {
-        fillsNewestTime = newestInBatch;
-      }
-      if (!fillsOldestTime || new Date(oldestInBatch) < new Date(fillsOldestTime)) {
-        fillsOldestTime = oldestInBatch;
-      }
-    }
-    updateTimeRangeDisplay();
-  }
-
-  // Aggregate fills
-  const aggregated = aggregateFills(btcEthFills);
-
-  const rows = aggregated
-    .map((fill) => {
-      const symbol = (fill.symbol || 'BTC').toUpperCase();
-      const sizeVal = fill.isAggregated ? fill.totalSize : Math.abs(fill.size_signed || 0);
-      const sizeSign = fill.size_signed >= 0 ? '+' : '-';
-      const size = typeof sizeVal === 'number' ? `${sizeSign}${sizeVal.toFixed(5)} ${symbol}` : '—';
-      const prev = typeof fill.previous_position === 'number' ? `${fill.previous_position.toFixed(5)} ${symbol}` : '—';
-      const price = fill.isAggregated && fill.avgPrice
-        ? `~${fmtUsdShort(fill.avgPrice)}`
-        : fmtUsdShort(fill.price_usd ?? null);
-      const pnl = fmtUsdShort(fill.closed_pnl_usd ?? null);
-      const action = fill.action || '—';
-      const sideClass = action.toLowerCase().includes('short') ? 'sell' : 'buy';
-
-      // Show aggregation indicator
-      const aggBadge = fill.isAggregated
-        ? `<span class="agg-badge" title="${fill.fillCount} fills aggregated">×${fill.fillCount}</span>`
-        : '';
-
-      return `
-        <tr class="${fill.isAggregated ? 'aggregated-row' : ''}">
-          <td data-label="Time">${fmtDateTime(fill.time_utc)}</td>
-          <td data-label="Address"><a href="https://hypurrscan.io/address/${fill.address}" target="_blank" rel="noopener noreferrer">${shortAddress(fill.address)}</a></td>
-          <td data-label="Action"><span class="pill ${sideClass}">${action}</span>${aggBadge}</td>
-          <td data-label="Size">${size}</td>
-          <td data-label="Previous Position">${prev}</td>
-          <td data-label="Price">${price}</td>
-          <td data-label="Closed PnL">${pnl}</td>
-        </tr>
-      `;
-    })
-    .join('');
-
+  const rows = aggregatedGroups.map(group => renderGroupRow(group)).join('');
   fillsTable.innerHTML = rows;
 
-  // Show empty state if no fills
-  if (!fillsTable.innerHTML.trim()) {
-    fillsTable.innerHTML = `<tr><td colspan="7" class="placeholder">No BTC/ETH fills yet</td></tr>`;
-  }
+  // Attach cross-highlight hover events
+  attachFillsHoverEvents();
 
-  // Update load history button visibility
-  updateLoadHistoryVisibility();
+  // Update all UI elements
+  updateFillsUI();
 }
 
-function renderDecisions(list) {
-  decisionsList.innerHTML = list
-    .map(
-      (d) => `
-        <li>
-          <span class="decision-meta"><strong>${d.address}</strong> · ${d.asset} · ${fmtTime(d.ts)}</span>
-          <span class="decision-status ${d.status === 'open' ? 'status-open' : 'status-closed'}">
-            ${d.side.toUpperCase()} ${d.status === 'closed' && d.result != null ? `(${d.result.toFixed(2)})` : ''}
-          </span>
-        </li>
-      `
-    )
-    .join('');
+// Cross-table highlight: hovering fills highlights matching leaderboard row
+function attachFillsHoverEvents() {
+  const fillRows = fillsTable.querySelectorAll('tr[data-address]');
+
+  fillRows.forEach(row => {
+    row.addEventListener('mouseenter', () => {
+      const addr = row.dataset.address;
+      if (!addr) return;
+      // Find matching row in leaderboard
+      const leaderboardRow = addressTable.querySelector(`tr[data-address="${addr}"]`);
+      if (leaderboardRow) {
+        leaderboardRow.classList.add('highlight-match');
+      }
+    });
+
+    row.addEventListener('mouseleave', () => {
+      const addr = row.dataset.address;
+      if (!addr) return;
+      const leaderboardRow = addressTable.querySelector(`tr[data-address="${addr}"]`);
+      if (leaderboardRow) {
+        leaderboardRow.classList.remove('highlight-match');
+      }
+    });
+  });
 }
+
+// Legacy function for initial load - initializes streaming aggregation
+function renderFills(list) {
+  // Initialize the streaming aggregation with the batch
+  initializeAggregation(list);
+
+  // Mark initial load as complete to prevent flashing
+  isInitialLoad = false;
+
+  // Render the aggregated groups
+  renderAggregatedFills();
+}
+
 
 function updateLastRefreshDisplay(lastRefresh) {
   if (lastRefresh) {
@@ -554,8 +1239,6 @@ async function refreshSummary() {
       addressMeta[row.address.toLowerCase()] = { remark: row.remark || null };
     });
     renderAddresses(rows, data.profiles || {}, holdings);
-    renderRecommendation(data);
-    statusEl.textContent = `Updated ${new Date().toLocaleTimeString()}`;
 
     // Update last refresh display
     updateLastRefreshDisplay(data.lastRefresh);
@@ -565,34 +1248,61 @@ async function refreshSummary() {
       updateCustomAccountCount(data.customAccountCount, data.maxCustomAccounts || MAX_CUSTOM_ACCOUNTS);
     }
   } catch (err) {
-    statusEl.textContent = 'Failed to load summary';
-    console.error(err);
+    console.error('Failed to load summary:', err);
   }
 }
 
 async function refreshFills() {
   try {
     const data = await fetchJson(`${API_BASE}/fills?limit=40`);
-    fillsCache = data.fills || [];
+    const newFills = data.fills || [];
+
+    if (fillsCache.length === 0) {
+      // Initial load - just use the new fills
+      fillsCache = newFills;
+      hasMoreFills = data.hasMore !== false;
+    } else {
+      // Incremental update - merge new fills at the front, keeping loaded history
+      // Find fills that are newer than our current newest
+      const newestTime = fillsCache.length > 0 ? new Date(fillsCache[0].time_utc).getTime() : 0;
+      const trulyNewFills = newFills.filter(f => new Date(f.time_utc).getTime() > newestTime);
+
+      if (trulyNewFills.length > 0) {
+        // Add new fills to the front
+        fillsCache = [...trulyNewFills, ...fillsCache];
+        // Cap the cache to prevent unbounded growth
+        if (fillsCache.length > 500) {
+          fillsCache = fillsCache.slice(0, 500);
+        }
+      }
+      // Don't update hasMoreFills here - keep user's "Load More" progress
+    }
+
+    // Set fillsOldestTime from the oldest fill in cache
+    // This is needed for "Load More" pagination to work correctly
+    if (fillsCache.length > 0) {
+      fillsOldestTime = fillsCache[fillsCache.length - 1].time_utc;
+    }
+
     renderFills(fillsCache);
   } catch (err) {
     console.error(err);
+    // Still update UI even on error
+    updateFillsUI();
   }
 }
 
-async function refreshDecisions() {
-  try {
-    const data = await fetchJson(`${API_BASE}/decisions?limit=20`);
-    renderDecisions(data.decisions || []);
-  } catch (err) {
-    console.error(err);
-  }
-}
 
 function pushFill(fill) {
+  // Keep raw fills cache for potential re-aggregation
   fillsCache.unshift(fill);
-  fillsCache = fillsCache.slice(0, 40);
-  renderFills(fillsCache);
+  fillsCache = fillsCache.slice(0, 200); // Keep more raw fills for history
+
+  // Use streaming aggregation - dynamically merge into existing groups
+  addFillToAggregation(fill);
+
+  // Re-render the aggregated view
+  renderAggregatedFills();
 }
 
 function connectWs() {
@@ -601,6 +1311,19 @@ function connectWs() {
   ws.addEventListener('message', (evt) => {
     try {
       const payload = JSON.parse(evt.data);
+
+      // Handle price updates
+      if (payload.type === 'price') {
+        updatePriceTicker(payload.btc, payload.eth);
+        return;
+      }
+
+      // Handle hello message with initial prices
+      if (payload.type === 'hello' && payload.prices) {
+        updatePriceTicker(payload.prices.btc, payload.prices.eth);
+      }
+
+      // Handle trade events
       const events = payload.events || payload.batch || payload;
       if (Array.isArray(events)) {
         events
@@ -612,12 +1335,17 @@ function connectWs() {
 
             const sizeSigned = e.size ?? e.payload?.size ?? 0;
             const startPos = e.startPosition ?? e.payload?.startPosition ?? null;
+            const sizeNum = Number(sizeSigned);
+            const prevPos = startPos != null ? Number(startPos) : null;
+            // Calculate resulting_position = previous_position + size_signed
+            const resultingPos = prevPos != null ? prevPos + sizeNum : null;
             const row = {
               time_utc: e.at,
               address: e.address,
               action: e.action || e.payload?.action || '',
-              size_signed: Number(sizeSigned),
-              previous_position: startPos != null ? Number(startPos) : null,
+              size_signed: sizeNum,
+              previous_position: prevPos,
+              resulting_position: resultingPos,
               price_usd: e.priceUsd ?? e.payload?.priceUsd ?? null,
               closed_pnl_usd: e.realizedPnlUsd ?? e.payload?.realizedPnlUsd ?? null,
               symbol
@@ -629,7 +1357,24 @@ function connectWs() {
       console.error('ws parse', err);
     }
   });
+  ws.addEventListener('open', () => {
+    // Refresh fills when WebSocket reconnects to ensure data consistency
+    // This prevents stale data showing after backend restart
+    // Skip on first connect since refreshFills() was already called in init()
+    if (isFirstWsConnect) {
+      isFirstWsConnect = false;
+    } else {
+      refreshFills();
+    }
+  });
   ws.addEventListener('close', () => {
+    // Clear stale fills data when connection is lost
+    // This prevents showing outdated data when backend restarts
+    fillsCache = [];
+    aggregatedGroups = [];
+    hasMoreFills = true; // Reset so "Load More" button is re-enabled after reconnect
+    fillsOldestTime = null;
+    renderAggregatedFills();
     setTimeout(connectWs, 2000);
   });
 }
@@ -671,6 +1416,15 @@ function initChartControls() {
       renderChart(currentSymbol);
     });
   });
+
+  // Chart collapse functionality
+  const collapseBtn = document.getElementById('chart-collapse-btn');
+  const chartCard = document.querySelector('.chart-card');
+  if (collapseBtn && chartCard) {
+    collapseBtn.addEventListener('click', () => {
+      chartCard.classList.toggle('collapsed');
+    });
+  }
 }
 
 // Period controls removed - now fixed to 30 days
@@ -885,16 +1639,13 @@ async function triggerLeaderboardRefresh() {
 
     if (!res.ok) {
       console.error('Refresh error:', data.error);
-      statusEl.textContent = 'Refresh failed';
       return;
     }
 
     // Poll for refresh completion
-    statusEl.textContent = 'Refreshing leaderboard...';
     pollRefreshStatus();
   } catch (err) {
     console.error('Refresh error:', err);
-    statusEl.textContent = 'Refresh failed';
     refreshBtn.disabled = false;
     refreshBtn.classList.remove('loading');
   }
@@ -915,14 +1666,12 @@ async function pollRefreshStatus() {
     refreshBtn.classList.remove('loading');
 
     if (data.status === 'idle') {
-      statusEl.textContent = 'Refresh complete';
       await refreshSummary();
     }
   } catch (err) {
     console.error('Poll refresh status error:', err);
     refreshBtn.disabled = false;
     refreshBtn.classList.remove('loading');
-    statusEl.textContent = 'Refresh status unknown';
   }
 }
 
@@ -950,7 +1699,13 @@ async function loadMoreFills() {
 
   isLoadingMore = true;
   const loadMoreEl = document.getElementById('fills-load-more');
+  const loadBtn = document.getElementById('load-history-btn');
+
   if (loadMoreEl) loadMoreEl.style.display = 'flex';
+  if (loadBtn) {
+    loadBtn.classList.add('loading');
+    loadBtn.textContent = 'Loading';
+  }
 
   try {
     const beforeTime = fillsOldestTime || new Date().toISOString();
@@ -969,24 +1724,28 @@ async function loadMoreFills() {
 
       // Re-render with all fills (aggregation will be applied)
       renderFills(fillsCache);
-      updateTimeRangeDisplay();
     } else {
       hasMoreFills = false;
     }
 
-    // Show "no more" message if we've reached the end
-    if (!hasMoreFills && loadMoreEl) {
-      loadMoreEl.innerHTML = '<span class="no-more-fills">No more fills to load</span>';
-      loadMoreEl.style.display = 'block';
-    }
+    // Update UI elements
+    updateFillsUI();
   } catch (err) {
     console.error('Load more fills error:', err);
     hasMoreFills = false;
+    updateFillsUI();
   } finally {
     isLoadingMore = false;
-    if (hasMoreFills) {
-      const loadMoreEl = document.getElementById('fills-load-more');
-      if (loadMoreEl) loadMoreEl.style.display = 'none';
+    if (loadMoreEl) loadMoreEl.style.display = 'none';
+    if (loadBtn) {
+      loadBtn.classList.remove('loading');
+      // Reset button text based on state
+      if (!hasMoreFills) {
+        loadBtn.textContent = 'All loaded';
+        loadBtn.disabled = true;
+      } else {
+        loadBtn.textContent = 'Load More';
+      }
     }
   }
 }
@@ -1005,60 +1764,14 @@ function initInfiniteScroll() {
   });
 }
 
-// Fetch historical fills from Hyperliquid API
-async function fetchHistoricalFills() {
-  try {
-    const response = await fetch(`${API_BASE}/fills/fetch-history`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ limit: 50 })
-    });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    return await response.json();
-  } catch (err) {
-    console.error('Fetch historical fills error:', err);
-    return null;
-  }
-}
-
 // Initialize load history button
 function initLoadHistoryButton() {
   const btn = document.getElementById('load-history-btn');
   if (!btn) return;
 
   btn.addEventListener('click', async () => {
-    btn.disabled = true;
-    btn.textContent = 'Fetching from Hyperliquid...';
-
-    // First, try to fetch historical fills from Hyperliquid API
-    const result = await fetchHistoricalFills();
-
-    if (result && result.fills && result.fills.length > 0) {
-      // Update cache with fetched fills
-      fillsCache = result.fills;
-      hasMoreFills = result.hasMore;
-      fillsOldestTime = result.oldestTime;
-      renderFills(fillsCache);
-      updateTimeRangeDisplay();
-      btn.textContent = `Loaded ${result.inserted} new fills`;
-    } else if (result && result.inserted === 0) {
-      // No new fills, but API call succeeded - try loading from DB
-      btn.textContent = 'Loading from DB...';
-      await loadMoreFills();
-      btn.textContent = 'No new fills found';
-    } else {
-      // API call failed, fall back to DB
-      btn.textContent = 'Loading from DB...';
-      await loadMoreFills();
-    }
-
-    updateLoadHistoryVisibility();
-    btn.disabled = false;
-
-    // Reset button text after a delay
-    setTimeout(() => {
-      btn.textContent = 'Load Historical Fills';
-    }, 2000);
+    // Use loadMoreFills for pagination - it handles everything including UI updates
+    await loadMoreFills();
   });
 }
 
@@ -1069,11 +1782,18 @@ async function init() {
   initInfiniteScroll();
   initLoadHistoryButton();
   renderChart('BTCUSDT');
+
+  // Initialize fills UI with initial state
+  updateFillsUI();
+
+  // Fetch initial prices
+  fetchPrices();
   // Check positions status FIRST before loading data
   await checkPositionsStatus();
   refreshSummary();
-  refreshFills();
-  refreshDecisions();
+  // Await initial fills load to prevent double-render flash
+  await refreshFills();
+  renderAIRecommendations();
   connectWs();
   // Continue polling until positions are ready (if not already)
   if (!positionsReady) {
@@ -1081,7 +1801,6 @@ async function init() {
   }
   setInterval(refreshSummary, 30_000);
   setInterval(refreshFills, 20_000);
-  setInterval(refreshDecisions, 45_000);
 }
 
 document.addEventListener('DOMContentLoaded', init);

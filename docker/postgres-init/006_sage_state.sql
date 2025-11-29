@@ -1,4 +1,4 @@
--- Migration 005: hl-sage state persistence
+-- Migration 006: hl-sage state persistence
 -- Persist tracked address metadata to survive service restarts
 
 CREATE TABLE IF NOT EXISTS sage_tracked_addresses (

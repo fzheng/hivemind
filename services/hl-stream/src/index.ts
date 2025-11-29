@@ -1,3 +1,21 @@
+/**
+ * HL-Stream Service
+ *
+ * Subscribes to Hyperliquid real-time WebSocket feeds for tracked addresses
+ * and streams position and trade events to connected dashboard clients.
+ * Also publishes fill events to NATS for downstream services.
+ *
+ * Key responsibilities:
+ * - Maintain WebSocket connections to Hyperliquid for each tracked address
+ * - Track position changes and trade fills in real-time
+ * - Stream events to browser clients via WebSocket
+ * - Publish fill events to `c.fills.v1` NATS topic
+ * - Serve the dashboard UI and proxy API requests to hl-scout
+ * - Handle historical fill backfill from Hyperliquid API
+ *
+ * @module hl-stream
+ */
+
 import cors from 'cors';
 import express, { Request, Response, NextFunction } from 'express';
 import http from 'http';
@@ -24,7 +42,13 @@ import {
   getBackfillFills,
   getOldestFillTime,
   fetchUserFills,
-  insertTradeIfNew
+  insertTradeIfNew,
+  getCurrentPrices,
+  onPriceChange,
+  startPriceFeed,
+  refreshPriceFeed,
+  validatePositionChain,
+  clearTradesForAddress
 } from '@hl/ts-lib';
 
 const OWNER_TOKEN = getOwnerToken();
@@ -74,20 +98,37 @@ const swaggerDoc: OpenAPIV3.Document = {
   }
 };
 
+/** Event queue for streaming to WebSocket clients */
 const queue = new EventQueue(5000);
+/** Connected WebSocket clients */
 const clients = new Set<{ ws: WebSocket; lastSeq: number; alive: boolean }>();
+/** Currently tracked addresses */
 let watchlist: string[] = [];
+/** URL of hl-scout service for API proxying */
 const scoutUrl = process.env.SCOUT_URL || 'http://hl-scout:8080';
+/** Directory containing dashboard static files */
 const dashboardDir = path.resolve(__dirname, '..', 'public');
+/** NATS subject for fill events */
 const fillsSubject = 'c.fills.v1';
+/** Realtime tracker for Hyperliquid WebSocket subscriptions */
 let tracker: RealtimeTracker | null = null;
 
+/**
+ * Express middleware for owner-only endpoints.
+ * Requires x-owner-key header to match OWNER_TOKEN.
+ */
 function ownerOnly(req: Request, res: Response, next: NextFunction) {
   const token = (req.headers['x-owner-key'] || req.headers['x-owner-token'] || '').toString();
   if (token !== OWNER_TOKEN) return res.status(403).json({ error: 'forbidden' });
   return next();
 }
 
+/**
+ * Fetches the list of addresses to track from hl-scout.
+ * Combines top-ranked system accounts with user's custom accounts.
+ *
+ * @returns Array of normalized Ethereum addresses
+ */
 async function fetchWatchlist(): Promise<string[]> {
   const addresses: string[] = [];
 
@@ -147,6 +188,14 @@ async function fetchWatchlist(): Promise<string[]> {
   return [];
 }
 
+/**
+ * Proxies a request to the hl-scout service.
+ * Used for dashboard API endpoints that need data from hl-scout.
+ *
+ * @param pathname - Path on hl-scout to request
+ * @param req - Express request object
+ * @param res - Express response object
+ */
 async function proxyScout(pathname: string, req: Request, res: Response) {
   try {
     const target = new URL(pathname, scoutUrl);
@@ -164,6 +213,12 @@ async function proxyScout(pathname: string, req: Request, res: Response) {
   }
 }
 
+/**
+ * Converts a trade event to a FillEvent schema for NATS publishing.
+ *
+ * @param evt - Raw trade event from RealtimeTracker
+ * @returns Validated FillEvent payload
+ */
 function toFillEventPayload(evt: any) {
   return FillEventSchema.parse({
     fill_id: evt.hash || `${evt.address}-${evt.at}`,
@@ -180,6 +235,13 @@ function toFillEventPayload(evt: any) {
   });
 }
 
+/**
+ * Publishes a fill event to NATS JetStream.
+ * Called for each trade detected by the RealtimeTracker.
+ *
+ * @param js - JetStream client
+ * @param evt - Trade event to publish
+ */
 async function publishFillFromEvent(
   js: Awaited<ReturnType<typeof connectNats>>['js'],
   evt: any
@@ -194,15 +256,32 @@ async function publishFillFromEvent(
   }
 }
 
+/**
+ * Configures WebSocket server for streaming events to clients.
+ * Handles connection lifecycle, heartbeat, and event broadcasting.
+ *
+ * @param server - HTTP server to attach WebSocket server to
+ */
 function configureWebSocket(server: http.Server) {
   const wss = new WebSocketServer({ server, path: '/ws' });
   let pingInterval: NodeJS.Timeout | null = null;
   let broadcastInterval: NodeJS.Timeout | null = null;
+  let priceInterval: NodeJS.Timeout | null = null;
+
+  // Track last sent prices to only send on change
+  let lastBtcPrice: number | null = null;
+  let lastEthPrice: number | null = null;
 
   wss.on('connection', (ws) => {
     const client = { ws, lastSeq: 0, alive: true };
     clients.add(client);
-    ws.send(JSON.stringify({ type: 'hello', latestSeq: queue.latestSeq() }));
+    // Send initial hello with current prices
+    const prices = getCurrentPrices();
+    ws.send(JSON.stringify({
+      type: 'hello',
+      latestSeq: queue.latestSeq(),
+      prices: { btc: prices.btc.price, eth: prices.eth.price }
+    }));
     ws.on('message', (raw) => {
       try {
         const msg = JSON.parse(String(raw));
@@ -260,16 +339,48 @@ function configureWebSocket(server: http.Server) {
     }
   };
 
+  // Broadcast price updates to all clients
+  const broadcastPrices = () => {
+    if (!clients.size) return;
+    const prices = getCurrentPrices();
+    const btc = prices.btc.price;
+    const eth = prices.eth.price;
+
+    // Only broadcast if prices have changed
+    if (btc === lastBtcPrice && eth === lastEthPrice) return;
+    lastBtcPrice = btc;
+    lastEthPrice = eth;
+
+    const priceMsg = JSON.stringify({ type: 'price', btc, eth });
+    for (const client of clients) {
+      if (client.ws.readyState !== WebSocket.OPEN) {
+        clients.delete(client);
+        continue;
+      }
+      try {
+        client.ws.send(priceMsg);
+      } catch (e) {
+        logger.warn('ws_price_send_failed', { error: e });
+      }
+    }
+  };
+
   broadcastInterval = setInterval(broadcast, 1000);
+  priceInterval = setInterval(broadcastPrices, 2000); // Broadcast prices every 2 seconds
 
   // Cleanup on server shutdown
   process.on('SIGTERM', () => {
     if (pingInterval) clearInterval(pingInterval);
     if (broadcastInterval) clearInterval(broadcastInterval);
+    if (priceInterval) clearInterval(priceInterval);
     wss.close();
   });
 }
 
+/**
+ * Main entry point for hl-stream service.
+ * Initializes NATS, RealtimeTracker, Express server, and WebSocket.
+ */
 async function main() {
   const natsUrl = process.env.NATS_URL || 'nats://localhost:4222';
   const nats = await connectNats(natsUrl);
@@ -290,6 +401,11 @@ async function main() {
   logger.info('starting_realtime_tracker', { watchlist: watchlist.length });
   await tracker.start({ awaitPositions: true });
   logger.info('realtime_tracker_ready', { watchlist: watchlist.length });
+
+  // Start the price feed for real-time BTC/ETH prices
+  startPriceFeed(async () => watchlist).catch((err) =>
+    logger.warn('price_feed_start_failed', { err: err?.message })
+  );
 
   const app = express();
   app.use(cors());
@@ -324,6 +440,17 @@ async function main() {
     positionsReady: tracker?.positionsReady ?? false,
     watchlistCount: watchlist.length
   }));
+
+  // Real-time prices endpoint
+  app.get('/dashboard/api/prices', (_req, res) => {
+    const prices = getCurrentPrices();
+    res.json({
+      btc: prices.btc.price,
+      eth: prices.eth.price,
+      btcUpdatedAt: prices.btc.updatedAt,
+      ethUpdatedAt: prices.eth.updatedAt
+    });
+  });
 
   // Custom accounts proxy routes
   app.get('/dashboard/api/custom-accounts', (req, res) => proxyScout('/custom-accounts', req, res));
@@ -524,6 +651,211 @@ async function main() {
     }
   });
 
+  // Validate position chain integrity for all tracked addresses
+  app.get('/dashboard/api/fills/validate', async (req, res) => {
+    try {
+      const symbol = (req.query.symbol === 'BTC' ? 'BTC' : 'ETH') as 'BTC' | 'ETH';
+      const addresses = watchlist.length > 0 ? watchlist : [];
+
+      if (addresses.length === 0) {
+        return res.json({ valid: true, message: 'No addresses in watchlist', results: [] });
+      }
+
+      const results: Array<{
+        address: string;
+        valid: boolean;
+        gapCount: number;
+        gaps: Array<{ time: string; expected: number; actual: number }>;
+      }> = [];
+
+      let allValid = true;
+
+      for (const address of addresses) {
+        const validation = await validatePositionChain(address, symbol);
+        results.push({
+          address,
+          valid: validation.valid,
+          gapCount: validation.gaps.length,
+          gaps: validation.gaps.slice(0, 5) // Limit to first 5 gaps per address
+        });
+        if (!validation.valid) allValid = false;
+      }
+
+      const invalidCount = results.filter(r => !r.valid).length;
+      logger.info('position_chain_validation', { symbol, addressCount: addresses.length, invalidCount });
+
+      res.json({
+        valid: allValid,
+        symbol,
+        addressCount: addresses.length,
+        invalidCount,
+        results: results.filter(r => !r.valid) // Only return invalid addresses
+      });
+    } catch (err: any) {
+      logger.error('validation_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to validate position chains' });
+    }
+  });
+
+  // Repair data for a specific address (clear and backfill)
+  app.post('/dashboard/api/fills/repair', async (req, res) => {
+    try {
+      const address = req.body?.address;
+      const symbol = (req.body?.symbol === 'BTC' ? 'BTC' : 'ETH') as 'BTC' | 'ETH';
+
+      if (!address || typeof address !== 'string' || !address.startsWith('0x')) {
+        return res.status(400).json({ error: 'Invalid address' });
+      }
+
+      const normalizedAddr = normalizeAddress(address);
+
+      // Step 1: Clear existing trades for this address
+      const cleared = await clearTradesForAddress(normalizedAddr, symbol);
+      logger.info('repair_cleared_trades', { address: normalizedAddr, symbol, cleared });
+
+      // Step 2: Backfill from Hyperliquid API
+      let inserted = 0;
+      try {
+        const fills = await fetchUserFills(normalizedAddr, { aggregateByTime: true, symbols: [symbol] });
+
+        for (const f of fills || []) {
+          const delta = f.side === 'B' ? +f.sz : -f.sz;
+          const newPos = f.startPosition + delta;
+          let action = '';
+          if (f.startPosition === 0) action = delta > 0 ? 'Open Long (Open New)' : 'Open Short (Open New)';
+          else if (f.startPosition > 0) action = delta > 0 ? 'Increase Long' : (newPos === 0 ? 'Close Long (Close All)' : 'Decrease Long');
+          else action = delta < 0 ? 'Increase Short' : (newPos === 0 ? 'Close Short (Close All)' : 'Decrease Short');
+
+          const payload = {
+            at: new Date(f.time).toISOString(),
+            address: normalizedAddr,
+            symbol: f.coin,
+            action,
+            size: Math.abs(f.sz),
+            startPosition: f.startPosition,
+            priceUsd: f.px,
+            realizedPnlUsd: f.closedPnl ?? null,
+            fee: f.fee ?? null,
+            feeToken: f.feeToken ?? null,
+            hash: f.hash ?? null,
+          };
+
+          const result = await insertTradeIfNew(normalizedAddr, payload);
+          if (result.inserted) inserted += 1;
+        }
+      } catch (err: any) {
+        logger.warn('repair_backfill_failed', { address: normalizedAddr, err: err?.message });
+      }
+
+      // Step 3: Re-validate
+      const validation = await validatePositionChain(normalizedAddr, symbol);
+
+      logger.info('repair_complete', {
+        address: normalizedAddr,
+        symbol,
+        cleared,
+        inserted,
+        valid: validation.valid,
+        remainingGaps: validation.gaps.length
+      });
+
+      res.json({
+        address: normalizedAddr,
+        symbol,
+        cleared,
+        inserted,
+        valid: validation.valid,
+        remainingGaps: validation.gaps.length
+      });
+    } catch (err: any) {
+      logger.error('repair_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to repair data' });
+    }
+  });
+
+  // Auto-repair all invalid addresses
+  app.post('/dashboard/api/fills/repair-all', async (req, res) => {
+    try {
+      const symbol = (req.body?.symbol === 'BTC' ? 'BTC' : 'ETH') as 'BTC' | 'ETH';
+      const addresses = watchlist.length > 0 ? watchlist : [];
+
+      if (addresses.length === 0) {
+        return res.json({ repaired: 0, message: 'No addresses in watchlist' });
+      }
+
+      // First validate all
+      const invalidAddresses: string[] = [];
+      for (const address of addresses) {
+        const validation = await validatePositionChain(address, symbol);
+        if (!validation.valid) {
+          invalidAddresses.push(address);
+        }
+      }
+
+      if (invalidAddresses.length === 0) {
+        return res.json({ repaired: 0, message: 'All position chains are valid' });
+      }
+
+      logger.info('repair_all_starting', { symbol, invalidCount: invalidAddresses.length });
+
+      const results: Array<{ address: string; cleared: number; inserted: number; valid: boolean }> = [];
+
+      for (const address of invalidAddresses) {
+        // Clear
+        const cleared = await clearTradesForAddress(address, symbol);
+
+        // Backfill
+        let inserted = 0;
+        try {
+          const fills = await fetchUserFills(address, { aggregateByTime: true, symbols: [symbol] });
+          for (const f of fills || []) {
+            const delta = f.side === 'B' ? +f.sz : -f.sz;
+            const newPos = f.startPosition + delta;
+            let action = '';
+            if (f.startPosition === 0) action = delta > 0 ? 'Open Long (Open New)' : 'Open Short (Open New)';
+            else if (f.startPosition > 0) action = delta > 0 ? 'Increase Long' : (newPos === 0 ? 'Close Long (Close All)' : 'Decrease Long');
+            else action = delta < 0 ? 'Increase Short' : (newPos === 0 ? 'Close Short (Close All)' : 'Decrease Short');
+
+            const payload = {
+              at: new Date(f.time).toISOString(),
+              address,
+              symbol: f.coin,
+              action,
+              size: Math.abs(f.sz),
+              startPosition: f.startPosition,
+              priceUsd: f.px,
+              realizedPnlUsd: f.closedPnl ?? null,
+              fee: f.fee ?? null,
+              feeToken: f.feeToken ?? null,
+              hash: f.hash ?? null,
+            };
+            const result = await insertTradeIfNew(address, payload);
+            if (result.inserted) inserted += 1;
+          }
+        } catch (err: any) {
+          logger.warn('repair_all_backfill_failed', { address, err: err?.message });
+        }
+
+        // Re-validate
+        const validation = await validatePositionChain(address, symbol);
+        results.push({ address, cleared, inserted, valid: validation.valid });
+      }
+
+      const stillInvalid = results.filter(r => !r.valid).length;
+      logger.info('repair_all_complete', { symbol, repaired: invalidAddresses.length, stillInvalid });
+
+      res.json({
+        symbol,
+        repaired: invalidAddresses.length,
+        stillInvalid,
+        results
+      });
+    } catch (err: any) {
+      logger.error('repair_all_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to repair data' });
+    }
+  });
+
   const server = http.createServer(app);
   configureWebSocket(server);
 
@@ -531,6 +863,7 @@ async function main() {
     try {
       watchlist = await fetchWatchlist();
       await tracker?.refresh();
+      await refreshPriceFeed();
     } catch (err: any) {
       logger.warn('watchlist_poll_failed', { err: err instanceof Error ? err.message : String(err) });
     }
@@ -538,6 +871,77 @@ async function main() {
   setInterval(() => {
     void tracker?.ensureFreshSnapshots();
   }, 30000);
+
+  // Periodic position chain validation (every 5 minutes)
+  // Auto-repairs any addresses with data gaps
+  const AUTO_REPAIR_ENABLED = process.env.AUTO_REPAIR_ENABLED !== 'false';
+  const VALIDATION_INTERVAL = Number(process.env.VALIDATION_INTERVAL_MS ?? 300000); // 5 minutes default
+
+  if (AUTO_REPAIR_ENABLED) {
+    setInterval(async () => {
+      try {
+        const addresses = watchlist.length > 0 ? watchlist : [];
+        if (addresses.length === 0) return;
+
+        // Validate ETH (most commonly traded)
+        for (const symbol of ['ETH', 'BTC'] as const) {
+          const invalidAddresses: string[] = [];
+
+          for (const address of addresses) {
+            const validation = await validatePositionChain(address, symbol);
+            if (!validation.valid && validation.gaps.length > 0) {
+              invalidAddresses.push(address);
+            }
+          }
+
+          if (invalidAddresses.length === 0) continue;
+
+          logger.warn('auto_repair_triggered', { symbol, invalidCount: invalidAddresses.length });
+
+          // Auto-repair each invalid address
+          for (const address of invalidAddresses) {
+            try {
+              const cleared = await clearTradesForAddress(address, symbol);
+              const fills = await fetchUserFills(address, { aggregateByTime: true, symbols: [symbol] });
+              let inserted = 0;
+
+              for (const f of fills || []) {
+                const delta = f.side === 'B' ? +f.sz : -f.sz;
+                const newPos = f.startPosition + delta;
+                let action = '';
+                if (f.startPosition === 0) action = delta > 0 ? 'Open Long (Open New)' : 'Open Short (Open New)';
+                else if (f.startPosition > 0) action = delta > 0 ? 'Increase Long' : (newPos === 0 ? 'Close Long (Close All)' : 'Decrease Long');
+                else action = delta < 0 ? 'Increase Short' : (newPos === 0 ? 'Close Short (Close All)' : 'Decrease Short');
+
+                const payload = {
+                  at: new Date(f.time).toISOString(),
+                  address,
+                  symbol: f.coin,
+                  action,
+                  size: Math.abs(f.sz),
+                  startPosition: f.startPosition,
+                  priceUsd: f.px,
+                  realizedPnlUsd: f.closedPnl ?? null,
+                  fee: f.fee ?? null,
+                  feeToken: f.feeToken ?? null,
+                  hash: f.hash ?? null,
+                };
+                const result = await insertTradeIfNew(address, payload);
+                if (result.inserted) inserted += 1;
+              }
+
+              logger.info('auto_repair_complete', { address, symbol, cleared, inserted });
+            } catch (err: any) {
+              logger.error('auto_repair_address_failed', { address, symbol, err: err?.message });
+            }
+          }
+        }
+      } catch (err: any) {
+        logger.error('auto_repair_cycle_failed', { err: err?.message });
+      }
+    }, VALIDATION_INTERVAL);
+    logger.info('auto_repair_enabled', { intervalMs: VALIDATION_INTERVAL });
+  }
 
   const port = getPort(8080);
   server.listen(port, () => logger.info('hl-stream listening', { port }));

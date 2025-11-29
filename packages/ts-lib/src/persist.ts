@@ -353,6 +353,22 @@ export async function listLiveFills(limit = 25): Promise<LiveFill[]> {
             ELSE (payload->>'size')::numeric
           END AS size_signed,
           (payload->>'startPosition')::numeric AS previous_position,
+          -- Calculate resulting_position = startPosition + position_delta
+          -- startPosition is already signed (negative for shorts)
+          -- For longs: buy adds to position, sell subtracts
+          -- For shorts: buy (cover) makes less negative, sell makes more negative
+          (payload->>'startPosition')::numeric +
+          CASE payload->>'action'
+            WHEN 'Increase Long'  THEN (payload->>'size')::numeric   -- buy adds
+            WHEN 'Open Long'      THEN (payload->>'size')::numeric   -- buy adds
+            WHEN 'Decrease Long'  THEN -(payload->>'size')::numeric  -- sell subtracts
+            WHEN 'Close Long'     THEN -(payload->>'size')::numeric  -- sell subtracts
+            WHEN 'Increase Short' THEN -(payload->>'size')::numeric  -- sell makes more negative
+            WHEN 'Open Short'     THEN -(payload->>'size')::numeric  -- sell makes negative
+            WHEN 'Decrease Short' THEN (payload->>'size')::numeric   -- buy makes less negative
+            WHEN 'Close Short'    THEN (payload->>'size')::numeric   -- buy closes to 0
+            ELSE (payload->>'size')::numeric
+          END AS resulting_position,
           (payload->>'priceUsd')::numeric      AS price_usd,
           (payload->>'realizedPnlUsd')::numeric AS closed_pnl_usd,
           payload->>'hash'                     AS tx_hash,
@@ -372,6 +388,7 @@ export async function listLiveFills(limit = 25): Promise<LiveFill[]> {
       action: row.action,
       size_signed: row.size_signed != null ? Number(row.size_signed) : null,
       previous_position: row.previous_position != null ? Number(row.previous_position) : null,
+      resulting_position: row.resulting_position != null ? Number(row.resulting_position) : null,
       price_usd: row.price_usd != null ? Number(row.price_usd) : null,
       closed_pnl_usd: row.closed_pnl_usd != null ? Number(row.closed_pnl_usd) : null,
       tx_hash: row.tx_hash || null,
@@ -498,26 +515,36 @@ export async function listCustomAccounts(): Promise<CustomAccount[]> {
 
 /**
  * Add a custom account (max 3 allowed)
+ * Uses SHARE ROW EXCLUSIVE lock to serialize inserts and prevent race conditions.
+ * This ensures two parallel requests cannot both see <3 accounts and both insert.
  * @returns The added account or null if limit reached or duplicate
  */
 export async function addCustomAccount(
   address: string,
   nickname?: string | null
 ): Promise<{ success: boolean; account?: CustomAccount; error?: string }> {
+  const p = await getPool();
+  const client = await p.connect();
   try {
-    const p = await getPool();
     const normalizedAddress = address.toLowerCase();
 
-    // Check current count
-    const { rows: countRows } = await p.query('SELECT COUNT(*) as cnt FROM hl_custom_accounts');
+    await client.query('BEGIN');
+
+    // Acquire exclusive lock to serialize all insert attempts
+    // SHARE ROW EXCLUSIVE prevents concurrent inserts while allowing concurrent reads
+    await client.query('LOCK TABLE hl_custom_accounts IN SHARE ROW EXCLUSIVE MODE');
+
+    // Now count is accurate - no other insert can proceed until we commit/rollback
+    const { rows: countRows } = await client.query('SELECT COUNT(*) as cnt FROM hl_custom_accounts');
     const currentCount = Number(countRows[0]?.cnt ?? 0);
 
     if (currentCount >= MAX_CUSTOM_ACCOUNTS) {
+      await client.query('ROLLBACK');
       return { success: false, error: `Maximum of ${MAX_CUSTOM_ACCOUNTS} custom accounts allowed` };
     }
 
-    // Insert the account
-    const { rows } = await p.query(
+    // Insert the account atomically within the same transaction
+    const { rows } = await client.query(
       `INSERT INTO hl_custom_accounts (address, nickname)
        VALUES ($1, $2)
        ON CONFLICT (lower(address)) DO NOTHING
@@ -526,8 +553,11 @@ export async function addCustomAccount(
     );
 
     if (!rows.length) {
+      await client.query('ROLLBACK');
       return { success: false, error: 'Account already exists' };
     }
+
+    await client.query('COMMIT');
 
     return {
       success: true,
@@ -539,8 +569,11 @@ export async function addCustomAccount(
       },
     };
   } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error('[persist] addCustomAccount failed:', e);
     return { success: false, error: 'Failed to add account' };
+  } finally {
+    client.release();
   }
 }
 
@@ -716,6 +749,22 @@ export async function getBackfillFills(opts: {
           ELSE (payload->>'size')::numeric
         END AS size_signed,
         (payload->>'startPosition')::numeric AS previous_position,
+        -- Calculate resulting_position = startPosition + position_delta
+        -- startPosition is already signed (negative for shorts)
+        -- For longs: buy adds to position, sell subtracts
+        -- For shorts: buy (cover) makes less negative, sell makes more negative
+        (payload->>'startPosition')::numeric +
+        CASE payload->>'action'
+          WHEN 'Increase Long'  THEN (payload->>'size')::numeric   -- buy adds
+          WHEN 'Open Long'      THEN (payload->>'size')::numeric   -- buy adds
+          WHEN 'Decrease Long'  THEN -(payload->>'size')::numeric  -- sell subtracts
+          WHEN 'Close Long'     THEN -(payload->>'size')::numeric  -- sell subtracts
+          WHEN 'Increase Short' THEN -(payload->>'size')::numeric  -- sell makes more negative
+          WHEN 'Open Short'     THEN -(payload->>'size')::numeric  -- sell makes negative
+          WHEN 'Decrease Short' THEN (payload->>'size')::numeric   -- buy makes less negative
+          WHEN 'Close Short'    THEN (payload->>'size')::numeric   -- buy closes to 0
+          ELSE (payload->>'size')::numeric
+        END AS resulting_position,
         (payload->>'priceUsd')::numeric AS price_usd,
         (payload->>'realizedPnlUsd')::numeric AS closed_pnl_usd,
         payload->>'hash' AS tx_hash
@@ -728,18 +777,26 @@ export async function getBackfillFills(opts: {
     const { rows } = await p.query(sql, params);
 
     const hasMore = rows.length > safeLimit;
-    const fills = rows.slice(0, safeLimit).map((row: Record<string, unknown>) => ({
-      id: Number(row.id),
-      time_utc: String(row.time_utc),
-      address: String(row.address),
-      symbol: String(row.symbol || 'BTC'),
-      action: String(row.action || ''),
-      size_signed: row.size_signed != null ? Number(row.size_signed) : null,
-      previous_position: row.previous_position != null ? Number(row.previous_position) : null,
-      price_usd: row.price_usd != null ? Number(row.price_usd) : null,
-      closed_pnl_usd: row.closed_pnl_usd != null ? Number(row.closed_pnl_usd) : null,
-      tx_hash: row.tx_hash ? String(row.tx_hash) : null,
-    }));
+    const fills = rows.slice(0, safeLimit).map((row: Record<string, unknown>) => {
+      // PostgreSQL returns timestamps as Date objects - convert to ISO string
+      const timeValue = row.time_utc;
+      const timeUtc = timeValue instanceof Date
+        ? timeValue.toISOString()
+        : String(timeValue);
+      return {
+        id: Number(row.id),
+        time_utc: timeUtc,
+        address: String(row.address),
+        symbol: String(row.symbol || 'BTC'),
+        action: String(row.action || ''),
+        size_signed: row.size_signed != null ? Number(row.size_signed) : null,
+        previous_position: row.previous_position != null ? Number(row.previous_position) : null,
+        resulting_position: row.resulting_position != null ? Number(row.resulting_position) : null,
+        price_usd: row.price_usd != null ? Number(row.price_usd) : null,
+        closed_pnl_usd: row.closed_pnl_usd != null ? Number(row.closed_pnl_usd) : null,
+        tx_hash: row.tx_hash ? String(row.tx_hash) : null,
+      };
+    });
 
     const oldestTime = fills.length > 0 ? fills[fills.length - 1].time_utc : null;
 
@@ -747,6 +804,95 @@ export async function getBackfillFills(opts: {
   } catch (e) {
     console.error('[persist] getBackfillFills failed:', e);
     return { fills: [], hasMore: false, oldestTime: null };
+  }
+}
+
+/**
+ * Deletes all trade events for a given address and symbol.
+ * Used for data repair when position chain is corrupted.
+ */
+export async function clearTradesForAddress(
+  address: string,
+  symbol?: 'BTC' | 'ETH'
+): Promise<number> {
+  try {
+    const p = await getPool();
+    let sql = `DELETE FROM hl_events WHERE type = 'trade' AND LOWER(address) = LOWER($1)`;
+    const params: (string | undefined)[] = [address];
+
+    if (symbol) {
+      sql += ` AND COALESCE(payload->>'symbol', 'BTC') = $2`;
+      params.push(symbol);
+    }
+
+    const result = await p.query(sql, params);
+    return result.rowCount ?? 0;
+  } catch (e) {
+    console.error('[persist] clearTradesForAddress failed:', e);
+    return 0;
+  }
+}
+
+/**
+ * Validates position chain integrity for a given address and symbol.
+ * Checks if each fill's resulting_position matches the next fill's previous_position.
+ * Returns gaps where data is missing or corrupted.
+ */
+export async function validatePositionChain(
+  address: string,
+  symbol: 'BTC' | 'ETH' = 'ETH'
+): Promise<{ valid: boolean; gaps: Array<{ time: string; expected: number; actual: number }> }> {
+  try {
+    const p = await getPool();
+    const { rows } = await p.query(
+      `
+      SELECT
+        COALESCE((payload->>'at')::timestamptz, at) AS time_utc,
+        (payload->>'startPosition')::numeric AS previous_position,
+        (payload->>'startPosition')::numeric +
+        CASE payload->>'action'
+          WHEN 'Increase Long'  THEN (payload->>'size')::numeric
+          WHEN 'Open Long'      THEN (payload->>'size')::numeric
+          WHEN 'Decrease Long'  THEN -(payload->>'size')::numeric
+          WHEN 'Close Long'     THEN -(payload->>'size')::numeric
+          WHEN 'Increase Short' THEN -(payload->>'size')::numeric
+          WHEN 'Open Short'     THEN -(payload->>'size')::numeric
+          WHEN 'Decrease Short' THEN (payload->>'size')::numeric
+          WHEN 'Close Short'    THEN (payload->>'size')::numeric
+          ELSE (payload->>'size')::numeric
+        END AS resulting_position
+      FROM hl_events
+      WHERE type = 'trade'
+        AND LOWER(address) = LOWER($1)
+        AND COALESCE(payload->>'symbol', 'BTC') = $2
+      ORDER BY time_utc DESC
+      `,
+      [address, symbol]
+    );
+
+    const gaps: Array<{ time: string; expected: number; actual: number }> = [];
+
+    for (let i = 0; i < rows.length - 1; i++) {
+      const current = rows[i];
+      const next = rows[i + 1];
+
+      const currentPrev = Number(current.previous_position);
+      const nextResult = Number(next.resulting_position);
+
+      // Allow small floating point differences (0.0001)
+      if (Math.abs(currentPrev - nextResult) > 0.0001) {
+        gaps.push({
+          time: current.time_utc,
+          expected: nextResult,
+          actual: currentPrev,
+        });
+      }
+    }
+
+    return { valid: gaps.length === 0, gaps };
+  } catch (e) {
+    console.error('[persist] validatePositionChain failed:', e);
+    return { valid: false, gaps: [] };
   }
 }
 

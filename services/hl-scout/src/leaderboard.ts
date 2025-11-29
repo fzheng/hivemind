@@ -1,3 +1,19 @@
+/**
+ * Leaderboard Service Module
+ *
+ * Polls and scores the Hyperliquid leaderboard to identify top-performing traders.
+ * Uses a composite scoring formula that prioritizes:
+ * 1. Stability Score (50%) - smooth, controlled profit generation
+ * 2. Win Rate (25%) - with penalty for rates below 60%
+ * 3. Trade Frequency (15%) - with penalty for excessive trading
+ * 4. Realized PnL (10%) - tiebreaker for large accounts
+ *
+ * Enriches top performers with detailed statistics from Hyperliquid's info API
+ * and persists results to PostgreSQL for dashboard display.
+ *
+ * @module leaderboard
+ */
+
 import {
   createLogger,
   getPool,
@@ -8,15 +24,112 @@ import {
   DEFAULT_SCORING_PARAMS,
   removeCustomAccount,
   listCustomAccounts,
+  updateCustomAccountNickname,
   type ScoringParams
 } from '@hl/ts-lib';
 import type { CandidateEvent } from '@hl/ts-lib';
 
+/** Base URL for Hyperbot leaderboard API */
 const DEFAULT_API_URL = 'https://hyperbot.network/api/leaderboard/smart';
+/** Hyperbot address remarks batch API endpoint */
+const HYPERBOT_REMARKS_URL = 'https://hyperbot.network/api/leaderboard/smart/query-addr-remarks';
+/** Hyperliquid info API endpoint */
 const HYPERLIQUID_INFO_URL = 'https://api.hyperliquid.xyz/info';
+/** Maps window names to period days */
 const WINDOW_PERIOD_MAP: Record<string, number> = { day: 1, week: 7, month: 30 };
-const DEFAULT_STATS_CONCURRENCY = Number(process.env.LEADERBOARD_STATS_CONCURRENCY ?? 4);
+/** Concurrency limit for fetching address statistics (reduced from 4 to 2 for rate limit safety) */
+const DEFAULT_STATS_CONCURRENCY = Number(process.env.LEADERBOARD_STATS_CONCURRENCY ?? 2);
+/** Concurrency limit for fetching PnL series data */
 const DEFAULT_SERIES_CONCURRENCY = Number(process.env.LEADERBOARD_SERIES_CONCURRENCY ?? 2);
+/** Delay between paginated leaderboard requests in ms */
+const PAGE_REQUEST_DELAY_MS = Number(process.env.LEADERBOARD_PAGE_DELAY_MS ?? 500);
+/** Delay between individual API requests in ms (rate limiting) */
+const REQUEST_DELAY_MS = Number(process.env.HYPERBOT_REQUEST_DELAY_MS ?? 200);
+/** Cache TTL for address stats in ms (1 hour) */
+const STATS_CACHE_TTL_MS = Number(process.env.HYPERBOT_STATS_CACHE_TTL_MS ?? 60 * 60 * 1000);
+/** Cache TTL for BTC/ETH analysis in ms (1 hour) */
+const BTC_ETH_CACHE_TTL_MS = Number(process.env.HYPERBOT_BTC_ETH_CACHE_TTL_MS ?? 60 * 60 * 1000);
+/** Maximum cache size for LRU eviction */
+const MAX_CACHE_SIZE = Number(process.env.HYPERBOT_MAX_CACHE_SIZE ?? 500);
+
+/**
+ * Simple LRU cache with TTL support for Hyperbot API responses.
+ * Prevents excessive API calls by caching frequently requested data.
+ */
+class LRUCache<T> {
+  private cache = new Map<string, { value: T; expiresAt: number }>();
+  private maxSize: number;
+  private ttlMs: number;
+
+  constructor(maxSize: number, ttlMs: number) {
+    this.maxSize = maxSize;
+    this.ttlMs = ttlMs;
+  }
+
+  get(key: string): T | undefined {
+    const entry = this.cache.get(key);
+    if (!entry) return undefined;
+    if (Date.now() > entry.expiresAt) {
+      this.cache.delete(key);
+      return undefined;
+    }
+    // Move to end (most recently used)
+    this.cache.delete(key);
+    this.cache.set(key, entry);
+    return entry.value;
+  }
+
+  set(key: string, value: T): void {
+    // Delete if exists to update position
+    this.cache.delete(key);
+    // Evict oldest if at capacity
+    while (this.cache.size >= this.maxSize) {
+      const firstKey = this.cache.keys().next().value;
+      if (firstKey !== undefined) {
+        this.cache.delete(firstKey);
+      }
+    }
+    this.cache.set(key, { value, expiresAt: Date.now() + this.ttlMs });
+  }
+
+  clear(): void {
+    this.cache.clear();
+  }
+
+  get size(): number {
+    return this.cache.size;
+  }
+}
+
+/** Cache for address stats from Hyperbot */
+const addressStatsCache = new LRUCache<AddressStats>(MAX_CACHE_SIZE, STATS_CACHE_TTL_MS);
+/** Cache for BTC/ETH analysis results */
+const btcEthAnalysisCache = new LRUCache<BtcEthAnalysis>(MAX_CACHE_SIZE, BTC_ETH_CACHE_TTL_MS);
+
+/**
+ * Rate limiter to prevent excessive API calls.
+ * Uses token bucket algorithm with configurable delay between requests.
+ */
+class RateLimiter {
+  private lastRequestTime = 0;
+  private delayMs: number;
+
+  constructor(delayMs: number) {
+    this.delayMs = delayMs;
+  }
+
+  async acquire(): Promise<void> {
+    const now = Date.now();
+    const elapsed = now - this.lastRequestTime;
+    if (elapsed < this.delayMs) {
+      await sleep(this.delayMs - elapsed);
+    }
+    this.lastRequestTime = Date.now();
+  }
+}
+
+/** Rate limiter for Hyperbot API requests */
+const hyperbotRateLimiter = new RateLimiter(REQUEST_DELAY_MS);
 
 /**
  * Hyperbot leaderboard sort options
@@ -43,23 +156,38 @@ export enum LeaderboardSort {
 
 const DEFAULT_LEADERBOARD_SORT = LeaderboardSort.PNL;
 
+/**
+ * Raw entry from the Hyperbot leaderboard API.
+ * Contains basic trading statistics before scoring.
+ */
 type LeaderboardRawEntry = {
+  /** Ethereum address */
   address: string;
+  /** Win rate as decimal (0-1) */
   winRate?: number;
+  /** Total number of executed orders */
   executedOrders?: number;
+  /** Realized PnL in USD */
   realizedPnl?: number;
+  /** User remark/bio */
   remark?: string | null;
+  /** Account labels/tags */
   labels?: string[] | null;
+  /** Historical PnL time series */
   pnlList?: Array<{ timestamp: number; value: string }>;
-  // Additional fields for new scoring formula
+  /** Total account value in USD */
   accountValue?: number;
+  /** Starting equity for period */
   startingEquity?: number;
+  /** Maximum drawdown percentage */
   maxDrawdown?: number;
+  /** Number of winning trades */
   numWins?: number;
+  /** Number of losing trades */
   numLosses?: number;
   /** Timestamp (ms) of last operation - used for activity filtering */
   lastOperationAt?: number;
-  // Nested stats object from API (contains accurate maxDrawdown)
+  /** Nested stats object from API (contains accurate maxDrawdown) */
   stats?: {
     maxDrawdown?: number;
     totalPnl?: number;
@@ -70,28 +198,52 @@ type LeaderboardRawEntry = {
   };
 };
 
+/**
+ * Scored and ranked leaderboard entry.
+ * Contains composite score and all metrics for display.
+ */
 export type RankedEntry = {
+  /** Ethereum address */
   address: string;
+  /** Position in leaderboard (1 = best) */
   rank: number;
+  /** Composite performance score (higher = better) */
   score: number;
+  /** Weight for consensus calculations (score / sum of scores) */
   weight: number;
+  /** Whether entry was filtered out */
   filtered?: boolean;
+  /** Reason for filtering */
   filterReason?: 'not_profitable' | 'insufficient_data';
+  /** Win rate as decimal (0-1) */
   winRate: number;
+  /** Total executed orders */
   executedOrders: number;
+  /** Realized PnL in USD */
   realizedPnl: number;
+  /** PnL per trade efficiency */
   efficiency: number;
+  /** Consistency of PnL over time */
   pnlConsistency: number;
+  /** User remark/bio */
   remark: string | null;
+  /** Account labels */
   labels: string[];
+  /** Open position count from Hyperliquid stats */
   statOpenPositions: number | null;
+  /** Closed position count from Hyperliquid stats */
   statClosedPositions: number | null;
+  /** Average position duration in seconds */
   statAvgPosDuration: number | null;
+  /** Total PnL from Hyperliquid stats */
   statTotalPnl: number | null;
+  /** Max drawdown from Hyperliquid stats */
   statMaxDrawdown: number | null;
+  /** Additional metadata */
   meta: any;
 };
 
+/** Stats from Hyperliquid leaderboard stats API */
 type AddressStats = {
   winRate?: number;
   openPosCount?: number;
@@ -101,12 +253,14 @@ type AddressStats = {
   maxDrawdown?: number;
 };
 
+/** Portfolio PnL and equity history for a time window */
 type PortfolioWindowSeries = {
   window: string;
   pnlHistory: Array<{ ts: number; value: number }>;
   equityHistory: Array<{ ts: number; value: number }>;
 };
 
+/** Completed trade record from Hyperliquid */
 type CompletedTrade = {
   address: string;
   coin: string;
@@ -121,6 +275,7 @@ type CompletedTrade = {
   pnl: number;
 };
 
+/** Analysis of BTC and ETH trading performance */
 type BtcEthAnalysis = {
   btcPnl: number;
   ethPnl: number;
@@ -131,18 +286,51 @@ type BtcEthAnalysis = {
   reason?: string;
 };
 
+/**
+ * Configuration options for the LeaderboardService.
+ */
 export interface LeaderboardOptions {
+  /** Base URL for Hyperbot leaderboard API */
   apiUrl?: string;
+  /** Maximum entries to fetch from API */
   topN?: number;
+  /** Number of top entries to select for tracking */
   selectCount?: number;
+  /** Time periods to fetch (in days) */
   periods?: number[];
+  /** Page size for paginated API requests */
   pageSize?: number;
+  /** Refresh interval in milliseconds */
   refreshMs?: number;
+  /** Number of entries to enrich with detailed stats */
   enrichCount?: number;
   /** Sort order for leaderboard API (default: PNL) */
   sort?: LeaderboardSort;
 }
 
+/**
+ * Service for polling and scoring the Hyperliquid leaderboard.
+ *
+ * Responsibilities:
+ * - Periodically fetch leaderboard data from Hyperbot API
+ * - Score entries using composite performance formula
+ * - Enrich top performers with detailed Hyperliquid statistics
+ * - Persist results to PostgreSQL
+ * - Publish candidate events for downstream services
+ *
+ * @example
+ * ```typescript
+ * const service = new LeaderboardService({
+ *   topN: 1000,
+ *   selectCount: 12,
+ *   periods: [30],
+ *   refreshMs: 24 * 60 * 60 * 1000
+ * }, async (candidate) => {
+ *   await publishJson(js, 'a.candidates.v1', candidate);
+ * });
+ * service.start();
+ * ```
+ */
 export class LeaderboardService {
   private opts: Required<LeaderboardOptions>;
   private timer: NodeJS.Timeout | null = null;
@@ -153,6 +341,12 @@ export class LeaderboardService {
   private statsConcurrency: number;
   private seriesConcurrency: number;
 
+  /**
+   * Creates a new LeaderboardService.
+   *
+   * @param opts - Configuration options
+   * @param publishCandidate - Callback to publish candidate events to NATS
+   */
   constructor(opts: LeaderboardOptions, publishCandidate: (entry: CandidateEvent) => Promise<void>) {
     this.opts = {
       apiUrl: opts.apiUrl || DEFAULT_API_URL,
@@ -192,6 +386,11 @@ export class LeaderboardService {
         this.logger.error('leaderboard_period_failed', { period, err: err?.message });
       }
     }
+    // Log cache statistics after refresh
+    this.logger.info('hyperbot_cache_stats', {
+      addressStatsSize: addressStatsCache.size,
+      btcEthAnalysisSize: btcEthAnalysisCache.size,
+    });
   }
 
   async refreshPeriod(period: number) {
@@ -234,22 +433,35 @@ export class LeaderboardService {
     // Apply BTC/ETH filtering to get top qualified candidates
     const qualifiedCandidates = await this.filterBtcEthQualified(ranked, this.opts.selectCount);
 
-    // Persist with qualified flags
-    await this.persistPeriod(period, ranked, tracked, hyperliquidSeries);
-    await this.publishTopCandidates(period, qualifiedCandidates);
+    // Persist with qualified flags - returns false if skipped due to empty data
+    const persisted = await this.persistPeriod(period, ranked, tracked, hyperliquidSeries);
 
-    this.logger.info('leaderboard_updated', {
-      period,
-      count: ranked.length,
-      qualified: qualifiedCandidates.length,
-      target: this.opts.selectCount
-    });
+    if (persisted) {
+      await this.publishTopCandidates(period, qualifiedCandidates);
+      this.logger.info('leaderboard_updated', {
+        period,
+        count: ranked.length,
+        qualified: qualifiedCandidates.length,
+        target: this.opts.selectCount
+      });
+    } else {
+      // Log that refresh was skipped - operators can detect upstream outages
+      this.logger.warn('leaderboard_refresh_skipped', {
+        period,
+        reason: 'empty_upstream_data',
+        message: 'Upstream API returned empty data; serving stale snapshot',
+      });
+    }
   }
 
   private async fetchPeriod(period: number): Promise<LeaderboardRawEntry[]> {
     const results: LeaderboardRawEntry[] = [];
     const pagesNeeded = Math.ceil(this.opts.topN / this.opts.pageSize);
     for (let page = 1; page <= pagesNeeded; page += 1) {
+      // Rate limit between paginated requests to avoid hitting API limits
+      if (page > 1) {
+        await sleep(PAGE_REQUEST_DELAY_MS);
+      }
       const url = `${this.opts.apiUrl}?pageNum=${page}&pageSize=${this.opts.pageSize}&period=${period}&sort=${this.opts.sort}`;
       const res = await fetch(url);
       if (!res.ok) throw new Error(`leaderboard HTTP ${res.status}`);
@@ -258,6 +470,11 @@ export class LeaderboardService {
       results.push(...data);
       if (data.length < this.opts.pageSize) break;
     }
+    this.logger.info('leaderboard_fetched', {
+      period,
+      pages: Math.min(pagesNeeded, Math.ceil(results.length / this.opts.pageSize)),
+      entries: results.length,
+    });
     return results.slice(0, this.opts.topN);
   }
 
@@ -271,24 +488,40 @@ export class LeaderboardService {
    * 4. Realized PnL (10%) - tiebreaker for large accounts
    */
   private scoreEntries(entries: LeaderboardRawEntry[]): RankedEntry[] {
-    // Build scoring params from defaults with optional env overrides
+    // Helper to safely parse env numbers with fallback to default on NaN/invalid values
+    const parseEnvNumber = (envKey: string, defaultValue: number): number => {
+      const envValue = process.env[envKey];
+      if (envValue === undefined) return defaultValue;
+      const parsed = Number(envValue);
+      if (!Number.isFinite(parsed)) {
+        this.logger.warn('invalid_env_number', {
+          key: envKey,
+          value: envValue,
+          usingDefault: defaultValue,
+        });
+        return defaultValue;
+      }
+      return parsed;
+    };
+
+    // Build scoring params from defaults with optional env overrides (validated)
     const scoringParams: ScoringParams = {
-      stabilityWeight: Number(process.env.SCORING_STABILITY_WEIGHT ?? DEFAULT_SCORING_PARAMS.stabilityWeight),
-      winRateWeight: Number(process.env.SCORING_WIN_RATE_WEIGHT ?? DEFAULT_SCORING_PARAMS.winRateWeight),
-      tradeFreqWeight: Number(process.env.SCORING_TRADE_FREQ_WEIGHT ?? DEFAULT_SCORING_PARAMS.tradeFreqWeight),
-      pnlWeight: Number(process.env.SCORING_PNL_WEIGHT ?? DEFAULT_SCORING_PARAMS.pnlWeight),
-      pnlReference: Number(process.env.SCORING_PNL_REFERENCE ?? DEFAULT_SCORING_PARAMS.pnlReference),
-      minTrades: Number(process.env.SCORING_MIN_TRADES ?? DEFAULT_SCORING_PARAMS.minTrades),
-      maxTrades: Number(process.env.SCORING_MAX_TRADES ?? DEFAULT_SCORING_PARAMS.maxTrades),
-      tradeCountThreshold: Number(process.env.SCORING_TRADE_COUNT_THRESHOLD ?? DEFAULT_SCORING_PARAMS.tradeCountThreshold),
-      winRateThreshold: Number(process.env.SCORING_WIN_RATE_THRESHOLD ?? DEFAULT_SCORING_PARAMS.winRateThreshold),
-      drawdownTolerance: Number(process.env.SCORING_DRAWDOWN_TOLERANCE ?? DEFAULT_SCORING_PARAMS.drawdownTolerance),
-      downsideTolerance: Number(process.env.SCORING_DOWNSIDE_TOLERANCE ?? DEFAULT_SCORING_PARAMS.downsideTolerance),
+      stabilityWeight: parseEnvNumber('SCORING_STABILITY_WEIGHT', DEFAULT_SCORING_PARAMS.stabilityWeight),
+      winRateWeight: parseEnvNumber('SCORING_WIN_RATE_WEIGHT', DEFAULT_SCORING_PARAMS.winRateWeight),
+      tradeFreqWeight: parseEnvNumber('SCORING_TRADE_FREQ_WEIGHT', DEFAULT_SCORING_PARAMS.tradeFreqWeight),
+      pnlWeight: parseEnvNumber('SCORING_PNL_WEIGHT', DEFAULT_SCORING_PARAMS.pnlWeight),
+      pnlReference: parseEnvNumber('SCORING_PNL_REFERENCE', DEFAULT_SCORING_PARAMS.pnlReference),
+      minTrades: parseEnvNumber('SCORING_MIN_TRADES', DEFAULT_SCORING_PARAMS.minTrades),
+      maxTrades: parseEnvNumber('SCORING_MAX_TRADES', DEFAULT_SCORING_PARAMS.maxTrades),
+      tradeCountThreshold: parseEnvNumber('SCORING_TRADE_COUNT_THRESHOLD', DEFAULT_SCORING_PARAMS.tradeCountThreshold),
+      winRateThreshold: parseEnvNumber('SCORING_WIN_RATE_THRESHOLD', DEFAULT_SCORING_PARAMS.winRateThreshold),
+      drawdownTolerance: parseEnvNumber('SCORING_DRAWDOWN_TOLERANCE', DEFAULT_SCORING_PARAMS.drawdownTolerance),
+      downsideTolerance: parseEnvNumber('SCORING_DOWNSIDE_TOLERANCE', DEFAULT_SCORING_PARAMS.downsideTolerance),
     };
 
     // Hard filters applied before scoring
-    const maxTrades = Number(process.env.SCORING_MAX_TRADES ?? scoringParams.maxTrades);
-    const inactivityDays = Number(process.env.SCORING_INACTIVITY_DAYS ?? 14);
+    const maxTrades = parseEnvNumber('SCORING_MAX_TRADES', scoringParams.maxTrades);
+    const inactivityDays = parseEnvNumber('SCORING_INACTIVITY_DAYS', 14);
     const inactivityThresholdMs = inactivityDays * 24 * 60 * 60 * 1000;
     const now = Date.now();
 
@@ -456,12 +689,24 @@ export class LeaderboardService {
 
   private async fetchAddressStat(address: string, period: number): Promise<AddressStats | null> {
     const normalized = normalizeAddress(address);
+    const cacheKey = `${normalized}:${period}`;
+
+    // Check cache first
+    const cached = addressStatsCache.get(cacheKey);
+    if (cached) {
+      this.logger.debug?.('addr_stat_cache_hit', { address: normalized, period });
+      return cached;
+    }
+
+    // Rate limit before making request
+    await hyperbotRateLimiter.acquire();
+
     const url = `${this.smartApiBase}query-addr-stat/${encodeURIComponent(normalized)}?period=${period}`;
     try {
       const payload = await this.requestJson<any>(url, { method: 'GET' }, 2, 6000);
       const data = payload?.data;
       if (!data) return null;
-      return {
+      const stats: AddressStats = {
         winRate: typeof data.winRate === 'number' ? data.winRate : undefined,
         openPosCount: Number.isFinite(Number(data.openPosCount)) ? Number(data.openPosCount) : undefined,
         closePosCount: Number.isFinite(Number(data.closePosCount)) ? Number(data.closePosCount) : undefined,
@@ -469,10 +714,66 @@ export class LeaderboardService {
         totalPnl: Number.isFinite(Number(data.totalPnl)) ? Number(data.totalPnl) : undefined,
         maxDrawdown: Number.isFinite(Number(data.maxDrawdown)) ? Number(data.maxDrawdown) : undefined,
       };
+      // Cache the result
+      addressStatsCache.set(cacheKey, stats);
+      return stats;
     } catch (err: any) {
       this.logger.warn('addr_stat_fetch_failed', { address: normalized, period, err: err?.message });
       return null;
     }
+  }
+
+  /**
+   * Fetch address remarks (nicknames) from Hyperbot batch API.
+   * Much faster than fetching the entire leaderboard.
+   * This is already a batch API, so it's naturally efficient.
+   *
+   * API: POST https://hyperbot.network/api/leaderboard/smart/query-addr-remarks
+   * Payload: ["0xaddress1", "0xaddress2", ...]
+   * Response: { code: 0, msg: "SUCCESS", data: [{ address: "0x...", remark: "nickname" }, ...] }
+   */
+  async fetchAddressRemarks(addresses: string[]): Promise<Map<string, string>> {
+    const result = new Map<string, string>();
+    if (!addresses.length) return result;
+
+    const normalizedAddresses = addresses.map(a => normalizeAddress(a));
+
+    // Rate limit before making request
+    await hyperbotRateLimiter.acquire();
+
+    try {
+      const payload = await this.requestJson<{
+        code: number;
+        msg: string;
+        data?: Array<{ address: string; remark?: string | null }>;
+      }>(
+        HYPERBOT_REMARKS_URL,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(normalizedAddresses),
+        },
+        2,
+        8000
+      );
+
+      if (payload?.code === 0 && Array.isArray(payload.data)) {
+        for (const item of payload.data) {
+          if (item.remark && typeof item.remark === 'string' && item.remark.trim()) {
+            result.set(normalizeAddress(item.address), item.remark.trim());
+          }
+        }
+      }
+
+      this.logger.info('address_remarks_fetched', {
+        requested: addresses.length,
+        found: result.size,
+      });
+    } catch (err: any) {
+      this.logger.warn('address_remarks_fetch_failed', { err: err?.message });
+    }
+
+    return result;
   }
 
   private async fetchPortfolioSeriesBatch(
@@ -525,11 +826,32 @@ export class LeaderboardService {
    * Fetch and analyze BTC/ETH trades for an address.
    * Returns analysis of BTC+ETH PnL contribution to total PnL.
    * Only considers trades lasting at least 10 minutes (excludes scalping).
+   * Results are cached to reduce API calls.
    *
    * API: GET https://hyperbot.network/api/leaderboard/smart/completed-trades/{address}?take=2000
    */
   private async analyzeBtcEthTrades(address: string, totalPnl: number): Promise<BtcEthAnalysis> {
     const normalized = normalizeAddress(address);
+
+    // Check cache first (cache key includes address only, not totalPnl since trades don't change)
+    const cached = btcEthAnalysisCache.get(normalized);
+    if (cached) {
+      this.logger.debug?.('btc_eth_cache_hit', { address: normalized });
+      // Recalculate ratio with current totalPnl (in case it changed)
+      const btcEthRatio = totalPnl !== 0 ? Math.abs(cached.btcEthPnl / totalPnl) : 0;
+      const qualified = cached.btcEthPnl >= 0 && btcEthRatio >= 0.10;
+      return {
+        ...cached,
+        totalPnl,
+        btcEthRatio,
+        qualified,
+        reason: !qualified ? (cached.btcEthPnl < 0 ? 'btc_eth_negative_pnl' : 'btc_eth_insufficient_contribution') : undefined,
+      };
+    }
+
+    // Rate limit before making request
+    await hyperbotRateLimiter.acquire();
+
     const url = `${this.smartApiBase}completed-trades/${encodeURIComponent(normalized)}?take=2000`;
     const MIN_TRADE_DURATION_MS = 10 * 60 * 1000; // 10 minutes
 
@@ -583,7 +905,7 @@ export class LeaderboardService {
         reason = 'btc_eth_insufficient_contribution';
       }
 
-      return {
+      const result: BtcEthAnalysis = {
         btcPnl,
         ethPnl,
         totalPnl,
@@ -592,6 +914,11 @@ export class LeaderboardService {
         qualified,
         reason,
       };
+
+      // Cache the result (store btcPnl, ethPnl, btcEthPnl for reuse)
+      btcEthAnalysisCache.set(normalized, result);
+
+      return result;
     } catch (err: any) {
       this.logger.warn('btc_eth_analysis_failed', { address: normalized, err: err?.message });
       // On error, assume not qualified to be conservative
@@ -709,17 +1036,20 @@ export class LeaderboardService {
     entries: RankedEntry[],
     tracked: RankedEntry[],
     hyperliquidSeries: Map<string, PortfolioWindowSeries[]>
-  ): Promise<void> {
+  ): Promise<boolean> {
+    // Guard: Do NOT delete existing data if new fetch returned empty/error
+    // This prevents wiping the leaderboard when upstream API fails
+    if (!entries.length) {
+      return false;
+    }
+
     const pool = await getPool();
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      // Safe to delete now - we have valid new data to replace it with
       await client.query('DELETE FROM hl_leaderboard_entries WHERE period_days = $1', [period]);
       await client.query('DELETE FROM hl_leaderboard_pnl_points WHERE period_days = $1', [period]);
-      if (!entries.length) {
-        await client.query('COMMIT');
-        return;
-      }
     const chunkSize = 100;
     for (let i = 0; i < entries.length; i += chunkSize) {
       const chunk = entries.slice(i, i + chunkSize);
@@ -792,6 +1122,7 @@ export class LeaderboardService {
       await this.insertPnlPointsInTransaction(client, period, tracked, hyperliquidSeries);
     }
       await client.query('COMMIT');
+      return true;
     } catch (err) {
       await client.query('ROLLBACK');
       this.logger.error('leaderboard_persist_failed', { period, err: err instanceof Error ? err.message : String(err) });
@@ -1105,25 +1436,21 @@ export class LeaderboardService {
     // Fetch stats from Hyperbot API
     const stats = await this.fetchAddressStat(normalized, period);
 
-    // Also try to find the account in the raw leaderboard API to get pnlList for proper scoring
-    let pnlList: Array<{ timestamp: number; value: string }> | undefined;
-    let rawWinRate = stats?.winRate ?? 0;
-    let rawExecutedOrders = (stats?.openPosCount ?? 0) + (stats?.closePosCount ?? 0);
-    let rawRealizedPnl = stats?.totalPnl ?? 0;
+    // Extract stats for scoring
+    const rawWinRate = stats?.winRate ?? 0;
+    const rawExecutedOrders = (stats?.openPosCount ?? 0) + (stats?.closePosCount ?? 0);
+    const rawRealizedPnl = stats?.totalPnl ?? 0;
 
+    // Fetch remark from Hyperbot batch API (much faster than fetching entire leaderboard)
+    let apiRemark: string | null = null;
     try {
-      // Fetch the raw leaderboard to find this address and get its pnlList
-      const raw = await this.fetchPeriod(period);
-      const found = raw.find(e => normalizeAddress(e.address) === normalized);
-      if (found) {
-        pnlList = found.pnlList;
-        rawWinRate = found.winRate ?? rawWinRate;
-        rawExecutedOrders = found.executedOrders ?? rawExecutedOrders;
-        rawRealizedPnl = found.realizedPnl ?? rawRealizedPnl;
-        this.logger.info('custom_account_found_in_leaderboard', { address: normalized });
+      const remarks = await this.fetchAddressRemarks([normalized]);
+      apiRemark = remarks.get(normalized) ?? null;
+      if (apiRemark) {
+        this.logger.info('custom_account_remark_fetched', { address: normalized, apiRemark });
       }
     } catch (err: any) {
-      this.logger.warn('custom_account_leaderboard_fetch_failed', { address: normalized, err: err?.message });
+      this.logger.warn('custom_account_remark_fetch_failed', { address: normalized, err: err?.message });
     }
 
     // Compute proper score using the scoring algorithm (same as system accounts)
@@ -1136,7 +1463,7 @@ export class LeaderboardService {
       numTrades: rawExecutedOrders,
       numWins,
       numLosses,
-      pnlList: pnlList?.map(p => parseFloat(p.value)) ?? [],
+      pnlList: [], // pnlList not available from stats API; stability score defaults to 0.5
     }, DEFAULT_SCORING_PARAMS, { computeFullScore: true });
 
     // Build the entry with computed score
@@ -1150,7 +1477,7 @@ export class LeaderboardService {
       realizedPnl: rawRealizedPnl,
       efficiency: rawRealizedPnl && rawExecutedOrders ? rawRealizedPnl / Math.max(1, rawExecutedOrders) : 0,
       pnlConsistency: scoringResult.details.stabilityScore,
-      remark: nickname ?? null,
+      remark: nickname ?? apiRemark ?? null, // Use user nickname, fallback to API remark
       labels: ['custom'],
       statOpenPositions: stats?.openPosCount ?? null,
       statClosedPositions: stats?.closePosCount ?? null,
@@ -1218,6 +1545,18 @@ export class LeaderboardService {
         ]
       );
       this.logger.info('custom_account_stats_stored', { address: normalized, period, stats });
+
+      // If we auto-fetched a nickname from the API and user didn't provide one,
+      // also update the hl_custom_accounts table so it persists
+      if (!nickname && apiRemark) {
+        try {
+          await updateCustomAccountNickname(normalized, apiRemark);
+          this.logger.info('custom_account_nickname_auto_filled', { address: normalized, nickname: apiRemark });
+        } catch (nickErr: any) {
+          this.logger.warn('custom_account_nickname_update_failed', { address: normalized, err: nickErr?.message });
+        }
+      }
+
       return entry;
     } catch (err: any) {
       this.logger.error('custom_account_stats_store_failed', { address: normalized, err: err?.message });

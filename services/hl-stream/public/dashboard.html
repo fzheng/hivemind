@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-    <title>HL Trader Intelligence</title>
+    <title>HyperMind</title>
     <link rel="stylesheet" href="/dashboard/static/dashboard.css" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -17,13 +17,24 @@
   <body>
     <header>
       <div class="header-left">
-        <h1>HL Trader Intelligence</h1>
-        <p id="dashboard-status">Loading stats…</p>
+        <span class="brand-name">HyperMind</span>
+        <span class="brand-separator"></span>
+        <span class="live-clock" id="live-clock">--:--:--</span>
       </div>
-      <div style="display: flex; gap: 12px; align-items: center;">
-        <div class="period-toggle">
-          <span class="period-label">Last 30 Days</span>
+      <div class="header-center">
+        <div class="price-ticker">
+          <div class="price-item" id="btc-price-item">
+            <span class="price-symbol">BTC</span>
+            <span class="price-value" id="btc-price">—</span>
+          </div>
+          <div class="price-divider"></div>
+          <div class="price-item" id="eth-price-item">
+            <span class="price-symbol">ETH</span>
+            <span class="price-value" id="eth-price">—</span>
+          </div>
         </div>
+      </div>
+      <div class="header-right">
         <div class="theme-toggle">
           <button data-theme="dark" title="Dark theme">
             <svg viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
@@ -38,29 +49,81 @@
       </div>
     </header>
     <main>
-      <section class="card">
-        <div class="toggle-group">
-          <button class="active" data-symbol="BTCUSDT">BTC</button>
-          <button data-symbol="ETHUSDT">ETH</button>
+      <!-- Row 1: Chart (full width, collapsible) -->
+      <section class="chart-section">
+        <div class="card chart-card">
+          <div class="chart-header">
+            <div class="toggle-group">
+              <button class="active" data-symbol="BTCUSDT">BTC</button>
+              <button data-symbol="ETHUSDT">ETH</button>
+            </div>
+            <button class="chart-collapse-btn" id="chart-collapse-btn" title="Collapse chart">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M18 15l-6-6-6 6"/>
+              </svg>
+            </button>
+          </div>
+          <div id="tradingview_chart" class="chart-container"></div>
         </div>
-        <div id="tradingview_chart" class="chart-container"></div>
       </section>
 
-      <section class="grid-2">
-        <div class="card">
+      <!-- Row 2: AI Trade Signals (full width) -->
+      <section class="ai-section">
+        <div class="card ai-recommendations-card">
           <div class="card-header">
-            <h3>Top Performance (Last 30 Days)</h3>
+            <h3>
+              <span class="ai-icon">⚡</span>
+              AI Signals
+              <span class="panel-subtitle">Generated from tracked trader patterns</span>
+            </h3>
             <div class="card-actions">
-              <span id="last-refresh" class="last-refresh">Last updated: —</span>
+              <span class="ai-status" id="ai-status">
+                <span class="ai-status-dot"></span>
+                Analyzing...
+              </span>
+              <span class="ai-disclaimer-inline">
+                <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
+                Not financial advice
+              </span>
+            </div>
+          </div>
+          <div class="ai-signals-container">
+            <table class="ai-signals-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Symbol</th>
+                  <th>Action</th>
+                  <th>Entry Price</th>
+                  <th>Stop Loss</th>
+                  <th>Take Profit</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="ai-recommendations-table"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- Row 3: Tracked Traders + Trader Activity (side by side) -->
+      <section class="grid-bottom">
+        <div class="card leaderboard-card">
+          <div class="card-header">
+            <h3>
+              Tracked Traders
+              <span class="panel-subtitle">Top performers (30-day) + custom accounts</span>
+            </h3>
+            <div class="card-actions">
+              <span id="last-refresh" class="last-refresh">Updated: —</span>
               <button id="refresh-btn" class="refresh-btn" title="Refresh leaderboard">
-                <svg class="refresh-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                <svg class="refresh-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
                   <path d="M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
                 </svg>
-                <span>Refresh</span>
               </button>
             </div>
           </div>
-          <span class="metric-hint">Live leaderboard data from Hyperliquid. Ranked by composite performance score. <span class="custom-badge">★</span> indicates custom-tracked accounts.</span>
+          <span class="metric-hint">AI analyzes these traders to generate signals. <span class="custom-badge">★</span> = custom</span>
 
           <!-- Custom Accounts Section -->
           <div class="custom-accounts-section">
@@ -68,46 +131,42 @@
               <span>Custom Accounts (<span id="custom-count">0</span>/3)</span>
             </div>
             <div class="custom-accounts-form">
-              <input type="text" id="custom-address-input" placeholder="Enter Ethereum address (0x...)" maxlength="42" />
-              <input type="text" id="custom-nickname-input" placeholder="Nickname (optional)" maxlength="32" />
-              <button id="add-custom-btn" class="add-custom-btn" title="Add custom account">Add</button>
+              <input type="text" id="custom-address-input" placeholder="0x..." maxlength="42" />
+              <input type="text" id="custom-nickname-input" placeholder="Nickname" maxlength="32" />
+              <button id="add-custom-btn" class="add-custom-btn" title="Add">+</button>
             </div>
             <div id="custom-accounts-error" class="custom-accounts-error"></div>
           </div>
 
-          <div class="table-wrapper">
-            <table class="stats-table">
+          <div class="leaderboard-table-container">
+            <table class="stats-table leaderboard-table">
               <thead>
                 <tr>
                   <th>Address</th>
-                  <th>Win Rate</th>
+                  <th>Win%</th>
                   <th>Trades</th>
                   <th>Holdings</th>
-                  <th>Realized PnL</th>
-                  <th>Score</th>
+                  <th>PnL</th>
+                  <th>30D Curve</th>
                 </tr>
               </thead>
               <tbody id="address-table"></tbody>
             </table>
           </div>
         </div>
-        <div class="card">
-          <h3>Recommendation</h3>
-          <div class="recommendation" id="recommendation-card">
-            <p>Waiting for data…</p>
-          </div>
-        </div>
-      </section>
-
-      <section class="grid-2">
         <div class="card fills-card">
           <div class="card-header">
-            <h3>Live Fills (BTC/ETH)</h3>
+            <h3>
+              <span class="live-dot" title="Live"></span>
+              Trader Activity
+              <span class="panel-subtitle">Real-time fills from tracked accounts</span>
+            </h3>
             <div class="fills-meta">
-              <span id="fills-time-range" class="time-range">No fills yet</span>
+              <span id="fills-count" class="fills-count">0 fills</span>
+              <span id="fills-time-range" class="time-range">—</span>
             </div>
           </div>
-          <div class="table-wrapper fills-scroll-container" id="fills-scroll-container">
+          <div class="fills-scroll-container" id="fills-scroll-container">
             <table class="stats-table fills-table">
               <thead>
                 <tr>
@@ -115,25 +174,25 @@
                   <th>Address</th>
                   <th>Action</th>
                   <th>Size</th>
-                  <th>Previous Position</th>
+                  <th>Prev</th>
                   <th>Price</th>
-                  <th>Closed PnL</th>
+                  <th>PnL</th>
                 </tr>
               </thead>
               <tbody id="fills-table"></tbody>
             </table>
             <div id="fills-load-more" class="load-more-indicator" style="display: none;">
               <span class="load-more-spinner"></span>
-              <span>Loading more fills...</span>
-            </div>
-            <div id="fills-load-history" class="load-history-btn-container">
-              <button id="load-history-btn" class="load-history-btn">Load Historical Fills</button>
+              <span>Loading...</span>
             </div>
           </div>
-        </div>
-        <div class="card">
-          <h3>Decisions</h3>
-          <ul class="decisions-list" id="decisions-list"></ul>
+          <div class="fills-status-bar" id="fills-status-bar">
+            <span class="fills-status-text" id="fills-status-text">
+              <span class="status-icon">📊</span>
+              <span id="fills-status-message">Waiting for fills...</span>
+            </span>
+            <button id="load-history-btn" class="load-history-btn">Load More</button>
+          </div>
         </div>
       </section>
     </main>

@@ -1,6 +1,17 @@
 import { fetchWithRetry } from './utils';
 import type { PriceInfo } from './types';
 
+// BTC price state
+let currentBtcPrice: number | null = null;
+let btcUpdatedAt: string | null = null;
+let btcPriceSource: 'ws' | 'http' | 'unknown' = 'unknown';
+
+// ETH price state
+let currentEthPrice: number | null = null;
+let ethUpdatedAt: string | null = null;
+let ethPriceSource: 'ws' | 'http' | 'unknown' = 'unknown';
+
+// Legacy alias for backward compatibility
 let currentPrice: number | null = null;
 let updatedAt: string | null = null;
 let priceSource: 'ws' | 'http' | 'unknown' = 'unknown';
@@ -10,12 +21,49 @@ let wsSub: any | null = null;
 let activeUser: string | null = null;
 let provider: (() => Promise<string[]>) | null = null;
 
-function setPrice(p: number, source: 'ws' | 'http') {
-  if (Number.isFinite(p)) {
-    currentPrice = p;
-    updatedAt = new Date().toISOString();
-    priceSource = source;
+// Price change listeners for real-time updates
+type PriceChangeListener = (prices: { btc: number | null; eth: number | null }) => void;
+const priceChangeListeners: Set<PriceChangeListener> = new Set();
+
+export function onPriceChange(listener: PriceChangeListener): () => void {
+  priceChangeListeners.add(listener);
+  return () => priceChangeListeners.delete(listener);
+}
+
+function notifyPriceChange() {
+  const prices = { btc: currentBtcPrice, eth: currentEthPrice };
+  for (const listener of priceChangeListeners) {
+    try {
+      listener(prices);
+    } catch {}
   }
+}
+
+function setBtcPrice(p: number, source: 'ws' | 'http') {
+  if (Number.isFinite(p)) {
+    currentBtcPrice = p;
+    btcUpdatedAt = new Date().toISOString();
+    btcPriceSource = source;
+    // Legacy compatibility
+    currentPrice = p;
+    updatedAt = btcUpdatedAt;
+    priceSource = source;
+    notifyPriceChange();
+  }
+}
+
+function setEthPrice(p: number, source: 'ws' | 'http') {
+  if (Number.isFinite(p)) {
+    currentEthPrice = p;
+    ethUpdatedAt = new Date().toISOString();
+    ethPriceSource = source;
+    notifyPriceChange();
+  }
+}
+
+// Legacy function for backward compatibility
+function setPrice(p: number, source: 'ws' | 'http') {
+  setBtcPrice(p, source);
 }
 
 type SubscribeFn = (user: string, listener: (evt: any) => void) => Promise<{ unsubscribe?: () => Promise<void> } | null>;
@@ -42,10 +90,19 @@ async function startWs(user: string) {
     try {
       const meta = evt.meta; // MetaResponse
       const ctxs = evt.assetCtxs; // contexts array
-      const idx = meta.universe.findIndex((u: any) => String(u?.name).toUpperCase() === 'BTC');
-      if (idx >= 0 && ctxs[idx]?.markPx) {
-        const px = Number(ctxs[idx].markPx);
-        if (Number.isFinite(px)) setPrice(px, 'ws');
+
+      // Find BTC price
+      const btcIdx = meta.universe.findIndex((u: any) => String(u?.name).toUpperCase() === 'BTC');
+      if (btcIdx >= 0 && ctxs[btcIdx]?.markPx) {
+        const px = Number(ctxs[btcIdx].markPx);
+        if (Number.isFinite(px)) setBtcPrice(px, 'ws');
+      }
+
+      // Find ETH price
+      const ethIdx = meta.universe.findIndex((u: any) => String(u?.name).toUpperCase() === 'ETH');
+      if (ethIdx >= 0 && ctxs[ethIdx]?.markPx) {
+        const px = Number(ctxs[ethIdx].markPx);
+        if (Number.isFinite(px)) setEthPrice(px, 'ws');
       }
     } catch {}
   });
@@ -75,7 +132,21 @@ export async function refreshPriceFeed() {
 }
 
 export function getCurrentBtcPrice(): { symbol: string; price: number | null; updatedAt: string | null; source: string } {
-  return { symbol: 'BTCUSD', price: currentPrice, updatedAt, source: priceSource };
+  return { symbol: 'BTCUSD', price: currentBtcPrice, updatedAt: btcUpdatedAt, source: btcPriceSource };
+}
+
+export function getCurrentEthPrice(): { symbol: string; price: number | null; updatedAt: string | null; source: string } {
+  return { symbol: 'ETHUSD', price: currentEthPrice, updatedAt: ethUpdatedAt, source: ethPriceSource };
+}
+
+export function getCurrentPrices(): {
+  btc: { price: number | null; updatedAt: string | null };
+  eth: { price: number | null; updatedAt: string | null };
+} {
+  return {
+    btc: { price: currentBtcPrice, updatedAt: btcUpdatedAt },
+    eth: { price: currentEthPrice, updatedAt: ethUpdatedAt },
+  };
 }
 
 // Test-only hooks (no side effects in production)
@@ -83,11 +154,19 @@ export function __setSubscribeWebData2ForTest(fn: SubscribeFn) {
   subscribeWebData2Impl = fn;
 }
 export async function __resetPriceForTest() {
+  currentBtcPrice = null;
+  btcUpdatedAt = null;
+  btcPriceSource = 'unknown';
+  currentEthPrice = null;
+  ethUpdatedAt = null;
+  ethPriceSource = 'unknown';
+  // Legacy
   currentPrice = null;
   updatedAt = null;
   priceSource = 'unknown';
   activeUser = null;
   provider = null;
+  priceChangeListeners.clear();
   if (wsSub) {
     try { await wsSub.unsubscribe?.(); } catch {}
   }

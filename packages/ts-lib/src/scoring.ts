@@ -5,7 +5,7 @@
  * The formula prioritizes:
  * 1. Stability Score - smooth, controlled drawdown profit ability (most important)
  * 2. Win Rate - with progressive penalty for win rate < 60%
- * 3. Trade Count - progressive penalty for > 150 trades per 30 days
+ * 3. Trade Count - progressive penalty for > 100 trades per 30 days
  * 4. Realized PnL - tiebreaker for accounts with similar stability scores
  *
  * @module scoring

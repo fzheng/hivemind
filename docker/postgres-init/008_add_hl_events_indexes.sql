@@ -1,4 +1,4 @@
--- 006_add_hl_events_indexes.sql
+-- Migration 008: Add hl_events indexes
 -- Add composite indexes to accelerate time-based trade queries.
 -- Global chronological trade index and per-address chronological index.
 
