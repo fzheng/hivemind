@@ -3,7 +3,205 @@
  * Covers formatting, normalization, and helper utilities
  */
 
-import { normalizeAddress } from '../packages/ts-lib/src/utils';
+import {
+  normalizeAddress,
+  clamp,
+  nowIso,
+  sleep,
+  fetchWithRetry,
+} from '../packages/ts-lib/src/utils';
+
+// Mock global fetch for fetchWithRetry tests
+const mockFetch = jest.fn();
+global.fetch = mockFetch;
+
+describe('clamp', () => {
+  test('returns value when within range', () => {
+    expect(clamp(5, 0, 10)).toBe(5);
+  });
+
+  test('returns min when value is below range', () => {
+    expect(clamp(-5, 0, 10)).toBe(0);
+  });
+
+  test('returns max when value is above range', () => {
+    expect(clamp(15, 0, 10)).toBe(10);
+  });
+
+  test('handles edge case at min boundary', () => {
+    expect(clamp(0, 0, 10)).toBe(0);
+  });
+
+  test('handles edge case at max boundary', () => {
+    expect(clamp(10, 0, 10)).toBe(10);
+  });
+
+  test('handles negative ranges', () => {
+    expect(clamp(-5, -10, -1)).toBe(-5);
+    expect(clamp(0, -10, -1)).toBe(-1);
+    expect(clamp(-15, -10, -1)).toBe(-10);
+  });
+
+  test('handles fractional values', () => {
+    expect(clamp(0.5, 0, 1)).toBe(0.5);
+    expect(clamp(-0.1, 0, 1)).toBe(0);
+    expect(clamp(1.5, 0, 1)).toBe(1);
+  });
+});
+
+describe('nowIso', () => {
+  test('returns ISO 8601 formatted string', () => {
+    const result = nowIso();
+    // ISO format: YYYY-MM-DDTHH:mm:ss.sssZ
+    expect(result).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+  });
+
+  test('returns current time (within 1 second)', () => {
+    const before = Date.now();
+    const result = nowIso();
+    const after = Date.now();
+    const resultTime = new Date(result).getTime();
+    expect(resultTime).toBeGreaterThanOrEqual(before);
+    expect(resultTime).toBeLessThanOrEqual(after);
+  });
+});
+
+describe('sleep', () => {
+  test('resolves after specified delay', async () => {
+    const start = Date.now();
+    await sleep(50);
+    const elapsed = Date.now() - start;
+    // Allow some tolerance for timing
+    expect(elapsed).toBeGreaterThanOrEqual(40);
+    expect(elapsed).toBeLessThan(150);
+  });
+
+  test('resolves immediately for 0ms', async () => {
+    const start = Date.now();
+    await sleep(0);
+    const elapsed = Date.now() - start;
+    expect(elapsed).toBeLessThan(50);
+  });
+});
+
+describe('fetchWithRetry', () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+  });
+
+  test('returns data on successful fetch', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ data: 'test' }),
+    });
+
+    const result = await fetchWithRetry('https://api.test.com', {});
+    expect(result).toEqual({ data: 'test' });
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  test('retries on HTTP error and succeeds', async () => {
+    mockFetch
+      .mockResolvedValueOnce({ ok: false, status: 500 })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ data: 'success' }),
+      });
+
+    const result = await fetchWithRetry(
+      'https://api.test.com',
+      {},
+      { retries: 2, baseDelayMs: 10 }
+    );
+    expect(result).toEqual({ data: 'success' });
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  test('retries on network error and succeeds', async () => {
+    mockFetch
+      .mockRejectedValueOnce(new Error('Network error'))
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ data: 'recovered' }),
+      });
+
+    const result = await fetchWithRetry(
+      'https://api.test.com',
+      {},
+      { retries: 2, baseDelayMs: 10 }
+    );
+    expect(result).toEqual({ data: 'recovered' });
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  test('throws after exhausting all retries', async () => {
+    mockFetch.mockResolvedValue({ ok: false, status: 500 });
+
+    await expect(
+      fetchWithRetry('https://api.test.com', {}, { retries: 2, baseDelayMs: 10 })
+    ).rejects.toThrow('HTTP 500');
+    expect(mockFetch).toHaveBeenCalledTimes(3); // initial + 2 retries
+  });
+
+  test('uses default retry count when not specified', async () => {
+    mockFetch.mockResolvedValue({ ok: false, status: 503 });
+
+    await expect(
+      fetchWithRetry('https://api.test.com', {}, { baseDelayMs: 10 })
+    ).rejects.toThrow('HTTP 503');
+    expect(mockFetch).toHaveBeenCalledTimes(3); // initial + 2 retries (default)
+  });
+
+  test('passes request init options to fetch', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({}),
+    });
+
+    await fetchWithRetry('https://api.test.com', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: 'value' }),
+    });
+
+    expect(mockFetch).toHaveBeenCalledWith('https://api.test.com', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: 'value' }),
+    });
+  });
+
+  test('uses exponential backoff between retries', async () => {
+    const delays: number[] = [];
+    const originalSetTimeout = global.setTimeout;
+
+    // Track setTimeout calls
+    jest.spyOn(global, 'setTimeout').mockImplementation((fn: any, delay?: number) => {
+      delays.push(delay || 0);
+      return originalSetTimeout(fn, 1) as any; // Execute immediately for test speed
+    });
+
+    mockFetch
+      .mockRejectedValueOnce(new Error('fail 1'))
+      .mockRejectedValueOnce(new Error('fail 2'))
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({}),
+      });
+
+    await fetchWithRetry(
+      'https://api.test.com',
+      {},
+      { retries: 2, baseDelayMs: 100 }
+    );
+
+    // Delays should be exponential: 100 * 2^0 = 100, 100 * 2^1 = 200
+    expect(delays).toContain(100);
+    expect(delays).toContain(200);
+
+    jest.restoreAllMocks();
+  });
+});
 
 describe('normalizeAddress', () => {
   test('converts uppercase address to lowercase', () => {

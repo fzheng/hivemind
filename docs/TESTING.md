@@ -3,7 +3,7 @@
 ## Quick Start
 
 ```bash
-npm test             # Run all 623 tests
+npm test             # Run all 657 tests
 ```
 
 That's it! One command runs the entire test suite.
@@ -19,16 +19,17 @@ npm test -- validation   # Run specific test file
 
 ## Test Coverage
 
-**Overall: 60%** | **ts-lib: 92%**
+**Overall: 63%** | **ts-lib: 97%**
 
 | Module | Coverage | Description |
 |--------|----------|-------------|
 | validation.ts | 100% | Address and input validation |
 | queue.ts | 100% | WebSocket event queue |
+| utils.ts | 100% | Utility functions (retry, clamp, sleep) |
+| pagination.ts | 100% | Trade pagination and deduplication |
 | scoring.ts | 99% | Trader performance scoring |
 | hyperliquid.ts | 98% | Hyperliquid API integration |
-| persist.ts | 89% | Database operations |
-| pagination.ts | 93% | Trade pagination |
+| persist.ts | 94% | Database operations |
 
 ## Test Files
 
@@ -36,11 +37,12 @@ npm test -- validation   # Run specific test file
 |------|-------|-------------|
 | validation.test.ts | 44 | Input validation |
 | scoring.test.ts | 89 | Performance scoring |
-| persist.integration.test.ts | 70+ | Database operations |
+| persist.integration.test.ts | 93 | Database operations |
+| utils.test.ts | 93 | Utility functions |
 | hyperliquid.integration.test.ts | 35 | External API calls |
 | leaderboard.test.ts | 40 | Leaderboard scoring |
 | leaderboard.integration.test.ts | 49 | Cache, rate limiter |
-| pagination.test.ts | 30 | Trade deduplication |
+| pagination.test.ts | 14 | Trade deduplication |
 | event-queue.test.ts | 15 | Event streaming |
 | fill-aggregation.test.ts | 20 | Fill grouping |
 | streaming-aggregation.test.ts | 25 | Real-time aggregation |

@@ -869,6 +869,90 @@ describe('Error handling and edge cases', () => {
     expect(result).toBe(0);
   });
 
+  it('should handle upsertCurrentPosition error', async () => {
+    mockQuery.mockRejectedValueOnce(new Error('DB error'));
+    // Should not throw, just log error
+    await expect(
+      upsertCurrentPosition({
+        address: '0x1234',
+        symbol: 'BTC',
+        size: 1,
+        entryPriceUsd: 100,
+        liquidationPriceUsd: 50,
+        leverage: 10,
+        pnlUsd: 5,
+      })
+    ).resolves.toBeUndefined();
+  });
+
+  it('should handle clearPositionsForAddress error', async () => {
+    mockQuery.mockRejectedValueOnce(new Error('DB error'));
+    // Should not throw, just log error
+    await expect(clearPositionsForAddress('0x1234')).resolves.toBeUndefined();
+  });
+
+  it('should handle pageTrades error', async () => {
+    mockQuery.mockRejectedValueOnce(new Error('DB error'));
+    const result = await pageTrades({ limit: 10 });
+    expect(result).toEqual([]);
+  });
+
+  it('should handle pageTradesByTime with beforeId only (no beforeAt)', async () => {
+    mockQuery.mockResolvedValueOnce({
+      rows: [{ id: 1, address: '0x1', at: '2025-01-01', payload: {} }],
+    });
+
+    const result = await pageTradesByTime({ beforeId: 100 });
+
+    expect(result.length).toBe(1);
+    expect(mockQuery).toHaveBeenCalledWith(
+      expect.stringContaining('id < $'),
+      expect.arrayContaining([100])
+    );
+  });
+
+  it('should handle listLiveFills error', async () => {
+    mockQuery.mockRejectedValueOnce(new Error('DB error'));
+    const result = await listLiveFills();
+    expect(result).toEqual([]);
+  });
+
+  it('should handle listRecentFills error', async () => {
+    mockQuery.mockRejectedValueOnce(new Error('DB error'));
+    const result = await listRecentFills();
+    expect(result).toEqual([]);
+  });
+
+  it('should handle listRecentDecisions error', async () => {
+    mockQuery.mockRejectedValueOnce(new Error('DB error'));
+    const result = await listRecentDecisions();
+    expect(result).toEqual([]);
+  });
+
+  it('should handle getAddressPerformance error', async () => {
+    mockQuery.mockRejectedValueOnce(new Error('DB error'));
+    const result = await getAddressPerformance();
+    expect(result).toEqual([]);
+  });
+
+  it('should handle deleteTradesForAddress error', async () => {
+    mockQuery.mockRejectedValueOnce(new Error('DB error'));
+    const result = await deleteTradesForAddress('0x1234');
+    expect(result).toBe(0);
+  });
+
+  it('should handle countValidTradesForAddress error', async () => {
+    mockQuery.mockRejectedValueOnce(new Error('DB error'));
+    const result = await countValidTradesForAddress('0x1234');
+    expect(result).toBe(0);
+  });
+
+  it('should handle insertTradeIfNew error', async () => {
+    mockQuery.mockRejectedValueOnce(new Error('DB error'));
+    const result = await insertTradeIfNew('0x1234', { hash: 'abc' });
+    expect(result).toEqual({ id: null, inserted: false });
+  });
+
   it('should handle undefined in performance rows', async () => {
     mockQuery.mockResolvedValueOnce({
       rows: [

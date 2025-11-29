@@ -77,4 +77,67 @@ describe('mergeTrades', () => {
     st.lastAt -= 250;
     expect(canLoadMore(st, 200)).toBe(true);
   });
+
+  // Additional edge case tests for tradeKey fallback paths
+  test('uses id-only key when no time or tx hash', () => {
+    const existing: TradeRow[] = [
+      { id: 42, time: '', address: '0x1', action: 'Buy', size: 1, startPosition: 0, price: 100, closedPnl: null },
+    ];
+    const incoming: TradeRow[] = [
+      { id: 42, time: '', address: '0x1', action: 'Buy', size: 1, startPosition: 0, price: 100, closedPnl: null },
+      { id: 43, time: '', address: '0x1', action: 'Sell', size: 1, startPosition: 1, price: 101, closedPnl: null },
+    ];
+    const merged = mergeTrades(existing, incoming);
+    expect(merged.length).toBe(2); // id:42 deduped, id:43 added
+    expect(merged.find(t => t.id === 42)).toBeTruthy();
+    expect(merged.find(t => t.id === 43)).toBeTruthy();
+  });
+
+  test('uses fallback key when no id, time, or address available', () => {
+    // This tests the fallback path in tradeKey: `fallback:${t.address ?? ''}:${t.time ?? ''}`
+    const existing: TradeRow[] = [];
+    const incoming: TradeRow[] = [
+      { address: '', time: '', action: 'Buy', size: 1, startPosition: 0, price: 100, closedPnl: null } as TradeRow,
+      { address: '', time: '', action: 'Buy', size: 1, startPosition: 0, price: 100, closedPnl: null } as TradeRow,
+    ];
+    const merged = mergeTrades(existing, incoming);
+    // Both have same fallback key, so only one is kept
+    expect(merged.length).toBe(1);
+  });
+
+  test('handles invalid time strings with fallback to 0 timestamp', () => {
+    const existing: TradeRow[] = [
+      { id: 1, time: 'invalid-time', address: '0x1', action: 'Buy', size: 1, startPosition: 0, price: 100, closedPnl: null },
+      { id: 2, time: '2024-01-01T00:00:01.000Z', address: '0x1', action: 'Buy', size: 1, startPosition: 0, price: 100, closedPnl: null },
+    ];
+    const merged = mergeTrades(existing, []);
+    // Should still sort without error, invalid time treated as 0
+    expect(merged.length).toBe(2);
+    // Valid time should come first (newer)
+    expect(merged[0].id).toBe(2);
+    expect(merged[1].id).toBe(1);
+  });
+
+  test('sorts by id when timestamps are equal', () => {
+    const sameTime = '2024-01-01T12:00:00.000Z';
+    const existing: TradeRow[] = [
+      { id: 1, time: sameTime, address: '0x1', action: 'Buy', size: 1, startPosition: 0, price: 100, closedPnl: null },
+      { id: 5, time: sameTime, address: '0x2', action: 'Buy', size: 1, startPosition: 0, price: 100, closedPnl: null },
+      { id: 3, time: sameTime, address: '0x3', action: 'Buy', size: 1, startPosition: 0, price: 100, closedPnl: null },
+    ];
+    const merged = mergeTrades(existing, []);
+    // Should sort by id desc when time is equal
+    expect(merged.map(t => t.id)).toEqual([5, 3, 1]);
+  });
+
+  test('handles undefined id in sorting', () => {
+    const existing: TradeRow[] = [
+      { time: '2024-01-01T12:00:00.000Z', address: '0x1', action: 'Buy', size: 1, startPosition: 0, price: 100, closedPnl: null } as TradeRow,
+      { id: 5, time: '2024-01-01T12:00:00.000Z', address: '0x2', action: 'Buy', size: 1, startPosition: 0, price: 100, closedPnl: null },
+    ];
+    const merged = mergeTrades(existing, []);
+    // id:5 should come before undefined id (5 > 0)
+    expect(merged[0].id).toBe(5);
+    expect(merged[1].id).toBeUndefined();
+  });
 });
