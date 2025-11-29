@@ -46,7 +46,9 @@ import {
   getCurrentPrices,
   onPriceChange,
   startPriceFeed,
-  refreshPriceFeed
+  refreshPriceFeed,
+  validatePositionChain,
+  clearTradesForAddress
 } from '@hl/ts-lib';
 
 const OWNER_TOKEN = getOwnerToken();
@@ -649,6 +651,211 @@ async function main() {
     }
   });
 
+  // Validate position chain integrity for all tracked addresses
+  app.get('/dashboard/api/fills/validate', async (req, res) => {
+    try {
+      const symbol = (req.query.symbol === 'BTC' ? 'BTC' : 'ETH') as 'BTC' | 'ETH';
+      const addresses = watchlist.length > 0 ? watchlist : [];
+
+      if (addresses.length === 0) {
+        return res.json({ valid: true, message: 'No addresses in watchlist', results: [] });
+      }
+
+      const results: Array<{
+        address: string;
+        valid: boolean;
+        gapCount: number;
+        gaps: Array<{ time: string; expected: number; actual: number }>;
+      }> = [];
+
+      let allValid = true;
+
+      for (const address of addresses) {
+        const validation = await validatePositionChain(address, symbol);
+        results.push({
+          address,
+          valid: validation.valid,
+          gapCount: validation.gaps.length,
+          gaps: validation.gaps.slice(0, 5) // Limit to first 5 gaps per address
+        });
+        if (!validation.valid) allValid = false;
+      }
+
+      const invalidCount = results.filter(r => !r.valid).length;
+      logger.info('position_chain_validation', { symbol, addressCount: addresses.length, invalidCount });
+
+      res.json({
+        valid: allValid,
+        symbol,
+        addressCount: addresses.length,
+        invalidCount,
+        results: results.filter(r => !r.valid) // Only return invalid addresses
+      });
+    } catch (err: any) {
+      logger.error('validation_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to validate position chains' });
+    }
+  });
+
+  // Repair data for a specific address (clear and backfill)
+  app.post('/dashboard/api/fills/repair', async (req, res) => {
+    try {
+      const address = req.body?.address;
+      const symbol = (req.body?.symbol === 'BTC' ? 'BTC' : 'ETH') as 'BTC' | 'ETH';
+
+      if (!address || typeof address !== 'string' || !address.startsWith('0x')) {
+        return res.status(400).json({ error: 'Invalid address' });
+      }
+
+      const normalizedAddr = normalizeAddress(address);
+
+      // Step 1: Clear existing trades for this address
+      const cleared = await clearTradesForAddress(normalizedAddr, symbol);
+      logger.info('repair_cleared_trades', { address: normalizedAddr, symbol, cleared });
+
+      // Step 2: Backfill from Hyperliquid API
+      let inserted = 0;
+      try {
+        const fills = await fetchUserFills(normalizedAddr, { aggregateByTime: true, symbols: [symbol] });
+
+        for (const f of fills || []) {
+          const delta = f.side === 'B' ? +f.sz : -f.sz;
+          const newPos = f.startPosition + delta;
+          let action = '';
+          if (f.startPosition === 0) action = delta > 0 ? 'Open Long (Open New)' : 'Open Short (Open New)';
+          else if (f.startPosition > 0) action = delta > 0 ? 'Increase Long' : (newPos === 0 ? 'Close Long (Close All)' : 'Decrease Long');
+          else action = delta < 0 ? 'Increase Short' : (newPos === 0 ? 'Close Short (Close All)' : 'Decrease Short');
+
+          const payload = {
+            at: new Date(f.time).toISOString(),
+            address: normalizedAddr,
+            symbol: f.coin,
+            action,
+            size: Math.abs(f.sz),
+            startPosition: f.startPosition,
+            priceUsd: f.px,
+            realizedPnlUsd: f.closedPnl ?? null,
+            fee: f.fee ?? null,
+            feeToken: f.feeToken ?? null,
+            hash: f.hash ?? null,
+          };
+
+          const result = await insertTradeIfNew(normalizedAddr, payload);
+          if (result.inserted) inserted += 1;
+        }
+      } catch (err: any) {
+        logger.warn('repair_backfill_failed', { address: normalizedAddr, err: err?.message });
+      }
+
+      // Step 3: Re-validate
+      const validation = await validatePositionChain(normalizedAddr, symbol);
+
+      logger.info('repair_complete', {
+        address: normalizedAddr,
+        symbol,
+        cleared,
+        inserted,
+        valid: validation.valid,
+        remainingGaps: validation.gaps.length
+      });
+
+      res.json({
+        address: normalizedAddr,
+        symbol,
+        cleared,
+        inserted,
+        valid: validation.valid,
+        remainingGaps: validation.gaps.length
+      });
+    } catch (err: any) {
+      logger.error('repair_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to repair data' });
+    }
+  });
+
+  // Auto-repair all invalid addresses
+  app.post('/dashboard/api/fills/repair-all', async (req, res) => {
+    try {
+      const symbol = (req.body?.symbol === 'BTC' ? 'BTC' : 'ETH') as 'BTC' | 'ETH';
+      const addresses = watchlist.length > 0 ? watchlist : [];
+
+      if (addresses.length === 0) {
+        return res.json({ repaired: 0, message: 'No addresses in watchlist' });
+      }
+
+      // First validate all
+      const invalidAddresses: string[] = [];
+      for (const address of addresses) {
+        const validation = await validatePositionChain(address, symbol);
+        if (!validation.valid) {
+          invalidAddresses.push(address);
+        }
+      }
+
+      if (invalidAddresses.length === 0) {
+        return res.json({ repaired: 0, message: 'All position chains are valid' });
+      }
+
+      logger.info('repair_all_starting', { symbol, invalidCount: invalidAddresses.length });
+
+      const results: Array<{ address: string; cleared: number; inserted: number; valid: boolean }> = [];
+
+      for (const address of invalidAddresses) {
+        // Clear
+        const cleared = await clearTradesForAddress(address, symbol);
+
+        // Backfill
+        let inserted = 0;
+        try {
+          const fills = await fetchUserFills(address, { aggregateByTime: true, symbols: [symbol] });
+          for (const f of fills || []) {
+            const delta = f.side === 'B' ? +f.sz : -f.sz;
+            const newPos = f.startPosition + delta;
+            let action = '';
+            if (f.startPosition === 0) action = delta > 0 ? 'Open Long (Open New)' : 'Open Short (Open New)';
+            else if (f.startPosition > 0) action = delta > 0 ? 'Increase Long' : (newPos === 0 ? 'Close Long (Close All)' : 'Decrease Long');
+            else action = delta < 0 ? 'Increase Short' : (newPos === 0 ? 'Close Short (Close All)' : 'Decrease Short');
+
+            const payload = {
+              at: new Date(f.time).toISOString(),
+              address,
+              symbol: f.coin,
+              action,
+              size: Math.abs(f.sz),
+              startPosition: f.startPosition,
+              priceUsd: f.px,
+              realizedPnlUsd: f.closedPnl ?? null,
+              fee: f.fee ?? null,
+              feeToken: f.feeToken ?? null,
+              hash: f.hash ?? null,
+            };
+            const result = await insertTradeIfNew(address, payload);
+            if (result.inserted) inserted += 1;
+          }
+        } catch (err: any) {
+          logger.warn('repair_all_backfill_failed', { address, err: err?.message });
+        }
+
+        // Re-validate
+        const validation = await validatePositionChain(address, symbol);
+        results.push({ address, cleared, inserted, valid: validation.valid });
+      }
+
+      const stillInvalid = results.filter(r => !r.valid).length;
+      logger.info('repair_all_complete', { symbol, repaired: invalidAddresses.length, stillInvalid });
+
+      res.json({
+        symbol,
+        repaired: invalidAddresses.length,
+        stillInvalid,
+        results
+      });
+    } catch (err: any) {
+      logger.error('repair_all_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to repair data' });
+    }
+  });
+
   const server = http.createServer(app);
   configureWebSocket(server);
 
@@ -664,6 +871,77 @@ async function main() {
   setInterval(() => {
     void tracker?.ensureFreshSnapshots();
   }, 30000);
+
+  // Periodic position chain validation (every 5 minutes)
+  // Auto-repairs any addresses with data gaps
+  const AUTO_REPAIR_ENABLED = process.env.AUTO_REPAIR_ENABLED !== 'false';
+  const VALIDATION_INTERVAL = Number(process.env.VALIDATION_INTERVAL_MS ?? 300000); // 5 minutes default
+
+  if (AUTO_REPAIR_ENABLED) {
+    setInterval(async () => {
+      try {
+        const addresses = watchlist.length > 0 ? watchlist : [];
+        if (addresses.length === 0) return;
+
+        // Validate ETH (most commonly traded)
+        for (const symbol of ['ETH', 'BTC'] as const) {
+          const invalidAddresses: string[] = [];
+
+          for (const address of addresses) {
+            const validation = await validatePositionChain(address, symbol);
+            if (!validation.valid && validation.gaps.length > 0) {
+              invalidAddresses.push(address);
+            }
+          }
+
+          if (invalidAddresses.length === 0) continue;
+
+          logger.warn('auto_repair_triggered', { symbol, invalidCount: invalidAddresses.length });
+
+          // Auto-repair each invalid address
+          for (const address of invalidAddresses) {
+            try {
+              const cleared = await clearTradesForAddress(address, symbol);
+              const fills = await fetchUserFills(address, { aggregateByTime: true, symbols: [symbol] });
+              let inserted = 0;
+
+              for (const f of fills || []) {
+                const delta = f.side === 'B' ? +f.sz : -f.sz;
+                const newPos = f.startPosition + delta;
+                let action = '';
+                if (f.startPosition === 0) action = delta > 0 ? 'Open Long (Open New)' : 'Open Short (Open New)';
+                else if (f.startPosition > 0) action = delta > 0 ? 'Increase Long' : (newPos === 0 ? 'Close Long (Close All)' : 'Decrease Long');
+                else action = delta < 0 ? 'Increase Short' : (newPos === 0 ? 'Close Short (Close All)' : 'Decrease Short');
+
+                const payload = {
+                  at: new Date(f.time).toISOString(),
+                  address,
+                  symbol: f.coin,
+                  action,
+                  size: Math.abs(f.sz),
+                  startPosition: f.startPosition,
+                  priceUsd: f.px,
+                  realizedPnlUsd: f.closedPnl ?? null,
+                  fee: f.fee ?? null,
+                  feeToken: f.feeToken ?? null,
+                  hash: f.hash ?? null,
+                };
+                const result = await insertTradeIfNew(address, payload);
+                if (result.inserted) inserted += 1;
+              }
+
+              logger.info('auto_repair_complete', { address, symbol, cleared, inserted });
+            } catch (err: any) {
+              logger.error('auto_repair_address_failed', { address, symbol, err: err?.message });
+            }
+          }
+        }
+      } catch (err: any) {
+        logger.error('auto_repair_cycle_failed', { err: err?.message });
+      }
+    }, VALIDATION_INTERVAL);
+    logger.info('auto_repair_enabled', { intervalMs: VALIDATION_INTERVAL });
+  }
 
   const port = getPort(8080);
   server.listen(port, () => logger.info('hl-stream listening', { port }));

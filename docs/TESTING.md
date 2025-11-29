@@ -3,7 +3,7 @@
 ## Quick Start
 
 ```bash
-npm test             # Run all 504 tests
+npm test             # Run all 548 tests
 ```
 
 That's it! One command runs the entire test suite.
@@ -19,7 +19,7 @@ npm test -- validation   # Run specific test file
 
 ## Test Coverage
 
-**Overall: 60%** | **ts-lib: 91%**
+**Overall: 60%** | **ts-lib: 92%**
 
 | Module | Coverage | Description |
 |--------|----------|-------------|
@@ -27,7 +27,7 @@ npm test -- validation   # Run specific test file
 | queue.ts | 100% | WebSocket event queue |
 | scoring.ts | 99% | Trader performance scoring |
 | hyperliquid.ts | 98% | Hyperliquid API integration |
-| persist.ts | 88% | Database operations |
+| persist.ts | 89% | Database operations |
 | pagination.ts | 93% | Trade pagination |
 
 ## Test Files
@@ -36,7 +36,7 @@ npm test -- validation   # Run specific test file
 |------|-------|-------------|
 | validation.test.ts | 44 | Input validation |
 | scoring.test.ts | 89 | Performance scoring |
-| persist.integration.test.ts | 50+ | Database operations |
+| persist.integration.test.ts | 70+ | Database operations |
 | hyperliquid.integration.test.ts | 35 | External API calls |
 | leaderboard.test.ts | 40 | Leaderboard scoring |
 | leaderboard.integration.test.ts | 49 | Cache, rate limiter |
@@ -44,6 +44,7 @@ npm test -- validation   # Run specific test file
 | event-queue.test.ts | 15 | Event streaming |
 | fill-aggregation.test.ts | 20 | Fill grouping |
 | streaming-aggregation.test.ts | 25 | Real-time aggregation |
+| position-chain.test.ts | 40+ | Position chain validation |
 
 ## Writing Tests
 

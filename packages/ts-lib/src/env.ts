@@ -18,6 +18,18 @@ export function getPort(defaultPort = 8080): number {
   return defaultPort;
 }
 
+/** Cached flag to only warn once per process */
+let ownerTokenWarned = false;
+
 export function getOwnerToken(): string {
-  return requireEnv('OWNER_TOKEN', 'dev-owner');
+  const token = requireEnv('OWNER_TOKEN', 'dev-owner');
+  if (token === 'dev-owner' && !ownerTokenWarned) {
+    ownerTokenWarned = true;
+    console.warn(
+      '[SECURITY WARNING] Using default OWNER_TOKEN "dev-owner". ' +
+      'All owner endpoints are publicly writable. ' +
+      'Set OWNER_TOKEN environment variable in production.'
+    );
+  }
+  return token;
 }

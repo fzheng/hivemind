@@ -113,6 +113,9 @@ Real-time feeds and dashboard.
 |----------|--------|------|-------------|
 | `/fills` | GET | No | Recent fills with pagination |
 | `/fills/backfill` | GET | No | Paginated historical fills |
+| `/fills/validate` | GET | No | Validate position chain integrity |
+| `/fills/repair` | POST | No | Repair data for a specific address |
+| `/fills/repair-all` | POST | No | Auto-repair all invalid addresses |
 
 **Query Parameters for `/fills`:**
 - `limit` - Max fills (default: 40, max: 200)
@@ -120,6 +123,24 @@ Real-time feeds and dashboard.
 **Query Parameters for `/fills/backfill`:**
 - `before` - ISO timestamp for pagination
 - `limit` - Max fills (default: 50, max: 100)
+
+**Query Parameters for `/fills/validate`:**
+- `symbol` - Asset symbol (`BTC` or `ETH`, default: `ETH`)
+
+**POST `/fills/repair` Body:**
+```json
+{
+  "address": "0x...",
+  "symbol": "ETH"
+}
+```
+
+**POST `/fills/repair-all` Body:**
+```json
+{
+  "symbol": "ETH"
+}
+```
 
 ### Prices
 

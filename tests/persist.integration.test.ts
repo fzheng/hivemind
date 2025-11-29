@@ -7,7 +7,15 @@
 
 // Mock the postgres module before any imports
 const mockQuery = jest.fn();
-const mockPool = { query: mockQuery };
+const mockClientQuery = jest.fn();
+const mockClient = {
+  query: mockClientQuery,
+  release: jest.fn(),
+};
+const mockPool = {
+  query: mockQuery,
+  connect: jest.fn(() => Promise.resolve(mockClient)),
+};
 
 jest.mock('../packages/ts-lib/src/postgres', () => ({
   getPool: jest.fn(() => Promise.resolve(mockPool)),
@@ -39,6 +47,8 @@ import {
   getBackfillFills,
   getOldestFillTime,
   listRecentDecisions,
+  validatePositionChain,
+  clearTradesForAddress,
   type InsertableEvent,
 } from '../packages/ts-lib/src/persist';
 
@@ -54,6 +64,8 @@ afterAll(() => {
 describe('persist.ts database integration', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // Reset the client mock for transactional tests
+    mockClientQuery.mockReset();
   });
 
   describe('insertEvent', () => {
@@ -589,12 +601,15 @@ describe('persist.ts database integration', () => {
 
     describe('addCustomAccount', () => {
       it('should add new custom account', async () => {
-        // First check count
-        mockQuery.mockResolvedValueOnce({ rows: [{ cnt: 1 }] });
-        // Then insert
-        mockQuery.mockResolvedValueOnce({
-          rows: [{ id: 3, address: '0xnew', nickname: 'NewWhale', added_at: '2025-01-01' }],
-        });
+        // Transaction flow: BEGIN, LOCK TABLE, COUNT, INSERT, COMMIT
+        mockClientQuery
+          .mockResolvedValueOnce({}) // BEGIN
+          .mockResolvedValueOnce({}) // LOCK TABLE
+          .mockResolvedValueOnce({ rows: [{ cnt: 1 }] }) // COUNT (1 existing)
+          .mockResolvedValueOnce({
+            rows: [{ id: 3, address: '0xnew', nickname: 'NewWhale', added_at: '2025-01-01' }],
+          }) // INSERT
+          .mockResolvedValueOnce({}); // COMMIT
 
         const result = await addCustomAccount('0xNEW', 'NewWhale');
 
@@ -603,7 +618,12 @@ describe('persist.ts database integration', () => {
       });
 
       it('should reject when limit reached', async () => {
-        mockQuery.mockResolvedValueOnce({ rows: [{ cnt: 3 }] });
+        // Transaction flow: BEGIN, LOCK TABLE, COUNT (3 = limit), ROLLBACK
+        mockClientQuery
+          .mockResolvedValueOnce({}) // BEGIN
+          .mockResolvedValueOnce({}) // LOCK TABLE
+          .mockResolvedValueOnce({ rows: [{ cnt: 3 }] }) // COUNT = 3 (limit reached)
+          .mockResolvedValueOnce({}); // ROLLBACK
 
         const result = await addCustomAccount('0xnew');
 
@@ -612,8 +632,13 @@ describe('persist.ts database integration', () => {
       });
 
       it('should handle duplicate address', async () => {
-        mockQuery.mockResolvedValueOnce({ rows: [{ cnt: 0 }] });
-        mockQuery.mockResolvedValueOnce({ rows: [] }); // ON CONFLICT DO NOTHING
+        // Transaction flow: BEGIN, LOCK TABLE, COUNT, INSERT (returns empty = conflict), ROLLBACK
+        mockClientQuery
+          .mockResolvedValueOnce({}) // BEGIN
+          .mockResolvedValueOnce({}) // LOCK TABLE
+          .mockResolvedValueOnce({ rows: [{ cnt: 0 }] }) // COUNT = 0 existing accounts
+          .mockResolvedValueOnce({ rows: [] }) // INSERT returns empty (ON CONFLICT DO NOTHING)
+          .mockResolvedValueOnce({}); // ROLLBACK
 
         const result = await addCustomAccount('0xexisting');
 
@@ -890,5 +915,157 @@ describe('Error handling and edge cases', () => {
 
     const result = await listRecentFills();
     expect(result[0].size).toBe(0.5);
+  });
+});
+
+describe('Position chain validation and repair', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  describe('clearTradesForAddress', () => {
+    it('should delete trades for a specific address', async () => {
+      mockQuery.mockResolvedValueOnce({ rowCount: 10 });
+
+      const result = await clearTradesForAddress('0x1234567890abcdef1234567890abcdef12345678');
+
+      expect(result).toBe(10);
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.stringContaining("DELETE FROM hl_events WHERE type = 'trade' AND LOWER(address) = LOWER($1)"),
+        ['0x1234567890abcdef1234567890abcdef12345678']
+      );
+    });
+
+    it('should filter by symbol when provided', async () => {
+      mockQuery.mockResolvedValueOnce({ rowCount: 5 });
+
+      const result = await clearTradesForAddress('0x1234', 'ETH');
+
+      expect(result).toBe(5);
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.stringContaining("payload->>'symbol', 'BTC') = $2"),
+        ['0x1234', 'ETH']
+      );
+    });
+
+    it('should return 0 on error', async () => {
+      mockQuery.mockRejectedValueOnce(new Error('DB error'));
+
+      const result = await clearTradesForAddress('0x1234');
+
+      expect(result).toBe(0);
+    });
+
+    it('should handle null rowCount', async () => {
+      mockQuery.mockResolvedValueOnce({ rowCount: null });
+
+      const result = await clearTradesForAddress('0x1234');
+
+      expect(result).toBe(0);
+    });
+  });
+
+  describe('validatePositionChain', () => {
+    it('should return valid for continuous chain', async () => {
+      // Fills sorted by time DESC (newest first)
+      mockQuery.mockResolvedValueOnce({
+        rows: [
+          { time_utc: '2025-01-03T00:00:00Z', previous_position: 5, resulting_position: 0 },
+          { time_utc: '2025-01-02T00:00:00Z', previous_position: 0, resulting_position: 5 },
+        ],
+      });
+
+      const result = await validatePositionChain('0x1234', 'ETH');
+
+      expect(result.valid).toBe(true);
+      expect(result.gaps.length).toBe(0);
+    });
+
+    it('should detect gaps in position chain', async () => {
+      // Gap: first fill starts at 5, but second fill results in 10 (missing fills)
+      mockQuery.mockResolvedValueOnce({
+        rows: [
+          { time_utc: '2025-01-03T00:00:00Z', previous_position: 5, resulting_position: 0 },
+          { time_utc: '2025-01-02T00:00:00Z', previous_position: 0, resulting_position: 10 },
+        ],
+      });
+
+      const result = await validatePositionChain('0x1234', 'ETH');
+
+      expect(result.valid).toBe(false);
+      expect(result.gaps.length).toBe(1);
+      expect(result.gaps[0].expected).toBe(10);
+      expect(result.gaps[0].actual).toBe(5);
+    });
+
+    it('should allow small floating point differences', async () => {
+      mockQuery.mockResolvedValueOnce({
+        rows: [
+          { time_utc: '2025-01-03T00:00:00Z', previous_position: 5.00001, resulting_position: 0 },
+          { time_utc: '2025-01-02T00:00:00Z', previous_position: 0, resulting_position: 5 },
+        ],
+      });
+
+      const result = await validatePositionChain('0x1234', 'ETH');
+
+      expect(result.valid).toBe(true);
+    });
+
+    it('should return valid for empty result set', async () => {
+      mockQuery.mockResolvedValueOnce({ rows: [] });
+
+      const result = await validatePositionChain('0x1234', 'ETH');
+
+      expect(result.valid).toBe(true);
+      expect(result.gaps.length).toBe(0);
+    });
+
+    it('should return valid for single fill', async () => {
+      mockQuery.mockResolvedValueOnce({
+        rows: [
+          { time_utc: '2025-01-01T00:00:00Z', previous_position: 0, resulting_position: 5 },
+        ],
+      });
+
+      const result = await validatePositionChain('0x1234', 'ETH');
+
+      expect(result.valid).toBe(true);
+    });
+
+    it('should handle database errors gracefully', async () => {
+      mockQuery.mockRejectedValueOnce(new Error('DB error'));
+
+      const result = await validatePositionChain('0x1234', 'ETH');
+
+      expect(result.valid).toBe(false);
+      expect(result.gaps.length).toBe(0);
+    });
+
+    it('should query with correct symbol filter', async () => {
+      mockQuery.mockResolvedValueOnce({ rows: [] });
+
+      await validatePositionChain('0x1234', 'BTC');
+
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.stringContaining("COALESCE(payload->>'symbol', 'BTC') = $2"),
+        ['0x1234', 'BTC']
+      );
+    });
+
+    it('should detect multiple gaps', async () => {
+      mockQuery.mockResolvedValueOnce({
+        rows: [
+          { time_utc: '2025-01-04T00:00:00Z', previous_position: 0, resulting_position: 0 },
+          { time_utc: '2025-01-03T00:00:00Z', previous_position: 5, resulting_position: 10 }, // gap: 10 != 0
+          { time_utc: '2025-01-02T00:00:00Z', previous_position: 0, resulting_position: 2 },  // gap: 2 != 5
+          { time_utc: '2025-01-01T00:00:00Z', previous_position: 0, resulting_position: 0 },
+        ],
+      });
+
+      const result = await validatePositionChain('0x1234', 'ETH');
+
+      expect(result.valid).toBe(false);
+      expect(result.gaps.length).toBe(2);
+    });
   });
 });

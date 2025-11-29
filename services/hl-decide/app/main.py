@@ -89,6 +89,9 @@ async def persist_ticket(conn, ticket_id: str, signal: SignalEvent):
         ticket_id: Unique ticket identifier
         signal: SignalEvent to persist
     """
+    # Use model_dump_json() to properly serialize datetimes, then parse back for DB
+    # This avoids TypeError from json.dumps on datetime objects
+    payload_json = signal.model_dump_json()
     await conn.execute(
         """
         INSERT INTO tickets (id, ts, address, asset, side, payload)
@@ -99,7 +102,7 @@ async def persist_ticket(conn, ticket_id: str, signal: SignalEvent):
         signal.address,
         signal.asset,
         signal.side,
-        json.dumps(signal.model_dump()),
+        payload_json,
     )
 
 

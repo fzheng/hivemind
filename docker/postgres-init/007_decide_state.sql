@@ -1,4 +1,4 @@
--- Migration 006: hl-decide state persistence
+-- Migration 007: hl-decide state persistence
 -- Persist scores and fills to survive service restarts
 
 CREATE TABLE IF NOT EXISTS decide_scores (

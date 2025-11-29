@@ -433,16 +433,25 @@ export class LeaderboardService {
     // Apply BTC/ETH filtering to get top qualified candidates
     const qualifiedCandidates = await this.filterBtcEthQualified(ranked, this.opts.selectCount);
 
-    // Persist with qualified flags
-    await this.persistPeriod(period, ranked, tracked, hyperliquidSeries);
-    await this.publishTopCandidates(period, qualifiedCandidates);
+    // Persist with qualified flags - returns false if skipped due to empty data
+    const persisted = await this.persistPeriod(period, ranked, tracked, hyperliquidSeries);
 
-    this.logger.info('leaderboard_updated', {
-      period,
-      count: ranked.length,
-      qualified: qualifiedCandidates.length,
-      target: this.opts.selectCount
-    });
+    if (persisted) {
+      await this.publishTopCandidates(period, qualifiedCandidates);
+      this.logger.info('leaderboard_updated', {
+        period,
+        count: ranked.length,
+        qualified: qualifiedCandidates.length,
+        target: this.opts.selectCount
+      });
+    } else {
+      // Log that refresh was skipped - operators can detect upstream outages
+      this.logger.warn('leaderboard_refresh_skipped', {
+        period,
+        reason: 'empty_upstream_data',
+        message: 'Upstream API returned empty data; serving stale snapshot',
+      });
+    }
   }
 
   private async fetchPeriod(period: number): Promise<LeaderboardRawEntry[]> {
@@ -479,24 +488,40 @@ export class LeaderboardService {
    * 4. Realized PnL (10%) - tiebreaker for large accounts
    */
   private scoreEntries(entries: LeaderboardRawEntry[]): RankedEntry[] {
-    // Build scoring params from defaults with optional env overrides
+    // Helper to safely parse env numbers with fallback to default on NaN/invalid values
+    const parseEnvNumber = (envKey: string, defaultValue: number): number => {
+      const envValue = process.env[envKey];
+      if (envValue === undefined) return defaultValue;
+      const parsed = Number(envValue);
+      if (!Number.isFinite(parsed)) {
+        this.logger.warn('invalid_env_number', {
+          key: envKey,
+          value: envValue,
+          usingDefault: defaultValue,
+        });
+        return defaultValue;
+      }
+      return parsed;
+    };
+
+    // Build scoring params from defaults with optional env overrides (validated)
     const scoringParams: ScoringParams = {
-      stabilityWeight: Number(process.env.SCORING_STABILITY_WEIGHT ?? DEFAULT_SCORING_PARAMS.stabilityWeight),
-      winRateWeight: Number(process.env.SCORING_WIN_RATE_WEIGHT ?? DEFAULT_SCORING_PARAMS.winRateWeight),
-      tradeFreqWeight: Number(process.env.SCORING_TRADE_FREQ_WEIGHT ?? DEFAULT_SCORING_PARAMS.tradeFreqWeight),
-      pnlWeight: Number(process.env.SCORING_PNL_WEIGHT ?? DEFAULT_SCORING_PARAMS.pnlWeight),
-      pnlReference: Number(process.env.SCORING_PNL_REFERENCE ?? DEFAULT_SCORING_PARAMS.pnlReference),
-      minTrades: Number(process.env.SCORING_MIN_TRADES ?? DEFAULT_SCORING_PARAMS.minTrades),
-      maxTrades: Number(process.env.SCORING_MAX_TRADES ?? DEFAULT_SCORING_PARAMS.maxTrades),
-      tradeCountThreshold: Number(process.env.SCORING_TRADE_COUNT_THRESHOLD ?? DEFAULT_SCORING_PARAMS.tradeCountThreshold),
-      winRateThreshold: Number(process.env.SCORING_WIN_RATE_THRESHOLD ?? DEFAULT_SCORING_PARAMS.winRateThreshold),
-      drawdownTolerance: Number(process.env.SCORING_DRAWDOWN_TOLERANCE ?? DEFAULT_SCORING_PARAMS.drawdownTolerance),
-      downsideTolerance: Number(process.env.SCORING_DOWNSIDE_TOLERANCE ?? DEFAULT_SCORING_PARAMS.downsideTolerance),
+      stabilityWeight: parseEnvNumber('SCORING_STABILITY_WEIGHT', DEFAULT_SCORING_PARAMS.stabilityWeight),
+      winRateWeight: parseEnvNumber('SCORING_WIN_RATE_WEIGHT', DEFAULT_SCORING_PARAMS.winRateWeight),
+      tradeFreqWeight: parseEnvNumber('SCORING_TRADE_FREQ_WEIGHT', DEFAULT_SCORING_PARAMS.tradeFreqWeight),
+      pnlWeight: parseEnvNumber('SCORING_PNL_WEIGHT', DEFAULT_SCORING_PARAMS.pnlWeight),
+      pnlReference: parseEnvNumber('SCORING_PNL_REFERENCE', DEFAULT_SCORING_PARAMS.pnlReference),
+      minTrades: parseEnvNumber('SCORING_MIN_TRADES', DEFAULT_SCORING_PARAMS.minTrades),
+      maxTrades: parseEnvNumber('SCORING_MAX_TRADES', DEFAULT_SCORING_PARAMS.maxTrades),
+      tradeCountThreshold: parseEnvNumber('SCORING_TRADE_COUNT_THRESHOLD', DEFAULT_SCORING_PARAMS.tradeCountThreshold),
+      winRateThreshold: parseEnvNumber('SCORING_WIN_RATE_THRESHOLD', DEFAULT_SCORING_PARAMS.winRateThreshold),
+      drawdownTolerance: parseEnvNumber('SCORING_DRAWDOWN_TOLERANCE', DEFAULT_SCORING_PARAMS.drawdownTolerance),
+      downsideTolerance: parseEnvNumber('SCORING_DOWNSIDE_TOLERANCE', DEFAULT_SCORING_PARAMS.downsideTolerance),
     };
 
     // Hard filters applied before scoring
-    const maxTrades = Number(process.env.SCORING_MAX_TRADES ?? scoringParams.maxTrades);
-    const inactivityDays = Number(process.env.SCORING_INACTIVITY_DAYS ?? 14);
+    const maxTrades = parseEnvNumber('SCORING_MAX_TRADES', scoringParams.maxTrades);
+    const inactivityDays = parseEnvNumber('SCORING_INACTIVITY_DAYS', 14);
     const inactivityThresholdMs = inactivityDays * 24 * 60 * 60 * 1000;
     const now = Date.now();
 
@@ -1011,17 +1036,20 @@ export class LeaderboardService {
     entries: RankedEntry[],
     tracked: RankedEntry[],
     hyperliquidSeries: Map<string, PortfolioWindowSeries[]>
-  ): Promise<void> {
+  ): Promise<boolean> {
+    // Guard: Do NOT delete existing data if new fetch returned empty/error
+    // This prevents wiping the leaderboard when upstream API fails
+    if (!entries.length) {
+      return false;
+    }
+
     const pool = await getPool();
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      // Safe to delete now - we have valid new data to replace it with
       await client.query('DELETE FROM hl_leaderboard_entries WHERE period_days = $1', [period]);
       await client.query('DELETE FROM hl_leaderboard_pnl_points WHERE period_days = $1', [period]);
-      if (!entries.length) {
-        await client.query('COMMIT');
-        return;
-      }
     const chunkSize = 100;
     for (let i = 0; i < entries.length; i += chunkSize) {
       const chunk = entries.slice(i, i + chunkSize);
@@ -1094,6 +1122,7 @@ export class LeaderboardService {
       await this.insertPnlPointsInTransaction(client, period, tracked, hyperliquidSeries);
     }
       await client.query('COMMIT');
+      return true;
     } catch (err) {
       await client.query('ROLLBACK');
       this.logger.error('leaderboard_persist_failed', { period, err: err instanceof Error ? err.message : String(err) });

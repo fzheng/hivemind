@@ -4,12 +4,13 @@ This document summarizes all fixes applied to address the code review findings.
 
 ## Summary
 
-**Total Issues Fixed: 20**
+**Total Issues Fixed: 22**
 - Critical: 3
-- High-Priority: 3
+- High-Priority: 4
 - Performance: 4
 - Medium-Priority: 5
 - Code Quality: 5
+- Data Integrity: 1
 
 ---
 
@@ -243,6 +244,22 @@ docker compose up --build
 
 ---
 
+## 7. Data Integrity
+
+### ✅ Position Chain Validation & Auto-Repair
+**Files**: `packages/ts-lib/src/persist.ts`, `services/hl-stream/src/index.ts`
+**Issue**: Data gaps in position chains cause incorrect previous_position calculations
+**Fix**:
+- Added `validatePositionChain()` to detect breaks in position continuity
+- Added `clearTradesForAddress()` for targeted data cleanup
+- Added `repairAddressData()` for auto-repair via fresh backfill
+- Auto-repair runs every 5 minutes via `VALIDATION_INTERVAL_MS`
+- New endpoints: `/fills/validate`, `/fills/repair`, `/fills/repair-all`
+
+**Impact**: Self-healing data integrity for position tracking
+
+---
+
 ## Future Recommendations
 
 1. **Leaderboard API**: Investigate if batch stat queries are available
@@ -256,14 +273,15 @@ docker compose up --build
 ## Files Modified
 
 ### TypeScript
-- `packages/ts-lib/src/persist.ts` (SQL injection, error logging, types)
+- `packages/ts-lib/src/persist.ts` (SQL injection, error logging, types, position chain validation)
 - `packages/ts-lib/src/postgres.ts` (pool singleton warning)
 - `packages/ts-lib/src/realtime.ts` (promise error handling)
 - `packages/ts-lib/src/index.ts` (export validation)
 - `packages/ts-lib/src/validation.ts` (NEW)
+- `packages/ts-lib/src/env.ts` (added VALIDATION_INTERVAL_MS)
 - `services/hl-scout/src/index.ts` (input validation)
 - `services/hl-scout/src/leaderboard.ts` (transactions)
-- `services/hl-stream/src/index.ts` (WebSocket fixes)
+- `services/hl-stream/src/index.ts` (WebSocket fixes, auto-repair endpoints)
 
 ### Python
 - `services/hl-sage/app/main.py` (memory limits, error handling)
@@ -277,7 +295,8 @@ docker compose up --build
 
 ---
 
-**Total Lines Changed**: ~350
+**Total Lines Changed**: ~500
 **New Files**: 2
-**Review Date**: 2025-11-18
-**Reviewed By**: Claude Code (Sonnet 4.5)
+**New Test Files**: 1 (`tests/position-chain.test.ts`)
+**Review Date**: 2025-11-18 (updated 2025-11-29)
+**Reviewed By**: Claude Code

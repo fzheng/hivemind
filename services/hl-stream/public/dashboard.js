@@ -180,6 +180,8 @@ function createGroup(fill) {
     totalSize: Math.abs(fill.size_signed || 0),
     totalPnl: fill.closed_pnl_usd || 0,
     prices: fill.price_usd ? [fill.price_usd] : [],
+    // Store the resulting position from the newest fill (for calculating previous_position later)
+    resulting_position: fill.resulting_position,
     previous_position: fill.previous_position,
     isAggregated: false,
     fillCount: 1,
@@ -219,6 +221,68 @@ function canMergeIntoGroup(group, fill) {
 }
 
 /**
+ * Calculates the previous_position for a group based on the resulting_position and totalSize.
+ * This is more reliable than tracking individual fill's previous_position because:
+ * - We know the resulting_position from the newest fill
+ * - We know the totalSize (sum of all fill sizes in the group)
+ * - We know the action type (determines direction of position change)
+ *
+ * Position sign conventions:
+ * - Long positions are POSITIVE (e.g., +5.0 BTC long)
+ * - Short positions are NEGATIVE (e.g., -5.0 BTC short)
+ *
+ * Action effects:
+ * - "Open Long" / "Increase Long": position becomes MORE positive
+ * - "Close Long" / "Decrease Long": position becomes LESS positive (toward 0)
+ * - "Open Short" / "Increase Short": position becomes MORE negative
+ * - "Close Short" / "Decrease Short": position becomes LESS negative (toward 0)
+ *
+ * @param {Object} group - The aggregation group to calculate previous_position for
+ */
+function calculateGroupPreviousPosition(group) {
+  const resultingPos = group.resulting_position;
+  const totalSize = group.totalSize;
+
+  // If we don't have a resulting position, we can't calculate
+  if (resultingPos == null || totalSize == null) {
+    return;
+  }
+
+  const action = (group.action || '').toLowerCase();
+  const isDecrease = action.includes('decrease') || action.includes('close');
+  const isShort = action.includes('short');
+
+  // Calculate previous_position by reversing the trade effect
+  if (isShort) {
+    // SHORT positions are negative
+    if (isDecrease) {
+      // "Close Short" / "Decrease Short" means buying to cover
+      // Position went from more negative to less negative (or 0)
+      // prev = result - totalSize (e.g., result=0, size=5 -> prev=-5)
+      group.previous_position = resultingPos - totalSize;
+    } else {
+      // "Open Short" / "Increase Short" means selling to go more negative
+      // Position went from less negative to more negative
+      // prev = result + totalSize (e.g., result=-10, size=5 -> prev=-5)
+      group.previous_position = resultingPos + totalSize;
+    }
+  } else {
+    // LONG positions are positive
+    if (isDecrease) {
+      // "Close Long" / "Decrease Long" means selling to reduce position
+      // Position went from more positive to less positive (or 0)
+      // prev = result + totalSize (e.g., result=0, size=5 -> prev=+5)
+      group.previous_position = resultingPos + totalSize;
+    } else {
+      // "Open Long" / "Increase Long" means buying to increase position
+      // Position went from less positive to more positive
+      // prev = result - totalSize (e.g., result=10, size=5 -> prev=+5)
+      group.previous_position = resultingPos - totalSize;
+    }
+  }
+}
+
+/**
  * Merges a fill into an existing aggregation group.
  * Updates totals, time range, and computed fields.
  *
@@ -227,6 +291,8 @@ function canMergeIntoGroup(group, fill) {
  */
 function mergeIntoGroup(group, fill) {
   const fillTime = new Date(fill.time_utc).getTime();
+  const groupNewestTime = new Date(group.time_utc).getTime();
+  const groupOldestTime = new Date(group.oldest_time).getTime();
 
   group.fills.push(fill);
   group.totalSize += Math.abs(fill.size_signed || 0);
@@ -235,19 +301,16 @@ function mergeIntoGroup(group, fill) {
     group.prices.push(fill.price_usd);
   }
 
-  // Update time range
-  if (fillTime > new Date(group.time_utc).getTime()) {
+  // Update time range and track resulting_position from the newest fill
+  if (fillTime > groupNewestTime) {
     group.time_utc = fill.time_utc;
+    // Update resulting_position from the newest fill
+    if (fill.resulting_position != null) {
+      group.resulting_position = fill.resulting_position;
+    }
   }
-  if (fillTime < new Date(group.oldest_time).getTime()) {
+  if (fillTime < groupOldestTime) {
     group.oldest_time = fill.time_utc;
-  }
-
-  // Update previous_position - use largest absolute value (true starting position)
-  const fillPrev = fill.previous_position;
-  const groupPrev = group.previous_position;
-  if (fillPrev != null && (groupPrev == null || Math.abs(fillPrev) > Math.abs(groupPrev))) {
-    group.previous_position = fillPrev;
   }
 
   // Update computed fields
@@ -258,11 +321,22 @@ function mergeIntoGroup(group, fill) {
     : null;
 
   // Update signed size based on action
+  // Increase Long → positive (buying)
+  // Decrease Long → negative (selling)
+  // Increase Short → negative (selling to go short)
+  // Decrease Short → positive (buying to cover)
   const isShort = group.action.toLowerCase().includes('short');
   const isDecrease = group.action.toLowerCase().includes('decrease') || group.action.toLowerCase().includes('close');
-  group.size_signed = isShort || isDecrease ? -group.totalSize : group.totalSize;
+  // XOR logic: negative when (decrease AND long) OR (increase AND short)
+  const isNegative = isDecrease !== isShort; // XOR: true when exactly one is true
+  group.size_signed = isNegative ? -group.totalSize : group.totalSize;
   group.closed_pnl_usd = group.totalPnl || null;
   group.price_usd = group.avgPrice;
+
+  // Calculate previous_position from resulting_position and totalSize
+  // This is more reliable than tracking individual fill's previous_position
+  // because grouped fills may have incomplete previous_position values during backfill
+  calculateGroupPreviousPosition(group);
 }
 
 /**
@@ -355,8 +429,18 @@ function placeholder(text = 'No live data') {
 }
 
 // Format price for display (e.g., $97,234.56)
+// Always shows full price with 2 decimal places - no K/M abbreviation
 function fmtPrice(value) {
   if (!Number.isFinite(value)) return '—';
+  return '$' + value.toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  });
+}
+
+// Format trade price for fills table (full price with 2 decimals, no K/M abbreviation)
+function fmtTradePrice(value) {
+  if (!Number.isFinite(value)) return 'N/A';
   return '$' + value.toLocaleString('en-US', {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2
@@ -543,15 +627,8 @@ function aggregateFills(fills) {
         if (fillTime < new Date(currentGroup.oldest_time).getTime()) {
           currentGroup.oldest_time = fill.time_utc;
         }
-        // For previous_position, we need the position BEFORE any fills in the group.
-        // When fills are concurrent (same timestamp), they have different previous_position
-        // values representing parallel fills against the order book. The "true" starting
-        // position is the one with the largest absolute value (furthest from zero).
-        const fillPrev = fill.previous_position;
-        const groupPrev = currentGroup.previous_position;
-        if (fillPrev != null && (groupPrev == null || Math.abs(fillPrev) > Math.abs(groupPrev))) {
-          currentGroup.previous_position = fillPrev;
-        }
+        // Note: We don't track previous_position here anymore - it will be calculated
+        // from resulting_position in finalizeGroup
         continue;
       }
     }
@@ -562,7 +639,8 @@ function aggregateFills(fills) {
       aggregated.push(currentGroup);
     }
 
-    // Start new group
+    // Start new group - the first fill is the newest in this group
+    // so its resulting_position is the final position after all fills
     currentGroup = {
       id: `${address}-${fill.time_utc}-${Math.random().toString(36).slice(2, 8)}`,
       time_utc: fill.time_utc,
@@ -576,7 +654,9 @@ function aggregateFills(fills) {
       totalSize: Math.abs(fill.size_signed || 0),
       totalPnl: fill.closed_pnl_usd || 0,
       prices: fill.price_usd ? [fill.price_usd] : [],
-      previous_position: fill.previous_position,
+      // Store resulting_position from newest fill for calculating previous_position later
+      resulting_position: fill.resulting_position,
+      previous_position: fill.previous_position, // Fallback for single fills
       isAggregated: false,
     };
   }
@@ -597,11 +677,23 @@ function finalizeGroup(group) {
     ? group.prices.reduce((a, b) => a + b, 0) / group.prices.length
     : null;
   // Determine signed size based on action
+  // Increase Long → positive (buying)
+  // Decrease Long → negative (selling)
+  // Increase Short → negative (selling to go short)
+  // Decrease Short → positive (buying to cover)
   const isShort = group.action.toLowerCase().includes('short');
   const isDecrease = group.action.toLowerCase().includes('decrease') || group.action.toLowerCase().includes('close');
-  group.size_signed = isShort || isDecrease ? -group.totalSize : group.totalSize;
+  // XOR logic: negative when (decrease AND long) OR (increase AND short)
+  const isNegative = isDecrease !== isShort; // XOR: true when exactly one is true
+  group.size_signed = isNegative ? -group.totalSize : group.totalSize;
   group.closed_pnl_usd = group.totalPnl || null;
   group.price_usd = group.avgPrice;
+
+  // For aggregated groups, calculate previous_position from resulting_position
+  // This is more reliable than the individual fill's previous_position values
+  if (group.isAggregated && group.resulting_position != null) {
+    calculateGroupPreviousPosition(group);
+  }
 }
 
 // Update time range display
@@ -957,8 +1049,8 @@ function renderGroupRow(group, isNew = false) {
   const size = typeof sizeVal === 'number' ? `${sizeSign}${sizeVal.toFixed(5)} ${symbol}` : '—';
   const prev = typeof group.previous_position === 'number' ? `${group.previous_position.toFixed(5)} ${symbol}` : '—';
   const price = group.isAggregated && group.avgPrice
-    ? `~${fmtUsdShort(group.avgPrice)}`
-    : fmtUsdShort(group.price_usd ?? null);
+    ? `~${fmtTradePrice(group.avgPrice)}`
+    : fmtTradePrice(group.price_usd ?? null);
   const pnl = fmtUsdShort(group.closed_pnl_usd ?? null);
   // Use originalAction for display, fallback to action (for backwards compatibility)
   const displayAction = group.originalAction || group.action || '—';
@@ -997,7 +1089,7 @@ function renderGroupRow(group, isNew = false) {
   if (group.isAggregated && isExpanded) {
     const subFills = group.fills.map(fill => {
       const fillSize = Math.abs(fill.size_signed || 0);
-      const fillPrice = fmtUsdShort(fill.price_usd ?? null);
+      const fillPrice = fmtTradePrice(fill.price_usd ?? null);
       const fillPnl = fmtUsdShort(fill.closed_pnl_usd ?? null);
       const fillTime = fmtTime(fill.time_utc);
       return `<div class="sub-fill">
@@ -1243,12 +1335,17 @@ function connectWs() {
 
             const sizeSigned = e.size ?? e.payload?.size ?? 0;
             const startPos = e.startPosition ?? e.payload?.startPosition ?? null;
+            const sizeNum = Number(sizeSigned);
+            const prevPos = startPos != null ? Number(startPos) : null;
+            // Calculate resulting_position = previous_position + size_signed
+            const resultingPos = prevPos != null ? prevPos + sizeNum : null;
             const row = {
               time_utc: e.at,
               address: e.address,
               action: e.action || e.payload?.action || '',
-              size_signed: Number(sizeSigned),
-              previous_position: startPos != null ? Number(startPos) : null,
+              size_signed: sizeNum,
+              previous_position: prevPos,
+              resulting_position: resultingPos,
               price_usd: e.priceUsd ?? e.payload?.priceUsd ?? null,
               closed_pnl_usd: e.realizedPnlUsd ?? e.payload?.realizedPnlUsd ?? null,
               symbol
