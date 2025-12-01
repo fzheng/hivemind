@@ -4,13 +4,14 @@ This document summarizes all fixes applied to address the code review findings.
 
 ## Summary
 
-**Total Issues Fixed: 22**
+**Total Issues Fixed: 24**
 - Critical: 3
 - High-Priority: 4
 - Performance: 4
 - Medium-Priority: 5
 - Code Quality: 5
 - Data Integrity: 1
+- Features: 2
 
 ---
 
@@ -260,6 +261,33 @@ docker compose up --build
 
 ---
 
+## 8. Features
+
+### ✅ Pinned Accounts System
+**Files**: `packages/ts-lib/src/persist.ts`, `services/hl-scout/src/index.ts`, `db/migrations/010_pinned_accounts.sql`
+**Feature**: Allow users to pin accounts from leaderboard or add custom addresses
+**Details**:
+- Pin from leaderboard: unlimited, gray pin icon
+- Custom pinned: max 3, gold pin icon
+- Pinned accounts excluded from auto-selection but always tracked
+- API: `/pinned-accounts/*` endpoints
+- Database: `hl_pinned_accounts` table with `is_custom` flag
+
+**Impact**: Users can track specific accounts they're interested in
+
+### ✅ Automatic Database Migrations
+**Files**: `packages/ts-lib/src/migrate.ts`, `services/hl-scout/src/index.ts`, `db/migrations/`
+**Feature**: Migrations run automatically on service startup
+**Details**:
+- `runMigrations()` runs pending migrations from `db/migrations/`
+- Tracked in `schema_migrations` table
+- Idempotent: safe to run multiple times
+- hl-scout runs migrations at startup
+
+**Impact**: No manual migration steps required for existing deployments
+
+---
+
 ## Future Recommendations
 
 1. **Leaderboard API**: Investigate if batch stat queries are available
@@ -278,8 +306,9 @@ docker compose up --build
 - `packages/ts-lib/src/realtime.ts` (promise error handling)
 - `packages/ts-lib/src/index.ts` (export validation)
 - `packages/ts-lib/src/validation.ts` (NEW)
+- `packages/ts-lib/src/migrate.ts` (NEW - auto migrations)
 - `packages/ts-lib/src/env.ts` (added VALIDATION_INTERVAL_MS)
-- `services/hl-scout/src/index.ts` (input validation)
+- `services/hl-scout/src/index.ts` (input validation, pinned accounts, migrations)
 - `services/hl-scout/src/leaderboard.ts` (transactions)
 - `services/hl-stream/src/index.ts` (WebSocket fixes, auto-repair endpoints)
 
@@ -289,14 +318,15 @@ docker compose up --build
 
 ### SQL
 - `db/migrations/003_performance_indexes.sql` (NEW)
+- `db/migrations/010_pinned_accounts.sql` (NEW - pinned accounts table)
 
 ### Documentation
 - `CODE_REVIEW_FIXES.md` (this file)
 
 ---
 
-**Total Lines Changed**: ~500
-**New Files**: 2
+**Total Lines Changed**: ~700
+**New Files**: 4
 **New Test Files**: 1 (`tests/position-chain.test.ts`)
-**Review Date**: 2025-11-18 (updated 2025-11-29)
+**Review Date**: 2025-11-18 (updated 2025-12-01)
 **Reviewed By**: Claude Code

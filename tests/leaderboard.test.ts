@@ -7,9 +7,14 @@ jest.mock('@hl/ts-lib', () => {
       info: jest.fn(),
       error: jest.fn(),
       warn: jest.fn(),
+      debug: jest.fn(),
     }),
     getPool: jest.fn(async () => ({
       query: jest.fn().mockResolvedValue({ rows: [] }),
+      connect: jest.fn().mockResolvedValue({
+        query: jest.fn().mockResolvedValue({ rows: [] }),
+        release: jest.fn(),
+      }),
     })),
     normalizeAddress: (value: string) => value.toLowerCase(),
     nowIso: () => '2024-01-01T00:00:00.000Z',
@@ -18,6 +23,10 @@ jest.mock('@hl/ts-lib', () => {
     computePerformanceScore: actualScoring.computePerformanceScore,
     computeStabilityScore: actualScoring.computeStabilityScore,
     DEFAULT_SCORING_PARAMS: actualScoring.DEFAULT_SCORING_PARAMS,
+    // Mock custom account functions
+    removeCustomAccount: jest.fn().mockResolvedValue(undefined),
+    listCustomAccounts: jest.fn().mockResolvedValue([]),
+    updateCustomAccountNickname: jest.fn().mockResolvedValue(undefined),
   };
 });
 
@@ -413,5 +422,310 @@ describe('LeaderboardService scoreEntries', () => {
     // Large PnL should rank higher as tiebreaker
     expect(scored[0].address).toBe('0xlarge_pnl');
     expect(scored[0].score).toBeGreaterThan(scored[1].score);
+  });
+});
+
+describe('LeaderboardService RefreshStatus', () => {
+  beforeEach(() => {
+    jest.useFakeTimers();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('initializes with idle status before start', () => {
+    const service = buildService(2);
+    const status = service.getRefreshStatus();
+
+    expect(status.status).toBe('idle');
+    expect(status.isRefreshing).toBe(false);
+    expect(status.refreshStartedAt).toBeNull();
+    expect(status.lastRefreshAt).toBeNull();
+    expect(status.nextRefreshAt).toBeNull();
+    expect(status.nextRefreshInMs).toBeNull();
+    expect(status.refreshIntervalMs).toBe(24 * 60 * 60 * 1000); // 24 hours
+  });
+
+  it('returns correct refresh interval from options', () => {
+    const customRefreshMs = 12 * 60 * 60 * 1000; // 12 hours
+    const service = new LeaderboardService(
+      {
+        apiUrl: 'https://example.com',
+        topN: 100,
+        selectCount: 2,
+        periods: [30],
+        pageSize: 50,
+        refreshMs: customRefreshMs,
+      },
+      async () => {}
+    );
+
+    const status = service.getRefreshStatus();
+    expect(status.refreshIntervalMs).toBe(customRefreshMs);
+  });
+
+  it('tracks refresh state transitions', () => {
+    const service = buildService(2);
+
+    // Initially idle
+    expect(service.getRefreshStatus().status).toBe('idle');
+    expect(service.getRefreshStatus().isRefreshing).toBe(false);
+  });
+
+  it('calculates next refresh time after start', () => {
+    const service = buildService(2);
+    const refreshMs = 24 * 60 * 60 * 1000; // 24 hours
+
+    // Mock fetch to prevent actual API calls
+    const originalFetch = global.fetch;
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ data: [] }),
+    });
+
+    try {
+      service.start();
+
+      const status = service.getRefreshStatus();
+      // Next refresh should be approximately refreshMs from now
+      expect(status.nextRefreshAt).not.toBeNull();
+      expect(status.nextRefreshInMs).not.toBeNull();
+      expect(status.nextRefreshInMs).toBeLessThanOrEqual(refreshMs);
+      expect(status.nextRefreshInMs).toBeGreaterThan(refreshMs - 1000); // Within 1 second tolerance
+
+      service.stop();
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('stops timer on stop()', () => {
+    const service = buildService(2);
+
+    // Mock fetch
+    const originalFetch = global.fetch;
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ data: [] }),
+    });
+
+    try {
+      service.start();
+      const statusBefore = service.getRefreshStatus();
+      expect(statusBefore.nextRefreshAt).not.toBeNull();
+
+      service.stop();
+
+      // After stop, timer-dependent values should reflect stopped state
+      // (nextRefreshAt still calculated based on last scheduled time until cleared)
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+});
+
+describe('LeaderboardService refresh concurrency', () => {
+  it('prevents concurrent refreshes', async () => {
+    const service = buildService(2);
+
+    // Access internal state
+    const serviceAny = service as any;
+
+    // Simulate refresh in progress
+    serviceAny._isRefreshing = true;
+    serviceAny._refreshStartedAt = new Date();
+
+    // Attempt another refresh
+    await service.refreshAll();
+
+    // Should have logged warning and returned early
+    // The _isRefreshing flag should still be true (not reset)
+    expect(serviceAny._isRefreshing).toBe(true);
+  });
+
+  it('clears refresh state on completion', async () => {
+    const service = buildService(2);
+
+    // Mock fetch
+    const originalFetch = global.fetch;
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ data: [] }),
+    });
+
+    try {
+      await service.refreshAll();
+
+      const serviceAny = service as any;
+      // Refresh state should be cleared
+      expect(serviceAny._isRefreshing).toBe(false);
+      expect(serviceAny._refreshProgress).toBeNull();
+      // lastRefreshAt should be set
+      expect(serviceAny._lastRefreshAt).not.toBeNull();
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('sets error state on refresh failure', async () => {
+    const service = buildService(2);
+
+    // Mock fetch to fail
+    const originalFetch = global.fetch;
+    global.fetch = jest.fn().mockRejectedValue(new Error('Network error'));
+
+    try {
+      await service.refreshAll();
+
+      const status = service.getRefreshStatus();
+      expect(status.status).toBe('error');
+      expect(status.error).toBeDefined();
+      expect(status.error).toContain('Network error');
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+});
+
+describe('LeaderboardService progress tracking', () => {
+  it('tracks progress through refresh phases', async () => {
+    const service = buildService(2);
+    const serviceAny = service as any;
+    const progressPhases: string[] = [];
+
+    // Spy on setProgress to capture phases
+    const originalSetProgress = serviceAny.setProgress.bind(service);
+    serviceAny.setProgress = (phase: string, detail?: string) => {
+      progressPhases.push(phase);
+      originalSetProgress(phase, detail);
+    };
+
+    // Mock fetch
+    const originalFetch = global.fetch;
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ data: [] }),
+    });
+
+    try {
+      await service.refreshAll();
+
+      // Should have gone through multiple phases
+      expect(progressPhases.length).toBeGreaterThan(0);
+      expect(progressPhases).toContain('starting');
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('includes progress in status during refresh', async () => {
+    const service = buildService(2);
+    const serviceAny = service as any;
+
+    // Manually set progress to test status API
+    serviceAny._isRefreshing = true;
+    serviceAny._refreshStartedAt = new Date();
+    serviceAny._refreshProgress = { phase: 'enriching', detail: 'Processing accounts' };
+
+    const status = service.getRefreshStatus();
+
+    expect(status.status).toBe('refreshing');
+    expect(status.progress).toBeDefined();
+    expect(status.progress?.phase).toBe('enriching');
+    expect(status.progress?.detail).toBe('Processing accounts');
+  });
+});
+
+describe('LeaderboardService formatDuration', () => {
+  it('formats milliseconds to human readable string', () => {
+    const service = buildService(2);
+    const serviceAny = service as any;
+
+    // Test hours + minutes
+    expect(serviceAny.formatDuration(2 * 60 * 60 * 1000 + 30 * 60 * 1000)).toBe('2h 30m');
+
+    // Test minutes only
+    expect(serviceAny.formatDuration(45 * 60 * 1000)).toBe('45m');
+
+    // Test zero minutes with hours
+    expect(serviceAny.formatDuration(3 * 60 * 60 * 1000)).toBe('3h 0m');
+
+    // Test edge case: exactly 1 hour
+    expect(serviceAny.formatDuration(60 * 60 * 1000)).toBe('1h 0m');
+
+    // Test small durations
+    expect(serviceAny.formatDuration(5 * 60 * 1000)).toBe('5m');
+  });
+});
+
+describe('LeaderboardService RefreshStatus edge cases', () => {
+  it('handles status when timer not started', () => {
+    const service = buildService(2);
+
+    const status = service.getRefreshStatus();
+
+    // Should return valid status object with null times
+    expect(status).toBeDefined();
+    expect(status.isRefreshing).toBe(false);
+    expect(status.nextRefreshAt).toBeNull();
+    expect(status.nextRefreshInMs).toBeNull();
+  });
+
+  it('returns error status when last refresh had error', () => {
+    const service = buildService(2);
+    const serviceAny = service as any;
+
+    // Simulate error state
+    serviceAny._lastRefreshError = 'API returned 500';
+    serviceAny._isRefreshing = false;
+
+    const status = service.getRefreshStatus();
+
+    expect(status.status).toBe('error');
+    expect(status.error).toBe('API returned 500');
+    expect(status.isRefreshing).toBe(false);
+  });
+
+  it('returns refreshing status during active refresh', () => {
+    const service = buildService(2);
+    const serviceAny = service as any;
+
+    // Simulate active refresh
+    serviceAny._isRefreshing = true;
+    serviceAny._refreshStartedAt = new Date();
+    serviceAny._lastRefreshError = null; // Clear any previous error
+
+    const status = service.getRefreshStatus();
+
+    expect(status.status).toBe('refreshing');
+    expect(status.isRefreshing).toBe(true);
+    expect(status.refreshStartedAt).not.toBeNull();
+  });
+
+  it('clears error status on successful refresh', async () => {
+    const service = buildService(2);
+    const serviceAny = service as any;
+
+    // Set initial error
+    serviceAny._lastRefreshError = 'Previous error';
+
+    // Mock fetch for successful refresh
+    const originalFetch = global.fetch;
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ data: [] }),
+    });
+
+    try {
+      await service.refreshAll();
+
+      const status = service.getRefreshStatus();
+      // Error should be cleared after successful refresh
+      expect(status.status).toBe('idle');
+      expect(status.error).toBeUndefined();
+    } finally {
+      global.fetch = originalFetch;
+    }
   });
 });

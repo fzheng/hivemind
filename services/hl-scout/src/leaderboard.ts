@@ -22,9 +22,9 @@ import {
   CandidateEventSchema,
   computePerformanceScore,
   DEFAULT_SCORING_PARAMS,
-  removeCustomAccount,
-  listCustomAccounts,
-  updateCustomAccountNickname,
+  listPinnedAccounts,
+  getPinnedAddressSet,
+  unpinAccount,
   type ScoringParams
 } from '@hl/ts-lib';
 import type { CandidateEvent } from '@hl/ts-lib';
@@ -44,13 +44,21 @@ const DEFAULT_SERIES_CONCURRENCY = Number(process.env.LEADERBOARD_SERIES_CONCURR
 /** Delay between paginated leaderboard requests in ms */
 const PAGE_REQUEST_DELAY_MS = Number(process.env.LEADERBOARD_PAGE_DELAY_MS ?? 500);
 /** Delay between individual API requests in ms (rate limiting) */
-const REQUEST_DELAY_MS = Number(process.env.HYPERBOT_REQUEST_DELAY_MS ?? 200);
+const REQUEST_DELAY_MS = Number(process.env.HYPERBOT_REQUEST_DELAY_MS ?? 300);
 /** Cache TTL for address stats in ms (1 hour) */
 const STATS_CACHE_TTL_MS = Number(process.env.HYPERBOT_STATS_CACHE_TTL_MS ?? 60 * 60 * 1000);
-/** Cache TTL for BTC/ETH analysis in ms (1 hour) */
+/** Cache TTL for BTC/ETH analysis in-memory cache in ms (1 hour) - DB cache is 30 days */
 const BTC_ETH_CACHE_TTL_MS = Number(process.env.HYPERBOT_BTC_ETH_CACHE_TTL_MS ?? 60 * 60 * 1000);
 /** Maximum cache size for LRU eviction */
 const MAX_CACHE_SIZE = Number(process.env.HYPERBOT_MAX_CACHE_SIZE ?? 500);
+/** Delay between BTC/ETH analysis requests in ms (separate from general rate limiter) */
+const BTC_ETH_REQUEST_DELAY_MS = Number(process.env.BTC_ETH_REQUEST_DELAY_MS ?? 500);
+/** Maximum retries for rate-limited requests */
+const MAX_RATE_LIMIT_RETRIES = Number(process.env.MAX_RATE_LIMIT_RETRIES ?? 3);
+/** Base delay for exponential backoff on rate limit (ms) */
+const RATE_LIMIT_BACKOFF_BASE_MS = Number(process.env.RATE_LIMIT_BACKOFF_BASE_MS ?? 2000);
+/** Database cache TTL for BTC/ETH analysis (30 days in ms) */
+const BTC_ETH_DB_CACHE_TTL_DAYS = Number(process.env.BTC_ETH_DB_CACHE_TTL_DAYS ?? 30);
 
 /**
  * Simple LRU cache with TTL support for Hyperbot API responses.
@@ -331,6 +339,33 @@ export interface LeaderboardOptions {
  * service.start();
  * ```
  */
+/**
+ * Refresh status information
+ */
+export interface RefreshStatus {
+  /** Current status: 'idle', 'refreshing', 'error' */
+  status: 'idle' | 'refreshing' | 'error';
+  /** Whether a refresh is currently in progress */
+  isRefreshing: boolean;
+  /** Timestamp when current refresh started (if refreshing) */
+  refreshStartedAt: string | null;
+  /** Timestamp of last successful refresh */
+  lastRefreshAt: string | null;
+  /** Timestamp of next scheduled refresh */
+  nextRefreshAt: string | null;
+  /** Time until next refresh in milliseconds */
+  nextRefreshInMs: number | null;
+  /** Refresh interval in milliseconds */
+  refreshIntervalMs: number;
+  /** Current refresh progress (if refreshing) */
+  progress?: {
+    phase: string;
+    detail?: string;
+  };
+  /** Error message if status is 'error' */
+  error?: string;
+}
+
 export class LeaderboardService {
   private opts: Required<LeaderboardOptions>;
   private timer: NodeJS.Timeout | null = null;
@@ -340,6 +375,14 @@ export class LeaderboardService {
   private enrichCount: number;
   private statsConcurrency: number;
   private seriesConcurrency: number;
+
+  // Refresh state tracking
+  private _isRefreshing = false;
+  private _refreshStartedAt: Date | null = null;
+  private _lastRefreshAt: Date | null = null;
+  private _lastScheduledRefreshAt: Date | null = null;
+  private _refreshProgress: { phase: string; detail?: string } | null = null;
+  private _lastRefreshError: string | null = null;
 
   /**
    * Creates a new LeaderboardService.
@@ -366,9 +409,19 @@ export class LeaderboardService {
   }
 
   start() {
+    this._lastScheduledRefreshAt = new Date();
+    this.logger.info('leaderboard_service_started', {
+      refreshIntervalMs: this.opts.refreshMs,
+      refreshIntervalHuman: this.formatDuration(this.opts.refreshMs),
+      periods: this.opts.periods,
+      topN: this.opts.topN,
+      selectCount: this.opts.selectCount,
+    });
+
     this.refreshAll().catch((err) => this.logger.error('leaderboard_refresh_failed', { err: err?.message }));
     if (this.timer) clearInterval(this.timer);
     this.timer = setInterval(() => {
+      this._lastScheduledRefreshAt = new Date();
       this.refreshAll().catch((err) => this.logger.error('leaderboard_refresh_failed', { err: err?.message }));
     }, this.opts.refreshMs);
   }
@@ -376,78 +429,187 @@ export class LeaderboardService {
   stop() {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    this.logger.info('leaderboard_service_stopped');
+  }
+
+  /**
+   * Get current refresh status for API/UI
+   */
+  getRefreshStatus(): RefreshStatus {
+    const now = Date.now();
+    let nextRefreshAt: Date | null = null;
+    let nextRefreshInMs: number | null = null;
+
+    if (this._lastScheduledRefreshAt && this.timer) {
+      nextRefreshAt = new Date(this._lastScheduledRefreshAt.getTime() + this.opts.refreshMs);
+      nextRefreshInMs = Math.max(0, nextRefreshAt.getTime() - now);
+    }
+
+    return {
+      status: this._isRefreshing ? 'refreshing' : (this._lastRefreshError ? 'error' : 'idle'),
+      isRefreshing: this._isRefreshing,
+      refreshStartedAt: this._refreshStartedAt?.toISOString() || null,
+      lastRefreshAt: this._lastRefreshAt?.toISOString() || null,
+      nextRefreshAt: nextRefreshAt?.toISOString() || null,
+      nextRefreshInMs,
+      refreshIntervalMs: this.opts.refreshMs,
+      progress: this._refreshProgress || undefined,
+      error: this._lastRefreshError || undefined,
+    };
+  }
+
+  /**
+   * Format milliseconds to human readable duration
+   */
+  private formatDuration(ms: number): string {
+    const hours = Math.floor(ms / (60 * 60 * 1000));
+    const minutes = Math.floor((ms % (60 * 60 * 1000)) / (60 * 1000));
+    if (hours > 0) return `${hours}h ${minutes}m`;
+    return `${minutes}m`;
+  }
+
+  /**
+   * Set refresh progress (for status API)
+   */
+  private setProgress(phase: string, detail?: string) {
+    this._refreshProgress = { phase, detail };
+    this.logger.debug?.('refresh_progress', { phase, detail });
   }
 
   async refreshAll() {
-    for (const period of this.opts.periods) {
-      try {
-        await this.refreshPeriod(period);
-      } catch (err: any) {
-        this.logger.error('leaderboard_period_failed', { period, err: err?.message });
-      }
+    if (this._isRefreshing) {
+      this.logger.warn('refresh_already_in_progress', {
+        startedAt: this._refreshStartedAt?.toISOString(),
+        elapsedMs: this._refreshStartedAt ? Date.now() - this._refreshStartedAt.getTime() : null,
+      });
+      return;
     }
-    // Log cache statistics after refresh
-    this.logger.info('hyperbot_cache_stats', {
-      addressStatsSize: addressStatsCache.size,
-      btcEthAnalysisSize: btcEthAnalysisCache.size,
+
+    this._isRefreshing = true;
+    this._refreshStartedAt = new Date();
+    this._lastRefreshError = null;
+    this.setProgress('starting', 'Initializing refresh cycle');
+
+    this.logger.info('leaderboard_refresh_started', {
+      periods: this.opts.periods,
+      timestamp: this._refreshStartedAt.toISOString(),
     });
+
+    const startTime = Date.now();
+
+    try {
+      for (const period of this.opts.periods) {
+        try {
+          this.setProgress('refreshing_period', `Processing ${period}-day period`);
+          await this.refreshPeriod(period);
+        } catch (err: any) {
+          this.logger.error('leaderboard_period_failed', { period, err: err?.message });
+          this._lastRefreshError = `Period ${period} failed: ${err?.message}`;
+        }
+      }
+
+      this._lastRefreshAt = new Date();
+      const elapsedMs = Date.now() - startTime;
+
+      this.logger.info('leaderboard_refresh_completed', {
+        elapsedMs,
+        elapsedHuman: this.formatDuration(elapsedMs),
+        timestamp: this._lastRefreshAt.toISOString(),
+      });
+
+      // Log cache statistics after refresh
+      this.logger.info('hyperbot_cache_stats', {
+        addressStatsSize: addressStatsCache.size,
+        btcEthAnalysisSize: btcEthAnalysisCache.size,
+      });
+    } catch (err: any) {
+      this._lastRefreshError = err?.message || 'Unknown error';
+      this.logger.error('leaderboard_refresh_failed', {
+        err: err?.message,
+        elapsedMs: Date.now() - startTime,
+      });
+    } finally {
+      this._isRefreshing = false;
+      this._refreshProgress = null;
+    }
   }
 
   async refreshPeriod(period: number) {
+    const periodStartTime = Date.now();
+    this.logger.info('refresh_period_started', { period });
+
+    // Phase 1: Fetch leaderboard data
+    this.setProgress('fetching', `Fetching ${period}-day leaderboard from API`);
     const raw = await this.fetchPeriod(period);
     let ranked = this.scoreEntries(raw);
+    this.logger.debug?.('refresh_phase_complete', { phase: 'fetch', period, entries: raw.length });
 
-    // Enrich top entries with detailed stats from API
+    // Phase 2: Enrich top entries with detailed stats
     const enrichTarget = Math.min(ranked.length, Math.max(this.enrichCount, this.opts.selectCount * 2));
     const toEnrich = ranked.slice(0, enrichTarget);
 
     let hyperliquidSeries = new Map<string, PortfolioWindowSeries[]>();
     if (toEnrich.length) {
+      this.setProgress('enriching', `Enriching top ${toEnrich.length} entries with stats`);
       await this.applyAddressStats(period, toEnrich);
+      this.logger.debug?.('refresh_phase_complete', { phase: 'stats', period, enriched: toEnrich.length });
+
+      this.setProgress('portfolio', `Fetching portfolio series for ${toEnrich.length} entries`);
       hyperliquidSeries = await this.fetchPortfolioSeriesBatch(period, toEnrich);
+      this.logger.debug?.('refresh_phase_complete', { phase: 'portfolio', period, fetched: hyperliquidSeries.size });
     }
 
     const tracked = ranked.slice(0, this.enrichCount);
 
-    // Auto-convert custom accounts that are now picked by the system
-    // If a custom account appears in the system-ranked entries, remove its custom status
-    try {
-      const customAccounts = await listCustomAccounts();
-      const topAddresses = new Set(ranked.slice(0, this.opts.selectCount).map(e => normalizeAddress(e.address)));
+    // Phase 3: Apply BTC/ETH filtering
+    this.setProgress('filtering', `Filtering for BTC/ETH qualified candidates`);
+    const qualifiedCandidates = await this.filterBtcEthQualified(ranked, this.opts.selectCount);
+    this.logger.debug?.('refresh_phase_complete', { phase: 'btc_eth_filter', period, qualified: qualifiedCandidates.length });
 
-      for (const custom of customAccounts) {
-        const normalizedCustom = normalizeAddress(custom.address);
-        if (topAddresses.has(normalizedCustom)) {
-          // This custom account is now system-ranked, remove custom status
-          await removeCustomAccount(custom.address);
-          this.logger.info('custom_account_auto_converted', {
-            address: normalizedCustom,
-            reason: 'Account is now in system top rankings',
+    // Auto-unpin custom accounts that are now displayed in the system rankings
+    // Only unpin if the account is BTC/ETH qualified (actually shown in dashboard)
+    // Pinned accounts from leaderboard remain pinned (they're excluded from top-10 selection)
+    try {
+      const pinnedAccounts = await listPinnedAccounts(true); // Only custom accounts
+      const qualifiedAddresses = new Set(qualifiedCandidates.slice(0, this.opts.selectCount).map(e => normalizeAddress(e.address)));
+
+      for (const pinned of pinnedAccounts) {
+        const normalizedPinned = normalizeAddress(pinned.address);
+        if (qualifiedAddresses.has(normalizedPinned)) {
+          // This custom pinned account is now displayed in system rankings, unpin it
+          await unpinAccount(pinned.address);
+          this.logger.info('custom_account_auto_unpinned', {
+            address: normalizedPinned,
+            reason: 'Account is now in displayed system rankings (BTC/ETH qualified)',
           });
         }
       }
     } catch (err: any) {
-      this.logger.warn('custom_account_auto_convert_failed', { err: err?.message });
+      this.logger.warn('custom_account_auto_unpin_failed', { err: err?.message });
     }
 
-    // Apply BTC/ETH filtering to get top qualified candidates
-    const qualifiedCandidates = await this.filterBtcEthQualified(ranked, this.opts.selectCount);
-
-    // Persist with qualified flags - returns false if skipped due to empty data
+    // Phase 4: Persist to database
+    this.setProgress('persisting', `Saving ${ranked.length} entries to database`);
     const persisted = await this.persistPeriod(period, ranked, tracked, hyperliquidSeries);
 
+    const periodElapsedMs = Date.now() - periodStartTime;
+
     if (persisted) {
+      this.setProgress('publishing', `Publishing ${qualifiedCandidates.length} candidates`);
       await this.publishTopCandidates(period, qualifiedCandidates);
-      this.logger.info('leaderboard_updated', {
+      this.logger.info('refresh_period_completed', {
         period,
-        count: ranked.length,
-        qualified: qualifiedCandidates.length,
-        target: this.opts.selectCount
+        elapsedMs: periodElapsedMs,
+        elapsedHuman: this.formatDuration(periodElapsedMs),
+        totalEntries: ranked.length,
+        qualifiedEntries: qualifiedCandidates.length,
+        targetCount: this.opts.selectCount,
       });
     } else {
       // Log that refresh was skipped - operators can detect upstream outages
       this.logger.warn('leaderboard_refresh_skipped', {
         period,
+        elapsedMs: periodElapsedMs,
         reason: 'empty_upstream_data',
         message: 'Upstream API returned empty data; serving stale snapshot',
       });
@@ -823,21 +985,130 @@ export class LeaderboardService {
   }
 
   /**
+   * Check database cache for BTC/ETH analysis (30-day TTL)
+   */
+  private async getBtcEthFromDbCache(address: string): Promise<BtcEthAnalysis | null> {
+    try {
+      const pool = await getPool();
+      const { rows } = await pool.query(
+        `SELECT btc_pnl, eth_pnl, btc_eth_pnl, total_pnl, btc_eth_ratio, qualified, reason
+         FROM hl_btc_eth_analysis_cache
+         WHERE address = $1 AND expires_at > NOW()`,
+        [address]
+      );
+      if (rows.length > 0) {
+        const row = rows[0];
+        return {
+          btcPnl: Number(row.btc_pnl),
+          ethPnl: Number(row.eth_pnl),
+          btcEthPnl: Number(row.btc_eth_pnl),
+          totalPnl: Number(row.total_pnl),
+          btcEthRatio: Number(row.btc_eth_ratio),
+          qualified: Boolean(row.qualified),
+          reason: row.reason || undefined,
+        };
+      }
+    } catch (err: any) {
+      this.logger.debug?.('btc_eth_db_cache_error', { address, err: err?.message });
+    }
+    return null;
+  }
+
+  /**
+   * Store BTC/ETH analysis in database cache (30-day TTL)
+   */
+  private async saveBtcEthToDbCache(address: string, analysis: BtcEthAnalysis): Promise<void> {
+    try {
+      const pool = await getPool();
+      await pool.query(
+        `INSERT INTO hl_btc_eth_analysis_cache
+         (address, btc_pnl, eth_pnl, btc_eth_pnl, total_pnl, btc_eth_ratio, qualified, reason, fetched_at, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW() + INTERVAL '${BTC_ETH_DB_CACHE_TTL_DAYS} days')
+         ON CONFLICT (address) DO UPDATE SET
+           btc_pnl = EXCLUDED.btc_pnl,
+           eth_pnl = EXCLUDED.eth_pnl,
+           btc_eth_pnl = EXCLUDED.btc_eth_pnl,
+           total_pnl = EXCLUDED.total_pnl,
+           btc_eth_ratio = EXCLUDED.btc_eth_ratio,
+           qualified = EXCLUDED.qualified,
+           reason = EXCLUDED.reason,
+           fetched_at = NOW(),
+           expires_at = NOW() + INTERVAL '${BTC_ETH_DB_CACHE_TTL_DAYS} days'`,
+        [
+          address,
+          analysis.btcPnl,
+          analysis.ethPnl,
+          analysis.btcEthPnl,
+          analysis.totalPnl,
+          analysis.btcEthRatio,
+          analysis.qualified,
+          analysis.reason || null,
+        ]
+      );
+    } catch (err: any) {
+      this.logger.debug?.('btc_eth_db_cache_save_error', { address, err: err?.message });
+    }
+  }
+
+  /**
+   * Fetch BTC/ETH trades with retry logic for rate limiting (429 errors)
+   */
+  private async fetchBtcEthTradesWithRetry(
+    url: string,
+    address: string
+  ): Promise<CompletedTrade[]> {
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt < MAX_RATE_LIMIT_RETRIES; attempt++) {
+      // Apply rate limiting delay (increases with each retry)
+      const delay = attempt === 0 ? BTC_ETH_REQUEST_DELAY_MS : RATE_LIMIT_BACKOFF_BASE_MS * Math.pow(2, attempt - 1);
+      await sleep(delay);
+
+      try {
+        const payload = await this.requestJson<any>(url, { method: 'GET' }, 1, 10000);
+        return Array.isArray(payload?.data) ? payload.data : [];
+      } catch (err: any) {
+        lastError = err;
+        const isRateLimit = err?.message?.includes('429') || err?.message?.includes('rate');
+
+        if (isRateLimit && attempt < MAX_RATE_LIMIT_RETRIES - 1) {
+          const nextDelay = RATE_LIMIT_BACKOFF_BASE_MS * Math.pow(2, attempt);
+          this.logger.warn('btc_eth_rate_limited', {
+            address,
+            attempt: attempt + 1,
+            maxRetries: MAX_RATE_LIMIT_RETRIES,
+            nextDelayMs: nextDelay,
+            err: err?.message,
+          });
+          continue;
+        }
+
+        // Non-rate-limit error or exhausted retries
+        break;
+      }
+    }
+
+    // All retries exhausted
+    throw lastError || new Error('Failed to fetch BTC/ETH trades');
+  }
+
+  /**
    * Fetch and analyze BTC/ETH trades for an address.
    * Returns analysis of BTC+ETH PnL contribution to total PnL.
    * Only considers trades lasting at least 10 minutes (excludes scalping).
-   * Results are cached to reduce API calls.
+   *
+   * Caching strategy:
+   * 1. In-memory LRU cache (1 hour TTL) for hot data
+   * 2. Database cache (30 day TTL) for persistent storage
+   * 3. Retry with exponential backoff for rate limiting (429 errors)
    *
    * API: GET https://hyperbot.network/api/leaderboard/smart/completed-trades/{address}?take=2000
    */
   private async analyzeBtcEthTrades(address: string, totalPnl: number): Promise<BtcEthAnalysis> {
     const normalized = normalizeAddress(address);
 
-    // Check cache first (cache key includes address only, not totalPnl since trades don't change)
-    const cached = btcEthAnalysisCache.get(normalized);
-    if (cached) {
-      this.logger.debug?.('btc_eth_cache_hit', { address: normalized });
-      // Recalculate ratio with current totalPnl (in case it changed)
+    // Helper to recalculate qualification with current totalPnl
+    const recalculateQualification = (cached: BtcEthAnalysis): BtcEthAnalysis => {
       const btcEthRatio = totalPnl !== 0 ? Math.abs(cached.btcEthPnl / totalPnl) : 0;
       const qualified = cached.btcEthPnl >= 0 && btcEthRatio >= 0.10;
       return {
@@ -847,17 +1118,30 @@ export class LeaderboardService {
         qualified,
         reason: !qualified ? (cached.btcEthPnl < 0 ? 'btc_eth_negative_pnl' : 'btc_eth_insufficient_contribution') : undefined,
       };
+    };
+
+    // 1. Check in-memory cache first (fastest)
+    const memCached = btcEthAnalysisCache.get(normalized);
+    if (memCached) {
+      this.logger.debug?.('btc_eth_mem_cache_hit', { address: normalized });
+      return recalculateQualification(memCached);
     }
 
-    // Rate limit before making request
-    await hyperbotRateLimiter.acquire();
+    // 2. Check database cache (30-day TTL)
+    const dbCached = await this.getBtcEthFromDbCache(normalized);
+    if (dbCached) {
+      this.logger.debug?.('btc_eth_db_cache_hit', { address: normalized });
+      // Populate in-memory cache
+      btcEthAnalysisCache.set(normalized, dbCached);
+      return recalculateQualification(dbCached);
+    }
 
+    // 3. Fetch from API with retry logic
     const url = `${this.smartApiBase}completed-trades/${encodeURIComponent(normalized)}?take=2000`;
     const MIN_TRADE_DURATION_MS = 10 * 60 * 1000; // 10 minutes
 
     try {
-      const payload = await this.requestJson<any>(url, { method: 'GET' }, 2, 8000);
-      const trades: CompletedTrade[] = Array.isArray(payload?.data) ? payload.data : [];
+      const trades = await this.fetchBtcEthTradesWithRetry(url, normalized);
 
       let btcPnl = 0;
       let ethPnl = 0;
@@ -915,12 +1199,35 @@ export class LeaderboardService {
         reason,
       };
 
-      // Cache the result (store btcPnl, ethPnl, btcEthPnl for reuse)
+      // Cache in memory
       btcEthAnalysisCache.set(normalized, result);
+
+      // Cache in database (30-day TTL) - fire and forget
+      this.saveBtcEthToDbCache(normalized, result).catch(() => {});
+
+      this.logger.info('btc_eth_analysis_complete', {
+        address: normalized,
+        btcPnl: btcPnl.toFixed(2),
+        ethPnl: ethPnl.toFixed(2),
+        btcEthRatio: (btcEthRatio * 100).toFixed(2) + '%',
+        qualified,
+        reason,
+      });
 
       return result;
     } catch (err: any) {
-      this.logger.warn('btc_eth_analysis_failed', { address: normalized, err: err?.message });
+      const isRateLimit = err?.message?.includes('429') || err?.message?.includes('rate');
+
+      if (isRateLimit) {
+        this.logger.error('btc_eth_analysis_rate_limit_exhausted', {
+          address: normalized,
+          err: err?.message,
+          suggestion: 'Consider increasing BTC_ETH_REQUEST_DELAY_MS or RATE_LIMIT_BACKOFF_BASE_MS',
+        });
+      } else {
+        this.logger.warn('btc_eth_analysis_failed', { address: normalized, err: err?.message });
+      }
+
       // On error, assume not qualified to be conservative
       return {
         btcPnl: 0,
@@ -929,7 +1236,7 @@ export class LeaderboardService {
         btcEthPnl: 0,
         btcEthRatio: 0,
         qualified: false,
-        reason: 'api_fetch_failed',
+        reason: isRateLimit ? 'rate_limit_exhausted' : 'api_fetch_failed',
       };
     }
   }
@@ -1048,8 +1355,19 @@ export class LeaderboardService {
     try {
       await client.query('BEGIN');
       // Safe to delete now - we have valid new data to replace it with
-      await client.query('DELETE FROM hl_leaderboard_entries WHERE period_days = $1', [period]);
-      await client.query('DELETE FROM hl_leaderboard_pnl_points WHERE period_days = $1', [period]);
+      // Preserve pinned account entries by excluding addresses in hl_pinned_accounts
+      await client.query(
+        `DELETE FROM hl_leaderboard_entries
+         WHERE period_days = $1
+         AND lower(address) NOT IN (SELECT lower(address) FROM hl_pinned_accounts)`,
+        [period]
+      );
+      await client.query(
+        `DELETE FROM hl_leaderboard_pnl_points
+         WHERE period_days = $1
+         AND lower(address) NOT IN (SELECT lower(address) FROM hl_pinned_accounts)`,
+        [period]
+      );
     const chunkSize = 100;
     for (let i = 0; i < entries.length; i += chunkSize) {
       const chunk = entries.slice(i, i + chunkSize);
@@ -1306,6 +1624,8 @@ export class LeaderboardService {
     const targetPeriod = period ?? this.opts.periods[0] ?? 30;
     const normalized = normalizeAddress(address);
 
+    // Only consider accounts that are BTC/ETH qualified (displayed in dashboard)
+    // This matches the getSelected query criteria
     const { rows } = await pool.query(
       `
         SELECT
@@ -1324,7 +1644,8 @@ export class LeaderboardService {
         FROM hl_leaderboard_entries
         WHERE period_days = $1
           AND lower(address) = $2
-          AND (metrics->>'custom' IS NULL OR metrics->>'custom' != 'true')
+          AND (metrics->'raw'->>'custom' IS NULL OR metrics->'raw'->>'custom' != 'true')
+          AND (metrics->'raw'->'btcEthAnalysis'->>'qualified')::boolean IS TRUE
           AND score > 0
       `,
       [targetPeriod, normalized]
@@ -1356,6 +1677,10 @@ export class LeaderboardService {
 
   async getSelected(period: number, limit = this.opts.selectCount): Promise<RankedEntry[]> {
     const pool = await getPool();
+    // Get pinned addresses to exclude from selection
+    const pinnedAddresses = await getPinnedAddressSet();
+    const pinnedArray = Array.from(pinnedAddresses);
+
     const { rows } = await pool.query(
       `
         SELECT
@@ -1382,10 +1707,11 @@ export class LeaderboardService {
             metrics->'raw'->>'custom' = 'true'
             OR (metrics->'raw'->'btcEthAnalysis'->>'qualified')::boolean IS TRUE
           )
+          AND lower(address) NOT IN (SELECT unnest($3::text[]))
         ORDER BY weight DESC, rank ASC
         LIMIT $2
       `,
-      [period, limit]
+      [period, limit, pinnedArray]
     );
     return rows.map((row: any) => ({
       address: row.address,
@@ -1453,6 +1779,23 @@ export class LeaderboardService {
       this.logger.warn('custom_account_remark_fetch_failed', { address: normalized, err: err?.message });
     }
 
+    // Fetch portfolio data for pnlList (PnL curve in dashboard)
+    let pnlList: Array<{ timestamp: number; value: string }> = [];
+    try {
+      const portfolioSeries = await this.fetchPortfolioSeries(normalized);
+      // Find the 30-day window (typically "month" or "30d")
+      const monthSeries = portfolioSeries?.find(s => s.window === 'month' || s.window === '30d' || s.window === 'allTime');
+      if (monthSeries?.pnlHistory?.length) {
+        pnlList = monthSeries.pnlHistory.map(pt => ({
+          timestamp: pt.ts,
+          value: String(pt.value),
+        }));
+        this.logger.info('custom_account_pnl_history_fetched', { address: normalized, points: pnlList.length });
+      }
+    } catch (err: any) {
+      this.logger.warn('custom_account_portfolio_fetch_failed', { address: normalized, err: err?.message });
+    }
+
     // Compute proper score using the scoring algorithm (same as system accounts)
     // Use computeFullScore: true to get the full score even if the account would be filtered
     const numWins = Math.round(rawWinRate * rawExecutedOrders);
@@ -1463,7 +1806,7 @@ export class LeaderboardService {
       numTrades: rawExecutedOrders,
       numWins,
       numLosses,
-      pnlList: [], // pnlList not available from stats API; stability score defaults to 0.5
+      pnlList: pnlList.map(pt => ({ timestamp: pt.timestamp, value: pt.value })),
     }, DEFAULT_SCORING_PARAMS, { computeFullScore: true });
 
     // Build the entry with computed score
@@ -1487,6 +1830,7 @@ export class LeaderboardService {
       meta: {
         custom: true,
         fetchedAt: nowIso(),
+        pnlList, // Include pnlList for dashboard PnL curve
         scoringDetails: scoringResult.details,
         filtered: scoringResult.filtered,
         filterReason: scoringResult.filterReason,
@@ -1536,7 +1880,16 @@ export class LeaderboardService {
           entry.efficiency,
           entry.remark,
           JSON.stringify(entry.labels),
-          JSON.stringify(entry.meta),
+          JSON.stringify({
+            raw: entry.meta, // Match format of system entries for dashboard compatibility
+            stats: {
+              openPositions: entry.statOpenPositions,
+              closedPositions: entry.statClosedPositions,
+              avgPositionDuration: entry.statAvgPosDuration,
+              totalPnl: entry.statTotalPnl,
+              maxDrawdown: entry.statMaxDrawdown,
+            },
+          }),
           entry.statOpenPositions,
           entry.statClosedPositions,
           entry.statAvgPosDuration,
@@ -1546,15 +1899,9 @@ export class LeaderboardService {
       );
       this.logger.info('custom_account_stats_stored', { address: normalized, period, stats });
 
-      // If we auto-fetched a nickname from the API and user didn't provide one,
-      // also update the hl_custom_accounts table so it persists
+      // Nickname is now stored in leaderboard_entries.remark (updated in the upsert above)
       if (!nickname && apiRemark) {
-        try {
-          await updateCustomAccountNickname(normalized, apiRemark);
-          this.logger.info('custom_account_nickname_auto_filled', { address: normalized, nickname: apiRemark });
-        } catch (nickErr: any) {
-          this.logger.warn('custom_account_nickname_update_failed', { address: normalized, err: nickErr?.message });
-        }
+        this.logger.info('custom_account_nickname_auto_filled', { address: normalized, nickname: apiRemark });
       }
 
       return entry;

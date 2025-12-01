@@ -11,6 +11,7 @@
 - **Scans Top Traders**: Continuously monitors 1000+ traders on Hyperliquid leaderboard
 - **Smart Ranking**: Scores traders by win rate, PnL consistency, and risk management
 - **Real-time Tracking**: Monitors positions and trades of top performers live
+- **Pin Favorites**: Pin accounts from leaderboard or add custom addresses to track
 - **AI Signals**: Generates trading signals when multiple top traders align (coming soon)
 - **Self-Learning**: Improves by analyzing past signal performance (coming soon)
 

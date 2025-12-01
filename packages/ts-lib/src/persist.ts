@@ -480,7 +480,221 @@ export async function fetchLatestFillForAddress(address: string): Promise<Recent
 }
 
 // =====================
-// Custom Accounts Management
+// Pinned Accounts Management
+// =====================
+
+const MAX_CUSTOM_PINNED_ACCOUNTS = 3;
+
+export interface PinnedAccount {
+  id: number;
+  address: string;
+  isCustom: boolean;
+  pinnedAt: string;
+}
+
+/**
+ * Get all pinned accounts
+ * @param isCustom - Optional filter: true for custom only, false for leaderboard-pinned only, undefined for all
+ */
+export async function listPinnedAccounts(isCustom?: boolean): Promise<PinnedAccount[]> {
+  try {
+    const p = await getPool();
+    let sql = `SELECT id, address, is_custom, pinned_at FROM hl_pinned_accounts`;
+    const params: boolean[] = [];
+    if (isCustom !== undefined) {
+      sql += ` WHERE is_custom = $1`;
+      params.push(isCustom);
+    }
+    sql += ` ORDER BY pinned_at ASC`;
+    const { rows } = await p.query(sql, params);
+    return rows.map((row: Record<string, unknown>) => ({
+      id: Number(row.id),
+      address: String(row.address),
+      isCustom: Boolean(row.is_custom),
+      pinnedAt: String(row.pinned_at),
+    }));
+  } catch (e) {
+    console.error('[persist] listPinnedAccounts failed:', e);
+    return [];
+  }
+}
+
+/**
+ * Pin an account from leaderboard (unlimited)
+ * @returns The pinned account or error
+ */
+export async function pinLeaderboardAccount(
+  address: string
+): Promise<{ success: boolean; account?: PinnedAccount; error?: string }> {
+  try {
+    const p = await getPool();
+    const normalizedAddress = address.toLowerCase();
+
+    const { rows } = await p.query(
+      `INSERT INTO hl_pinned_accounts (address, is_custom)
+       VALUES ($1, false)
+       ON CONFLICT (lower(address)) DO NOTHING
+       RETURNING id, address, is_custom, pinned_at`,
+      [normalizedAddress]
+    );
+
+    if (!rows.length) {
+      return { success: false, error: 'Account is already pinned' };
+    }
+
+    return {
+      success: true,
+      account: {
+        id: Number(rows[0].id),
+        address: String(rows[0].address),
+        isCustom: Boolean(rows[0].is_custom),
+        pinnedAt: String(rows[0].pinned_at),
+      },
+    };
+  } catch (e) {
+    console.error('[persist] pinLeaderboardAccount failed:', e);
+    return { success: false, error: 'Failed to pin account' };
+  }
+}
+
+/**
+ * Add a custom pinned account (max 3 allowed)
+ * Uses SHARE ROW EXCLUSIVE lock to serialize inserts and prevent race conditions.
+ * @returns The added account or error
+ */
+export async function addCustomPinnedAccount(
+  address: string
+): Promise<{ success: boolean; account?: PinnedAccount; error?: string }> {
+  const p = await getPool();
+  const client = await p.connect();
+  try {
+    const normalizedAddress = address.toLowerCase();
+
+    await client.query('BEGIN');
+
+    // Acquire exclusive lock to serialize all insert attempts
+    await client.query('LOCK TABLE hl_pinned_accounts IN SHARE ROW EXCLUSIVE MODE');
+
+    // Count custom accounts only
+    const { rows: countRows } = await client.query(
+      'SELECT COUNT(*) as cnt FROM hl_pinned_accounts WHERE is_custom = true'
+    );
+    const customCount = Number(countRows[0]?.cnt ?? 0);
+
+    if (customCount >= MAX_CUSTOM_PINNED_ACCOUNTS) {
+      await client.query('ROLLBACK');
+      return { success: false, error: `Maximum of ${MAX_CUSTOM_PINNED_ACCOUNTS} custom accounts allowed` };
+    }
+
+    // Check if already exists (as any type)
+    const { rows: existing } = await client.query(
+      'SELECT 1 FROM hl_pinned_accounts WHERE lower(address) = $1',
+      [normalizedAddress]
+    );
+    if (existing.length > 0) {
+      await client.query('ROLLBACK');
+      return { success: false, error: 'Account is already pinned' };
+    }
+
+    // Insert the account
+    const { rows } = await client.query(
+      `INSERT INTO hl_pinned_accounts (address, is_custom)
+       VALUES ($1, true)
+       RETURNING id, address, is_custom, pinned_at`,
+      [normalizedAddress]
+    );
+
+    await client.query('COMMIT');
+
+    return {
+      success: true,
+      account: {
+        id: Number(rows[0].id),
+        address: String(rows[0].address),
+        isCustom: Boolean(rows[0].is_custom),
+        pinnedAt: String(rows[0].pinned_at),
+      },
+    };
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('[persist] addCustomPinnedAccount failed:', e);
+    return { success: false, error: 'Failed to add custom account' };
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Unpin an account by address
+ * @returns true if removed, false if not found
+ */
+export async function unpinAccount(address: string): Promise<boolean> {
+  try {
+    const p = await getPool();
+    const { rowCount } = await p.query(
+      'DELETE FROM hl_pinned_accounts WHERE lower(address) = $1',
+      [address.toLowerCase()]
+    );
+    return (rowCount ?? 0) > 0;
+  } catch (e) {
+    console.error('[persist] unpinAccount failed:', e);
+    return false;
+  }
+}
+
+/**
+ * Get count of pinned accounts
+ * @param isCustom - Optional filter: true for custom only, false for leaderboard-pinned only
+ */
+export async function getPinnedAccountCount(isCustom?: boolean): Promise<number> {
+  try {
+    const p = await getPool();
+    let sql = 'SELECT COUNT(*) as cnt FROM hl_pinned_accounts';
+    const params: boolean[] = [];
+    if (isCustom !== undefined) {
+      sql += ' WHERE is_custom = $1';
+      params.push(isCustom);
+    }
+    const { rows } = await p.query(sql, params);
+    return Number(rows[0]?.cnt ?? 0);
+  } catch (_e) {
+    return 0;
+  }
+}
+
+/**
+ * Check if an address is pinned
+ * @returns Object with isPinned and isCustom flags, or null if not pinned
+ */
+export async function isPinnedAccount(address: string): Promise<{ isPinned: boolean; isCustom: boolean } | null> {
+  try {
+    const p = await getPool();
+    const { rows } = await p.query(
+      'SELECT is_custom FROM hl_pinned_accounts WHERE lower(address) = $1 LIMIT 1',
+      [address.toLowerCase()]
+    );
+    if (rows.length === 0) return null;
+    return { isPinned: true, isCustom: Boolean(rows[0].is_custom) };
+  } catch (_e) {
+    return null;
+  }
+}
+
+/**
+ * Get all pinned addresses as a Set (for efficient lookup)
+ */
+export async function getPinnedAddressSet(): Promise<Set<string>> {
+  try {
+    const p = await getPool();
+    const { rows } = await p.query('SELECT address FROM hl_pinned_accounts');
+    return new Set(rows.map((row: Record<string, unknown>) => String(row.address).toLowerCase()));
+  } catch (_e) {
+    return new Set();
+  }
+}
+
+// =====================
+// Legacy Custom Accounts (for backward compatibility during migration)
 // =====================
 
 const MAX_CUSTOM_ACCOUNTS = 3;
@@ -493,14 +707,21 @@ export interface CustomAccount {
 }
 
 /**
+ * @deprecated Use listPinnedAccounts instead
  * Get all custom accounts (max 3)
  */
 export async function listCustomAccounts(): Promise<CustomAccount[]> {
   try {
     const p = await getPool();
+    // Try new table first, fall back to old table
     const { rows } = await p.query(
-      `SELECT id, address, nickname, added_at FROM hl_custom_accounts ORDER BY added_at ASC`
-    );
+      `SELECT id, address, pinned_at as added_at FROM hl_pinned_accounts WHERE is_custom = true ORDER BY pinned_at ASC`
+    ).catch(async () => {
+      // Fallback to old table
+      return p.query(
+        `SELECT id, address, nickname, added_at FROM hl_custom_accounts ORDER BY added_at ASC`
+      );
+    });
     return rows.map((row: Record<string, unknown>) => ({
       id: Number(row.id),
       address: String(row.address),
@@ -514,118 +735,57 @@ export async function listCustomAccounts(): Promise<CustomAccount[]> {
 }
 
 /**
+ * @deprecated Use addCustomPinnedAccount instead
  * Add a custom account (max 3 allowed)
- * Uses SHARE ROW EXCLUSIVE lock to serialize inserts and prevent race conditions.
- * This ensures two parallel requests cannot both see <3 accounts and both insert.
- * @returns The added account or null if limit reached or duplicate
  */
 export async function addCustomAccount(
   address: string,
   nickname?: string | null
 ): Promise<{ success: boolean; account?: CustomAccount; error?: string }> {
-  const p = await getPool();
-  const client = await p.connect();
-  try {
-    const normalizedAddress = address.toLowerCase();
-
-    await client.query('BEGIN');
-
-    // Acquire exclusive lock to serialize all insert attempts
-    // SHARE ROW EXCLUSIVE prevents concurrent inserts while allowing concurrent reads
-    await client.query('LOCK TABLE hl_custom_accounts IN SHARE ROW EXCLUSIVE MODE');
-
-    // Now count is accurate - no other insert can proceed until we commit/rollback
-    const { rows: countRows } = await client.query('SELECT COUNT(*) as cnt FROM hl_custom_accounts');
-    const currentCount = Number(countRows[0]?.cnt ?? 0);
-
-    if (currentCount >= MAX_CUSTOM_ACCOUNTS) {
-      await client.query('ROLLBACK');
-      return { success: false, error: `Maximum of ${MAX_CUSTOM_ACCOUNTS} custom accounts allowed` };
-    }
-
-    // Insert the account atomically within the same transaction
-    const { rows } = await client.query(
-      `INSERT INTO hl_custom_accounts (address, nickname)
-       VALUES ($1, $2)
-       ON CONFLICT (lower(address)) DO NOTHING
-       RETURNING id, address, nickname, added_at`,
-      [normalizedAddress, nickname || null]
-    );
-
-    if (!rows.length) {
-      await client.query('ROLLBACK');
-      return { success: false, error: 'Account already exists' };
-    }
-
-    await client.query('COMMIT');
-
-    return {
-      success: true,
-      account: {
-        id: Number(rows[0].id),
-        address: String(rows[0].address),
-        nickname: rows[0].nickname ? String(rows[0].nickname) : null,
-        addedAt: String(rows[0].added_at),
-      },
-    };
-  } catch (e) {
-    await client.query('ROLLBACK').catch(() => {});
-    console.error('[persist] addCustomAccount failed:', e);
-    return { success: false, error: 'Failed to add account' };
-  } finally {
-    client.release();
+  // Delegate to new function
+  const result = await addCustomPinnedAccount(address);
+  if (!result.success) {
+    return { success: false, error: result.error };
   }
+  return {
+    success: true,
+    account: {
+      id: result.account!.id,
+      address: result.account!.address,
+      nickname: nickname || null,
+      addedAt: result.account!.pinnedAt,
+    },
+  };
 }
 
 /**
+ * @deprecated Use unpinAccount instead
  * Remove a custom account by address
  */
 export async function removeCustomAccount(address: string): Promise<boolean> {
-  try {
-    const p = await getPool();
-    const { rowCount } = await p.query(
-      'DELETE FROM hl_custom_accounts WHERE lower(address) = $1',
-      [address.toLowerCase()]
-    );
-    return (rowCount ?? 0) > 0;
-  } catch (e) {
-    console.error('[persist] removeCustomAccount failed:', e);
-    return false;
-  }
+  return unpinAccount(address);
 }
 
 /**
+ * @deprecated Use getPinnedAccountCount(true) instead
  * Get count of custom accounts
  */
 export async function getCustomAccountCount(): Promise<number> {
-  try {
-    const p = await getPool();
-    const { rows } = await p.query('SELECT COUNT(*) as cnt FROM hl_custom_accounts');
-    return Number(rows[0]?.cnt ?? 0);
-  } catch (_e) {
-    return 0;
-  }
+  return getPinnedAccountCount(true);
 }
 
 /**
+ * @deprecated Use isPinnedAccount instead
  * Check if an address is a custom account
  */
 export async function isCustomAccount(address: string): Promise<boolean> {
-  try {
-    const p = await getPool();
-    const { rows } = await p.query(
-      'SELECT 1 FROM hl_custom_accounts WHERE lower(address) = $1 LIMIT 1',
-      [address.toLowerCase()]
-    );
-    return rows.length > 0;
-  } catch (_e) {
-    return false;
-  }
+  const result = await isPinnedAccount(address);
+  return result?.isCustom === true;
 }
 
 /**
+ * @deprecated Nicknames are now managed via leaderboard_entries
  * Update nickname for a custom account
- * @returns Updated account or null if not found
  */
 export async function updateCustomAccountNickname(
   address: string,
@@ -633,25 +793,27 @@ export async function updateCustomAccountNickname(
 ): Promise<{ success: boolean; account?: CustomAccount; error?: string }> {
   try {
     const p = await getPool();
-    const { rows } = await p.query(
-      `UPDATE hl_custom_accounts
-       SET nickname = $2
-       WHERE lower(address) = $1
-       RETURNING id, address, nickname, added_at`,
+    // Update nickname in leaderboard_entries if it exists
+    await p.query(
+      `UPDATE hl_leaderboard_entries
+       SET remark = $2
+       WHERE lower(address) = $1`,
       [address.toLowerCase(), nickname || null]
     );
 
-    if (!rows.length) {
+    // Check if the account is pinned
+    const pinned = await isPinnedAccount(address);
+    if (!pinned) {
       return { success: false, error: 'Account not found' };
     }
 
     return {
       success: true,
       account: {
-        id: Number(rows[0].id),
-        address: String(rows[0].address),
-        nickname: rows[0].nickname ? String(rows[0].nickname) : null,
-        addedAt: String(rows[0].added_at),
+        id: 0,
+        address: address.toLowerCase(),
+        nickname: nickname,
+        addedAt: new Date().toISOString(),
       },
     };
   } catch (e) {

@@ -66,13 +66,22 @@ You can also click "Load More" to fetch historical fills.
 - **Tracked Traders** - Top performers being monitored, with stats
 - **Trader Activity** - Real-time fills from tracked accounts
 
-### What does the ★ star mean?
+### What do the pin icons mean?
 
-Starred accounts are custom accounts you added for tracking. You can add up to 3 custom accounts.
+- **Gray pin** - Account pinned from the leaderboard (unlimited)
+- **Gold pin** - Custom account you added manually (max 3)
+- **No pin** - System-selected account from top 10
 
-### How do I add a custom account?
+Pinned accounts are always tracked, even when they drop out of the top rankings.
 
-Enter an Ethereum address (0x...) in the "Custom Accounts" input box and click +. Optionally add a nickname.
+### How do I pin an account?
+
+Two ways to pin accounts:
+
+1. **From leaderboard**: Click the pin icon next to any trader in the list
+2. **Custom address**: Enter an Ethereum address (0x...) in the "Add Custom" input box and click +
+
+You can pin unlimited accounts from the leaderboard, but only add up to 3 custom addresses.
 
 ### Why are some fills grouped together?
 
@@ -114,7 +123,7 @@ docker compose logs -f hl-stream # Specific service
 PostgreSQL stores all data in a Docker volume. Key tables:
 - `hl_events` - Trade and position events
 - `hl_leaderboard_entries` - Trader rankings
-- `hl_custom_accounts` - User's custom tracked accounts
+- `hl_pinned_accounts` - User's pinned accounts
 
 ### Why is leaderboard.ts coverage not 100%?
 

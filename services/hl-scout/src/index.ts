@@ -49,12 +49,14 @@ import {
   validateEthereumAddress,
   validateAddressArray,
   sanitizeNickname,
-  listCustomAccounts,
-  addCustomAccount,
-  removeCustomAccount,
-  updateCustomAccountNickname,
-  getCustomAccountCount,
-  getLastRefreshTime
+  listPinnedAccounts,
+  pinLeaderboardAccount,
+  addCustomPinnedAccount,
+  unpinAccount,
+  getPinnedAccountCount,
+  isPinnedAccount,
+  getLastRefreshTime,
+  runMigrations
 } from '@hl/ts-lib';
 import LeaderboardService, { LeaderboardSort } from './leaderboard';
 
@@ -355,6 +357,7 @@ async function bootstrapCandidates(subject: string, js: Awaited<ReturnType<typeo
  */
 async function main() {
   await getPool(); // ensure db connectivity
+  await runMigrations(); // apply any pending migrations
   const natsUrl = process.env.NATS_URL || 'nats://localhost:4222';
   const topic = 'a.candidates.v1';
   const nats = await connectNats(natsUrl);
@@ -491,34 +494,33 @@ async function main() {
     const systemLimit = 10; // Always get top 10 system accounts
     const selected = await leaderboardService.getSelected(period, systemLimit);
 
-    // Get custom accounts
-    const customAccounts = await listCustomAccounts();
-    const customAddressSet = new Set(customAccounts.map((a) => a.address.toLowerCase()));
+    // Get pinned accounts (both leaderboard-pinned and custom)
+    const pinnedAccounts = await listPinnedAccounts();
 
-    // Mark system accounts and filter out any that are also custom
+    // Mark system accounts (already filtered to exclude pinned in getSelected)
     const systemEntries = selected
-      .filter((entry) => !customAddressSet.has(entry.address.toLowerCase()))
       .slice(0, systemLimit)
       .map((entry) => ({
         ...entry,
+        isPinned: false,
         isCustom: false,
       }));
 
-    // For custom accounts, try to get their leaderboard stats
-    const customEntries = await Promise.all(
-      customAccounts.map(async (custom) => {
+    // For pinned accounts, try to get their leaderboard stats
+    const pinnedEntries = await Promise.all(
+      pinnedAccounts.map(async (pinned) => {
         // Try to find in leaderboard entries
         const pool = await getPool();
         const { rows } = await pool.query(
           `SELECT * FROM hl_leaderboard_entries
            WHERE period_days = $1 AND lower(address) = $2
            LIMIT 1`,
-          [period, custom.address.toLowerCase()]
+          [period, pinned.address.toLowerCase()]
         );
         if (rows.length) {
           const row = rows[0];
           return {
-            address: custom.address,
+            address: pinned.address,
             rank: 0, // Will be re-ranked
             score: Number(row.score ?? 0),
             weight: 0,
@@ -527,7 +529,7 @@ async function main() {
             realizedPnl: Number(row.realized_pnl ?? 0),
             efficiency: Number(row.efficiency ?? 0),
             pnlConsistency: Number(row.pnl_consistency ?? 0),
-            remark: custom.nickname || row.remark || null,
+            remark: row.remark || null,
             labels: row.labels || [],
             statOpenPositions: row.stat_open_positions,
             statClosedPositions: row.stat_closed_positions,
@@ -535,12 +537,13 @@ async function main() {
             statTotalPnl: row.stat_total_pnl,
             statMaxDrawdown: row.stat_max_drawdown,
             meta: row.metrics || {},
-            isCustom: true,
+            isPinned: true,
+            isCustom: pinned.isCustom,
           };
         }
         // No leaderboard entry found - return minimal data
         return {
-          address: custom.address,
+          address: pinned.address,
           rank: 0,
           score: 0,
           weight: 0,
@@ -549,7 +552,7 @@ async function main() {
           realizedPnl: 0,
           efficiency: 0,
           pnlConsistency: 0,
-          remark: custom.nickname || null,
+          remark: null,
           labels: [],
           statOpenPositions: null,
           statClosedPositions: null,
@@ -557,13 +560,14 @@ async function main() {
           statTotalPnl: null,
           statMaxDrawdown: null,
           meta: {},
-          isCustom: true,
+          isPinned: true,
+          isCustom: pinned.isCustom,
         };
       })
     );
 
     // Merge and re-rank all entries by score
-    const allEntries = [...systemEntries, ...customEntries];
+    const allEntries = [...systemEntries, ...pinnedEntries];
     allEntries.sort((a, b) => b.score - a.score);
     allEntries.forEach((entry, idx) => {
       entry.rank = idx + 1;
@@ -618,8 +622,9 @@ async function main() {
       }
     }
 
-    // Get last refresh timestamp
+    // Get last refresh timestamp and live status
     const lastRefresh = await getLastRefreshTime(period);
+    const refreshStatus = leaderboardService?.getRefreshStatus() || null;
 
     res.json({
       period,
@@ -629,8 +634,18 @@ async function main() {
       holdings,
       lastRefresh,
       lastRefreshFormatted: lastRefresh ? new Date(lastRefresh).toISOString() : null,
-      customAccountCount: customAccounts.length,
-      maxCustomAccounts: 3,
+      // Include refresh status for dashboard UI
+      refreshStatus: refreshStatus ? {
+        status: refreshStatus.status,
+        isRefreshing: refreshStatus.isRefreshing,
+        nextRefreshAt: refreshStatus.nextRefreshAt,
+        nextRefreshInMs: refreshStatus.nextRefreshInMs,
+        refreshIntervalMs: refreshStatus.refreshIntervalMs,
+        progress: refreshStatus.progress,
+      } : null,
+      pinnedAccountCount: pinnedAccounts.length,
+      customPinnedCount: pinnedAccounts.filter(p => p.isCustom).length,
+      maxCustomPinned: 3,
       recommendation: top
         ? {
             address: top.address,
@@ -673,25 +688,30 @@ async function main() {
   });
 
   // =====================
-  // Custom Accounts API
+  // Pinned Accounts API
   // =====================
 
-  // Get all custom accounts
-  app.get('/custom-accounts', async (_req, res) => {
+  // Get all pinned accounts
+  app.get('/pinned-accounts', async (_req, res) => {
     try {
-      const accounts = await listCustomAccounts();
-      const count = accounts.length;
-      res.json({ accounts, count, maxAllowed: 3 });
+      const accounts = await listPinnedAccounts();
+      const customCount = accounts.filter(a => a.isCustom).length;
+      res.json({
+        accounts,
+        count: accounts.length,
+        customCount,
+        maxCustomAllowed: 3,
+      });
     } catch (err: any) {
-      logger.error('custom_accounts_list_failed', { err: err?.message });
-      res.status(500).json({ error: 'Failed to list custom accounts' });
+      logger.error('pinned_accounts_list_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to list pinned accounts' });
     }
   });
 
-  // Add a custom account
-  app.post('/custom-accounts', async (req, res) => {
+  // Pin an account from leaderboard (unlimited)
+  app.post('/pinned-accounts/leaderboard', async (req, res) => {
     try {
-      const { address, nickname } = req.body;
+      const { address } = req.body;
       if (!address || typeof address !== 'string') {
         res.status(400).json({ error: 'Address is required' });
         return;
@@ -705,53 +725,186 @@ async function main() {
         return;
       }
 
-      // Check if account already exists in top 10 system-ranked entries
-      // Only block if it's already in the top performers shown in UI
-      if (leaderboardService) {
-        const existingEntry = await leaderboardService.isSystemRankedAccount(address);
-        if (existingEntry && existingEntry.rank <= 10) {
-          res.status(400).json({
-            error: 'Account already exists in top 10 system rankings',
-            rank: existingEntry.rank,
-            score: existingEntry.score,
-          });
-          return;
-        }
+      // Check if already pinned
+      const existingPinned = await isPinnedAccount(address);
+      if (existingPinned) {
+        res.status(400).json({ error: 'Account is already pinned' });
+        return;
       }
 
-      const sanitizedNickname = nickname ? sanitizeNickname(nickname) : null;
-      const result = await addCustomAccount(address, sanitizedNickname);
+      const result = await pinLeaderboardAccount(address);
 
       if (!result.success) {
         res.status(400).json({ error: result.error });
         return;
       }
 
-      logger.info('custom_account_added', { address: result.account?.address });
+      logger.info('account_pinned_from_leaderboard', { address: result.account?.address });
+      res.status(201).json({ success: true, account: result.account });
+    } catch (err: any) {
+      logger.error('pin_leaderboard_account_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to pin account' });
+    }
+  });
+
+  // Add a custom pinned account (max 3)
+  app.post('/pinned-accounts/custom', async (req, res) => {
+    try {
+      const { address } = req.body;
+      if (!address || typeof address !== 'string') {
+        res.status(400).json({ error: 'Address is required' });
+        return;
+      }
+
+      // Validate Ethereum address
+      try {
+        validateEthereumAddress(address);
+      } catch (e: any) {
+        res.status(400).json({ error: e.message || 'Invalid Ethereum address' });
+        return;
+      }
+
+      // Check if already pinned
+      const existingPinned = await isPinnedAccount(address);
+      if (existingPinned) {
+        res.status(400).json({ error: 'Account is already pinned' });
+        return;
+      }
+
+      // Check if account exists in current leaderboard (should use pin from leaderboard instead)
+      if (leaderboardService) {
+        const existingEntry = await leaderboardService.isSystemRankedAccount(address);
+        if (existingEntry) {
+          res.status(400).json({
+            error: 'Account exists in leaderboard. Use the pin button on that row instead.',
+            rank: existingEntry.rank,
+          });
+          return;
+        }
+      }
+
+      const result = await addCustomPinnedAccount(address);
+
+      if (!result.success) {
+        res.status(400).json({ error: result.error });
+        return;
+      }
+
+      logger.info('custom_pinned_account_added', { address: result.account?.address });
 
       // Return immediately - don't block on stats fetch
       res.status(201).json({ success: true, account: result.account });
 
       // Fetch stats in background (non-blocking) so UI doesn't timeout
-      // This also auto-fills nickname from API if user didn't provide one
       if (leaderboardService && result.account?.address) {
-        leaderboardService.fetchAndStoreCustomAccountStats(result.account.address, sanitizedNickname)
+        leaderboardService.fetchAndStoreCustomAccountStats(result.account.address)
           .then(stats => {
             if (stats) {
-              logger.info('custom_account_stats_fetched_background', { address: result.account?.address, remark: stats.remark });
+              logger.info('custom_pinned_account_stats_fetched', { address: result.account?.address, remark: stats.remark });
             }
           })
+          .catch((err: any) => {
+            logger.error('custom_pinned_account_stats_fetch_failed', { address: result.account?.address, err: err?.message });
+          });
+      }
+    } catch (err: any) {
+      logger.error('add_custom_pinned_account_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to add custom pinned account' });
+    }
+  });
+
+  // Unpin an account
+  app.delete('/pinned-accounts/:address', async (req, res) => {
+    try {
+      const { address } = req.params;
+      if (!address) {
+        res.status(400).json({ error: 'Address is required' });
+        return;
+      }
+
+      const removed = await unpinAccount(address);
+      if (!removed) {
+        res.status(404).json({ error: 'Account not found' });
+        return;
+      }
+
+      logger.info('account_unpinned', { address });
+      res.json({ success: true });
+    } catch (err: any) {
+      logger.error('unpin_account_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to unpin account' });
+    }
+  });
+
+  // Legacy endpoints for backward compatibility
+  // These redirect to the new pinned accounts endpoints
+  app.get('/custom-accounts', async (_req, res) => {
+    try {
+      const accounts = await listPinnedAccounts(true); // Only custom accounts
+      res.json({
+        accounts: accounts.map(a => ({
+          id: a.id,
+          address: a.address,
+          nickname: null,
+          addedAt: a.pinnedAt,
+        })),
+        count: accounts.length,
+        maxAllowed: 3,
+      });
+    } catch (err: any) {
+      logger.error('custom_accounts_list_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to list custom accounts' });
+    }
+  });
+
+  app.post('/custom-accounts', async (req, res) => {
+    // Redirect to custom pinned account endpoint
+    try {
+      const { address } = req.body;
+      if (!address || typeof address !== 'string') {
+        res.status(400).json({ error: 'Address is required' });
+        return;
+      }
+
+      validateEthereumAddress(address);
+
+      const existingPinned = await isPinnedAccount(address);
+      if (existingPinned) {
+        res.status(400).json({ error: 'Account is already pinned' });
+        return;
+      }
+
+      const result = await addCustomPinnedAccount(address);
+
+      if (!result.success) {
+        res.status(400).json({ error: result.error });
+        return;
+      }
+
+      logger.info('custom_account_added_legacy', { address: result.account?.address });
+      res.status(201).json({
+        success: true,
+        account: {
+          id: result.account?.id,
+          address: result.account?.address,
+          nickname: null,
+          addedAt: result.account?.pinnedAt,
+        },
+      });
+
+      // Fetch stats in background
+      if (leaderboardService && result.account?.address) {
+        leaderboardService.fetchAndStoreCustomAccountStats(result.account.address)
           .catch((err: any) => {
             logger.error('custom_account_stats_fetch_failed', { address: result.account?.address, err: err?.message });
           });
       }
     } catch (err: any) {
       logger.error('custom_account_add_failed', { err: err?.message });
-      res.status(500).json({ error: 'Failed to add custom account' });
+      res.status(500).json({ error: err?.message || 'Failed to add custom account' });
     }
   });
 
-  // Remove a custom account
   app.delete('/custom-accounts/:address', async (req, res) => {
     try {
       const { address } = req.params;
@@ -760,13 +913,13 @@ async function main() {
         return;
       }
 
-      const removed = await removeCustomAccount(address);
+      const removed = await unpinAccount(address);
       if (!removed) {
         res.status(404).json({ error: 'Account not found' });
         return;
       }
 
-      logger.info('custom_account_removed', { address });
+      logger.info('custom_account_removed_legacy', { address });
       res.json({ success: true });
     } catch (err: any) {
       logger.error('custom_account_remove_failed', { err: err?.message });
@@ -774,39 +927,47 @@ async function main() {
     }
   });
 
-  // Update nickname for a custom account
-  app.patch('/custom-accounts/:address', async (req, res) => {
+  // =====================
+  // Refresh Status API (Public - read only)
+  // =====================
+
+  // Get refresh status - public endpoint for dashboard
+  app.get('/leaderboard/refresh-status', async (req, res) => {
     try {
-      const { address } = req.params;
-      const { nickname } = req.body;
+      const period = Number(req.query.period ?? DEFAULT_LEADERBOARD_PERIOD);
+      const lastRefreshFromDb = await getLastRefreshTime(period);
 
-      if (!address) {
-        res.status(400).json({ error: 'Address is required' });
-        return;
-      }
+      // Get live status from service if available
+      const liveStatus = leaderboardService?.getRefreshStatus() || null;
 
-      const sanitizedNickname = nickname ? sanitizeNickname(nickname) : null;
-      const result = await updateCustomAccountNickname(address, sanitizedNickname);
-
-      if (!result.success) {
-        res.status(404).json({ error: result.error });
-        return;
-      }
-
-      logger.info('custom_account_nickname_updated', { address, nickname: sanitizedNickname });
-      res.json({ success: true, account: result.account });
+      res.json({
+        period,
+        // Database-based last refresh time
+        lastRefresh: lastRefreshFromDb,
+        lastRefreshFormatted: lastRefreshFromDb ? new Date(lastRefreshFromDb).toISOString() : null,
+        // Live status from service
+        ...(liveStatus && {
+          status: liveStatus.status,
+          isRefreshing: liveStatus.isRefreshing,
+          nextRefreshAt: liveStatus.nextRefreshAt,
+          nextRefreshInMs: liveStatus.nextRefreshInMs,
+          refreshIntervalMs: liveStatus.refreshIntervalMs,
+          progress: liveStatus.progress,
+        }),
+      });
     } catch (err: any) {
-      logger.error('custom_account_update_failed', { err: err?.message });
-      res.status(500).json({ error: 'Failed to update nickname' });
+      logger.error('refresh_status_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to get refresh status' });
     }
   });
 
   // =====================
-  // Manual Refresh API
+  // Admin Refresh API (Protected - requires owner key)
   // =====================
 
-  // Trigger a manual refresh of the leaderboard
-  app.post('/leaderboard/refresh', ownerOnly, async (req, res) => {
+  // Trigger a manual refresh - ADMIN ONLY
+  // This is protected by ownerOnly middleware to prevent abuse
+  app.post('/admin/leaderboard/trigger-refresh', ownerOnly, async (req, res) => {
     try {
       const period = Number(req.query.period ?? DEFAULT_LEADERBOARD_PERIOD);
       if (!leaderboardService) {
@@ -814,33 +975,37 @@ async function main() {
         return;
       }
 
-      logger.info('manual_refresh_triggered', { period });
+      // Check if already refreshing
+      const status = leaderboardService.getRefreshStatus();
+      if (status.isRefreshing) {
+        res.status(409).json({
+          error: 'Refresh already in progress',
+          startedAt: status.refreshStartedAt,
+          progress: status.progress,
+        });
+        return;
+      }
+
+      logger.info('admin_refresh_triggered', {
+        period,
+        source: 'api',
+        ip: req.ip,
+      });
 
       // Run refresh in background, return immediately
-      leaderboardService.refreshPeriod(period).catch((err) => {
-        logger.error('manual_refresh_failed', { period, err: err?.message });
+      leaderboardService.refreshAll().catch((err) => {
+        logger.error('admin_refresh_failed', { period, err: err?.message });
       });
 
-      res.json({ success: true, message: 'Refresh started', period });
-    } catch (err: any) {
-      logger.error('manual_refresh_request_failed', { err: err?.message });
-      res.status(500).json({ error: 'Failed to trigger refresh' });
-    }
-  });
-
-  // Get last refresh timestamp
-  app.get('/leaderboard/refresh-status', async (req, res) => {
-    try {
-      const period = Number(req.query.period ?? DEFAULT_LEADERBOARD_PERIOD);
-      const lastRefresh = await getLastRefreshTime(period);
       res.json({
+        success: true,
+        message: 'Refresh started in background',
         period,
-        lastRefresh,
-        lastRefreshFormatted: lastRefresh ? new Date(lastRefresh).toISOString() : null
+        checkStatusAt: '/leaderboard/refresh-status',
       });
     } catch (err: any) {
-      logger.error('refresh_status_failed', { err: err?.message });
-      res.status(500).json({ error: 'Failed to get refresh status' });
+      logger.error('admin_refresh_request_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to trigger refresh' });
     }
   });
 

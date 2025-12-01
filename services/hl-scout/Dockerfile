@@ -10,6 +10,7 @@ COPY scripts ./scripts
 COPY contracts ./contracts
 COPY packages ./packages
 COPY services ./services
+COPY db ./db
 RUN npm ci
 RUN npm run build
 

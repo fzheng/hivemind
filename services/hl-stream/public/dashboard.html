@@ -74,16 +74,12 @@
             <h3>
               <span class="ai-icon">⚡</span>
               AI Signals
-              <span class="panel-subtitle">Generated from tracked trader patterns</span>
+              <span class="info-icon" title="Generated from tracked trader patterns. Not financial advice.">?</span>
             </h3>
             <div class="card-actions">
               <span class="ai-status" id="ai-status">
                 <span class="ai-status-dot"></span>
-                Analyzing...
-              </span>
-              <span class="ai-disclaimer-inline">
-                <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
-                Not financial advice
+                Analyzing
               </span>
             </div>
           </div>
@@ -112,28 +108,28 @@
           <div class="card-header">
             <h3>
               Tracked Traders
-              <span class="panel-subtitle">Top performers (30-day) + custom accounts</span>
+              <span class="info-icon" title="Top 30-day performers filtered by BTC/ETH profitability. ★ = custom accounts.">?</span>
             </h3>
             <div class="card-actions">
-              <span id="last-refresh" class="last-refresh">Updated: —</span>
-              <button id="refresh-btn" class="refresh-btn" title="Refresh leaderboard">
-                <svg class="refresh-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+              <span id="last-refresh" class="last-refresh" title="Last leaderboard refresh"></span>
+              <span id="next-refresh" class="next-refresh" title="Time until next auto-refresh"></span>
+              <span id="refresh-status" class="refresh-status" style="display: none;" title="Refreshing leaderboard data...">
+                <svg class="refresh-spinner" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2">
                   <path d="M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
                 </svg>
-              </button>
+              </span>
             </div>
           </div>
-          <span class="metric-hint">AI analyzes these traders to generate signals. <span class="custom-badge">★</span> = custom</span>
 
-          <!-- Custom Accounts Section -->
-          <div class="custom-accounts-section">
-            <div class="custom-accounts-header">
-              <span>Custom Accounts (<span id="custom-count">0</span>/3)</span>
+          <!-- Pinned Accounts Section -->
+          <div class="pinned-accounts-section">
+            <div class="pinned-accounts-header">
+              <span>Add Custom (<span id="custom-count">0</span>/3)</span>
+              <span class="info-icon" title="Pin accounts from leaderboard (unlimited) or add custom addresses (max 3). Pinned accounts are excluded from auto-selection.">?</span>
             </div>
-            <div class="custom-accounts-form">
+            <div class="pinned-accounts-form">
               <input type="text" id="custom-address-input" placeholder="0x..." maxlength="42" />
-              <input type="text" id="custom-nickname-input" placeholder="Nickname" maxlength="32" />
-              <button id="add-custom-btn" class="add-custom-btn" title="Add">+</button>
+              <button id="add-custom-btn" class="add-custom-btn" title="Add custom account">+</button>
             </div>
             <div id="custom-accounts-error" class="custom-accounts-error"></div>
           </div>
@@ -147,7 +143,7 @@
                   <th>Trades</th>
                   <th>Holdings</th>
                   <th>PnL</th>
-                  <th>30D Curve</th>
+                  <th>PnL Curve</th>
                 </tr>
               </thead>
               <tbody id="address-table"></tbody>
@@ -158,12 +154,12 @@
           <div class="card-header">
             <h3>
               <span class="live-dot" title="Live"></span>
-              Trader Activity
-              <span class="panel-subtitle">Real-time fills from tracked accounts</span>
+              Activity
+              <span class="info-icon" title="Real-time BTC/ETH fills from tracked accounts via WebSocket">?</span>
             </h3>
             <div class="fills-meta">
-              <span id="fills-count" class="fills-count">0 fills</span>
-              <span id="fills-time-range" class="time-range">—</span>
+              <span id="fills-count" class="fills-count"></span>
+              <span id="fills-time-range" class="time-range"></span>
             </div>
           </div>
           <div class="fills-scroll-container" id="fills-scroll-container">

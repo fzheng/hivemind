@@ -148,26 +148,26 @@ async function fetchWatchlist(): Promise<string[]> {
     logger.warn('selected_watchlist_failed', { err: err instanceof Error ? err.message : err });
   }
 
-  // Also fetch custom accounts and add them to the watchlist
+  // Also fetch pinned accounts and add them to the watchlist
   try {
-    const customRes = await fetch(`${scoutUrl}/custom-accounts`, {
+    const pinnedRes = await fetch(`${scoutUrl}/pinned-accounts`, {
       headers: { 'x-owner-key': OWNER_TOKEN }
     });
-    if (customRes.ok) {
-      const customData = await customRes.json();
-      if (Array.isArray(customData?.accounts) && customData.accounts.length) {
-        const customAddresses = customData.accounts.map((acc: any) => normalizeAddress(acc.address));
-        // Add custom addresses that aren't already in the list
-        for (const addr of customAddresses) {
+    if (pinnedRes.ok) {
+      const pinnedData = await pinnedRes.json();
+      if (Array.isArray(pinnedData?.accounts) && pinnedData.accounts.length) {
+        const pinnedAddresses = pinnedData.accounts.map((acc: any) => normalizeAddress(acc.address));
+        // Add pinned addresses that aren't already in the list
+        for (const addr of pinnedAddresses) {
           if (!addresses.includes(addr)) {
             addresses.push(addr);
           }
         }
-        logger.info('custom_accounts_added_to_watchlist', { count: customAddresses.length });
+        logger.info('pinned_accounts_added_to_watchlist', { count: pinnedAddresses.length });
       }
     }
   } catch (err) {
-    logger.warn('custom_accounts_watchlist_failed', { err: err instanceof Error ? err.message : err });
+    logger.warn('pinned_accounts_watchlist_failed', { err: err instanceof Error ? err.message : err });
   }
 
   if (addresses.length) return addresses;
@@ -452,7 +452,63 @@ async function main() {
     });
   });
 
-  // Custom accounts proxy routes
+  // Pinned accounts proxy routes
+  app.get('/dashboard/api/pinned-accounts', (req, res) => proxyScout('/pinned-accounts', req, res));
+  app.post('/dashboard/api/pinned-accounts/leaderboard', async (req, res) => {
+    try {
+      const target = new URL('/pinned-accounts/leaderboard', scoutUrl);
+      const response = await fetch(target, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-owner-key': OWNER_TOKEN
+        },
+        body: JSON.stringify(req.body)
+      });
+      const body = await response.text();
+      const type = response.headers.get('content-type') || 'application/json';
+      res.status(response.status).setHeader('Content-Type', type).send(body);
+    } catch (err: any) {
+      logger.error('pin_leaderboard_proxy_failed', { err: err?.message });
+      res.status(502).json({ error: 'proxy_failed' });
+    }
+  });
+  app.post('/dashboard/api/pinned-accounts/custom', async (req, res) => {
+    try {
+      const target = new URL('/pinned-accounts/custom', scoutUrl);
+      const response = await fetch(target, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-owner-key': OWNER_TOKEN
+        },
+        body: JSON.stringify(req.body)
+      });
+      const body = await response.text();
+      const type = response.headers.get('content-type') || 'application/json';
+      res.status(response.status).setHeader('Content-Type', type).send(body);
+    } catch (err: any) {
+      logger.error('add_custom_pinned_proxy_failed', { err: err?.message });
+      res.status(502).json({ error: 'proxy_failed' });
+    }
+  });
+  app.delete('/dashboard/api/pinned-accounts/:address', async (req, res) => {
+    try {
+      const target = new URL(`/pinned-accounts/${encodeURIComponent(req.params.address)}`, scoutUrl);
+      const response = await fetch(target, {
+        method: 'DELETE',
+        headers: { 'x-owner-key': OWNER_TOKEN }
+      });
+      const body = await response.text();
+      const type = response.headers.get('content-type') || 'application/json';
+      res.status(response.status).setHeader('Content-Type', type).send(body);
+    } catch (err: any) {
+      logger.error('unpin_account_proxy_failed', { err: err?.message });
+      res.status(502).json({ error: 'proxy_failed' });
+    }
+  });
+
+  // Legacy custom accounts proxy routes (backward compatibility)
   app.get('/dashboard/api/custom-accounts', (req, res) => proxyScout('/custom-accounts', req, res));
   app.post('/dashboard/api/custom-accounts', async (req, res) => {
     try {
@@ -485,25 +541,6 @@ async function main() {
       res.status(response.status).setHeader('Content-Type', type).send(body);
     } catch (err: any) {
       logger.error('custom_accounts_delete_proxy_failed', { err: err?.message });
-      res.status(502).json({ error: 'proxy_failed' });
-    }
-  });
-  app.patch('/dashboard/api/custom-accounts/:address', async (req, res) => {
-    try {
-      const target = new URL(`/custom-accounts/${encodeURIComponent(req.params.address)}`, scoutUrl);
-      const response = await fetch(target, {
-        method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-owner-key': OWNER_TOKEN
-        },
-        body: JSON.stringify(req.body)
-      });
-      const body = await response.text();
-      const type = response.headers.get('content-type') || 'application/json';
-      res.status(response.status).setHeader('Content-Type', type).send(body);
-    } catch (err: any) {
-      logger.error('custom_accounts_patch_proxy_failed', { err: err?.message });
       res.status(502).json({ error: 'proxy_failed' });
     }
   });

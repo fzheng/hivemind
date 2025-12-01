@@ -18,7 +18,9 @@
     "docker:up": "docker compose up -d",
     "docker:down": "docker compose down",
     "docker:logs": "docker compose logs -f",
-    "docker:ps": "docker compose ps"
+    "docker:ps": "docker compose ps",
+    "admin:refresh": "node scripts/admin-refresh.mjs",
+    "admin:refresh:status": "node scripts/admin-refresh.mjs --status"
   },
   "dependencies": {
     "@hl/ts-lib": "file:packages/ts-lib",

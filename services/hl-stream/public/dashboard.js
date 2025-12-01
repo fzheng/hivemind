@@ -77,10 +77,10 @@ const aiRecommendationsTable = document.getElementById('ai-recommendations-table
 const aiStatusEl = document.getElementById('ai-status');
 const symbolButtons = document.querySelectorAll('.toggle-group button');
 const lastRefreshEl = document.getElementById('last-refresh');
-const refreshBtn = document.getElementById('refresh-btn');
+const nextRefreshEl = document.getElementById('next-refresh');
+const refreshStatusEl = document.getElementById('refresh-status');
 const customCountEl = document.getElementById('custom-count');
 const customAddressInput = document.getElementById('custom-address-input');
-const customNicknameInput = document.getElementById('custom-nickname-input');
 const addCustomBtn = document.getElementById('add-custom-btn');
 const customErrorEl = document.getElementById('custom-accounts-error');
 
@@ -89,8 +89,8 @@ const customErrorEl = document.getElementById('custom-accounts-error');
 // =====================
 const API_BASE = '/dashboard/api';
 const SCOUT_API = '/api'; // hl-scout API base (proxied via hl-stream)
-const TOP_TABLE_LIMIT = 13; // 10 system + up to 3 custom
-const MAX_CUSTOM_ACCOUNTS = 3;
+const TOP_TABLE_LIMIT = 20; // 10 system + unlimited pinned
+const MAX_CUSTOM_PINNED = 3;
 
 // =====================
 // Application State
@@ -98,7 +98,7 @@ const MAX_CUSTOM_ACCOUNTS = 3;
 let fillsCache = [];
 let dashboardPeriod = 30;
 let addressMeta = {};
-let customAccountCount = 0;
+let customPinnedCount = 0;
 let positionsReady = false; // Track whether positions have been loaded
 
 // =====================
@@ -876,24 +876,31 @@ function renderAddresses(stats = [], profiles = {}, holdings = {}) {
       const pnlList = row.meta?.raw?.pnlList || [];
       const sparklineCell = generateSparkline(pnlList);
 
+      const isPinned = row.isPinned === true;
       const isCustom = row.isCustom === true;
-      const customIndicator = isCustom ? '<span class="custom-star" title="Custom tracked account">★</span>' : '';
-      const removeBtn = isCustom ? `<button class="remove-custom-btn" data-address="${row.address}" title="Remove custom account">×</button>` : '';
+      const pinIconClass = isPinned ? (isCustom ? 'pinned-custom' : 'pinned-leaderboard') : 'unpinned';
+      const pinTitle = isPinned
+        ? (isCustom ? 'Custom pinned account (click to unpin)' : 'Pinned from leaderboard (click to unpin)')
+        : 'Click to pin this account';
+      const pinIcon = `
+        <span class="pin-icon ${pinIconClass}" data-address="${row.address}" data-pinned="${isPinned}" data-custom="${isCustom}" title="${pinTitle}">
+          <svg viewBox="0 0 24 24"><path d="M16 4l4 4-8.5 8.5-4-4L16 4zm-8 8l4 4-6 6v-4l2-6zM4 20h4v-4l-4 4z"/></svg>
+        </span>`;
       const nicknameDisplay = row.remark
-        ? `<span class="nickname-display" data-address="${row.address}" data-nickname="${escapeHtml(row.remark)}" title="Click to edit nickname">${escapeHtml(row.remark)}</span>`
-        : (isCustom ? `<span class="nickname-display nickname-empty" data-address="${row.address}" data-nickname="" title="Click to add nickname">+ Add nickname</span>` : '');
+        ? `<span class="nickname-display" data-address="${row.address}" data-nickname="${escapeHtml(row.remark)}">${escapeHtml(row.remark)}</span>`
+        : '';
       const addrLower = (row.address || '').toLowerCase();
+      const rowClass = isPinned ? 'pinned-row' : '';
       return `
-        <tr class="${isCustom ? 'custom-row' : ''}" data-address="${addrLower}">
+        <tr class="${rowClass}" data-address="${addrLower}">
           <td data-label="Address" title="Score: ${scoreValue}">
-            <span class="custom-indicator">
-              ${customIndicator}
-              <a href="https://hypurrscan.io/address/${row.address}" target="_blank" rel="noopener noreferrer">
+            <div class="address-cell-with-pin">
+              ${pinIcon}
+              <a class="address-link" href="https://hypurrscan.io/address/${row.address}" target="_blank" rel="noopener noreferrer">
                 ${shortAddress(row.address)}
               </a>
-              ${removeBtn}
-            </span>
-            <div class="addr-remark">${nicknameDisplay}</div>
+            </div>
+            ${nicknameDisplay ? `<div class="addr-remark">${nicknameDisplay}</div>` : ''}
           </td>
           <td data-label="Win Rate">${winRateCell}</td>
           <td data-label="Trades">${tradesCell}</td>
@@ -901,28 +908,26 @@ function renderAddresses(stats = [], profiles = {}, holdings = {}) {
             ${holdingCell}
           </td>
           <td data-label="Realized PnL">${pnlCell}</td>
-          <td data-label="30D PnL" class="sparkline-cell">${sparklineCell}</td>
+          <td data-label="PnL Curve" class="sparkline-cell">${sparklineCell}</td>
         </tr>
       `;
     })
     .join('');
 
-  // Attach event listeners for remove buttons
-  document.querySelectorAll('.remove-custom-btn').forEach((btn) => {
-    btn.addEventListener('click', (e) => {
+  // Attach event listeners for pin icons
+  document.querySelectorAll('.pin-icon').forEach((icon) => {
+    icon.addEventListener('click', async (e) => {
       e.preventDefault();
-      const address = btn.dataset.address;
-      if (address) removeCustomAccount(address);
-    });
-  });
-
-  // Attach event listeners for nickname editing (custom accounts only)
-  document.querySelectorAll('.nickname-display').forEach((el) => {
-    el.addEventListener('click', (e) => {
-      e.preventDefault();
-      const address = el.dataset.address;
-      const currentNickname = el.dataset.nickname || '';
-      if (address) showNicknameEditor(el, address, currentNickname);
+      e.stopPropagation();
+      const address = icon.dataset.address;
+      const isPinned = icon.dataset.pinned === 'true';
+      if (address) {
+        if (isPinned) {
+          await unpinAccount(address);
+        } else {
+          await pinLeaderboardAccount(address);
+        }
+      }
     });
   });
 }
@@ -1176,16 +1181,64 @@ function renderFills(list) {
 
 
 function updateLastRefreshDisplay(lastRefresh) {
-  if (lastRefresh) {
+  if (lastRefresh && lastRefreshEl) {
     const date = new Date(lastRefresh);
-    lastRefreshEl.textContent = `Last updated: ${date.toLocaleString([], { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' })}`;
-  } else {
-    lastRefreshEl.textContent = 'Last updated: —';
+    // Always show full date + time for clarity
+    const formatted = date.toLocaleString([], {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+    lastRefreshEl.textContent = `Updated: ${formatted}`;
+  } else if (lastRefreshEl) {
+    lastRefreshEl.textContent = '';
   }
 }
 
-function updateCustomAccountCount(count, max) {
-  customAccountCount = count;
+/**
+ * Update refresh status display (countdown timer and refreshing indicator)
+ */
+function updateRefreshStatusDisplay(refreshStatus) {
+  if (!refreshStatus) {
+    if (nextRefreshEl) nextRefreshEl.textContent = '';
+    if (refreshStatusEl) refreshStatusEl.style.display = 'none';
+    return;
+  }
+
+  // Show refreshing indicator if in progress
+  if (refreshStatus.isRefreshing) {
+    if (refreshStatusEl) refreshStatusEl.style.display = 'inline-flex';
+    if (nextRefreshEl) nextRefreshEl.textContent = '';
+  } else {
+    if (refreshStatusEl) refreshStatusEl.style.display = 'none';
+
+    // Show countdown to next refresh
+    if (nextRefreshEl && refreshStatus.nextRefreshInMs != null) {
+      nextRefreshEl.textContent = `Next: ${formatTimeUntil(refreshStatus.nextRefreshInMs)}`;
+    } else if (nextRefreshEl) {
+      nextRefreshEl.textContent = '';
+    }
+  }
+}
+
+/**
+ * Format milliseconds into human readable time (e.g., "23h 45m" or "15m")
+ */
+function formatTimeUntil(ms) {
+  if (ms <= 0) return 'soon';
+
+  const hours = Math.floor(ms / (60 * 60 * 1000));
+  const minutes = Math.floor((ms % (60 * 60 * 1000)) / (60 * 1000));
+
+  if (hours > 0) {
+    return `${hours}h ${minutes}m`;
+  }
+  return `${minutes}m`;
+}
+
+function updateCustomPinnedCount(count, max) {
+  customPinnedCount = count;
   customCountEl.textContent = count;
   // Disable add button if at max
   addCustomBtn.disabled = count >= max;
@@ -1243,9 +1296,12 @@ async function refreshSummary() {
     // Update last refresh display
     updateLastRefreshDisplay(data.lastRefresh);
 
-    // Update custom account count
-    if (typeof data.customAccountCount === 'number') {
-      updateCustomAccountCount(data.customAccountCount, data.maxCustomAccounts || MAX_CUSTOM_ACCOUNTS);
+    // Update refresh status (countdown timer, refreshing indicator)
+    updateRefreshStatusDisplay(data.refreshStatus);
+
+    // Update custom pinned account count
+    if (typeof data.customPinnedCount === 'number') {
+      updateCustomPinnedCount(data.customPinnedCount, data.maxCustomPinned || MAX_CUSTOM_PINNED);
     }
   } catch (err) {
     console.error('Failed to load summary:', err);
@@ -1449,11 +1505,10 @@ function isValidEthAddress(address) {
   return /^0x[a-fA-F0-9]{40}$/.test(address);
 }
 
-// Add a custom account
-async function addCustomAccount() {
+// Add a custom pinned account
+async function addCustomPinnedAccount() {
   clearCustomError();
   const address = customAddressInput.value.trim();
-  const nickname = customNicknameInput.value.trim();
 
   if (!address) {
     showCustomError('Please enter an Ethereum address');
@@ -1465,19 +1520,19 @@ async function addCustomAccount() {
     return;
   }
 
-  if (customAccountCount >= MAX_CUSTOM_ACCOUNTS) {
-    showCustomError(`Maximum of ${MAX_CUSTOM_ACCOUNTS} custom accounts allowed`);
+  if (customPinnedCount >= MAX_CUSTOM_PINNED) {
+    showCustomError(`Maximum of ${MAX_CUSTOM_PINNED} custom accounts allowed`);
     return;
   }
 
   addCustomBtn.disabled = true;
-  addCustomBtn.textContent = 'Adding...';
+  addCustomBtn.textContent = '...';
 
   try {
-    const res = await fetch(`${API_BASE}/custom-accounts`, {
+    const res = await fetch(`${API_BASE}/pinned-accounts/custom`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ address, nickname: nickname || undefined })
+      body: JSON.stringify({ address })
     });
 
     const data = await res.json();
@@ -1487,40 +1542,65 @@ async function addCustomAccount() {
       return;
     }
 
-    // Clear inputs on success
+    // Clear input on success
     customAddressInput.value = '';
-    customNicknameInput.value = '';
 
     // Refresh the summary to show the new account
     await refreshSummary();
   } catch (err) {
-    console.error('Add custom account error:', err);
+    console.error('Add custom pinned account error:', err);
     showCustomError('Failed to add custom account');
   } finally {
-    addCustomBtn.disabled = customAccountCount >= MAX_CUSTOM_ACCOUNTS;
-    addCustomBtn.textContent = 'Add';
+    addCustomBtn.disabled = customPinnedCount >= MAX_CUSTOM_PINNED;
+    addCustomBtn.textContent = '+';
   }
 }
 
-// Remove a custom account
-async function removeCustomAccount(address) {
+// Pin an account from the leaderboard
+async function pinLeaderboardAccount(address) {
   if (!address) return;
 
   try {
-    const res = await fetch(`${API_BASE}/custom-accounts/${encodeURIComponent(address)}`, {
-      method: 'DELETE'
+    const res = await fetch(`${API_BASE}/pinned-accounts/leaderboard`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ address })
     });
 
     if (!res.ok) {
       const data = await res.json();
-      console.error('Remove custom account error:', data.error);
+      console.error('Pin account error:', data.error);
+      showCustomError(data.error || 'Failed to pin account');
       return;
     }
 
     // Refresh the summary to update the table
     await refreshSummary();
   } catch (err) {
-    console.error('Remove custom account error:', err);
+    console.error('Pin account error:', err);
+    showCustomError('Failed to pin account');
+  }
+}
+
+// Unpin an account
+async function unpinAccount(address) {
+  if (!address) return;
+
+  try {
+    const res = await fetch(`${API_BASE}/pinned-accounts/${encodeURIComponent(address)}`, {
+      method: 'DELETE'
+    });
+
+    if (!res.ok) {
+      const data = await res.json();
+      console.error('Unpin account error:', data.error);
+      return;
+    }
+
+    // Refresh the summary to update the table
+    await refreshSummary();
+  } catch (err) {
+    console.error('Unpin account error:', err);
   }
 }
 
@@ -1625,72 +1705,14 @@ async function updateNickname(address, nickname) {
   }
 }
 
-// Trigger manual leaderboard refresh
-async function triggerLeaderboardRefresh() {
-  refreshBtn.disabled = true;
-  refreshBtn.classList.add('loading');
-
-  try {
-    const res = await fetch(`${API_BASE}/leaderboard/refresh`, {
-      method: 'POST'
-    });
-
-    const data = await res.json();
-
-    if (!res.ok) {
-      console.error('Refresh error:', data.error);
-      return;
-    }
-
-    // Poll for refresh completion
-    pollRefreshStatus();
-  } catch (err) {
-    console.error('Refresh error:', err);
-    refreshBtn.disabled = false;
-    refreshBtn.classList.remove('loading');
-  }
-}
-
-// Poll refresh status until complete
-async function pollRefreshStatus() {
-  try {
-    const data = await fetchJson(`${API_BASE}/leaderboard/refresh-status`);
-
-    if (data.status === 'refreshing') {
-      setTimeout(pollRefreshStatus, 2000);
-      return;
-    }
-
-    // Refresh complete
-    refreshBtn.disabled = false;
-    refreshBtn.classList.remove('loading');
-
-    if (data.status === 'idle') {
-      await refreshSummary();
-    }
-  } catch (err) {
-    console.error('Poll refresh status error:', err);
-    refreshBtn.disabled = false;
-    refreshBtn.classList.remove('loading');
-  }
-}
-
-// Initialize custom accounts controls
-function initCustomAccountsControls() {
-  addCustomBtn.addEventListener('click', addCustomAccount);
+// Initialize pinned accounts controls
+function initPinnedAccountsControls() {
+  addCustomBtn.addEventListener('click', addCustomPinnedAccount);
 
   // Allow Enter key to submit
   customAddressInput.addEventListener('keypress', (e) => {
-    if (e.key === 'Enter') addCustomAccount();
+    if (e.key === 'Enter') addCustomPinnedAccount();
   });
-  customNicknameInput.addEventListener('keypress', (e) => {
-    if (e.key === 'Enter') addCustomAccount();
-  });
-}
-
-// Initialize refresh button
-function initRefreshButton() {
-  refreshBtn.addEventListener('click', triggerLeaderboardRefresh);
 }
 
 // Infinite scroll for fills
@@ -1777,8 +1799,7 @@ function initLoadHistoryButton() {
 
 async function init() {
   initChartControls();
-  initCustomAccountsControls();
-  initRefreshButton();
+  initPinnedAccountsControls();
   initInfiniteScroll();
   initLoadHistoryButton();
   renderChart('BTCUSDT');

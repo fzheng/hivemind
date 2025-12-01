@@ -311,45 +311,66 @@ main {
   opacity: 0.8;
 }
 
-.card-actions {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
-.last-refresh {
-  font-size: 0.7rem;
-  color: var(--text-muted);
-}
-
-.refresh-btn {
+/* Info icon for tooltips */
+.info-icon {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 12px;
-  background: transparent;
-  color: var(--text-secondary);
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  font-size: 0.6rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: var(--bg-secondary);
   border: 1px solid var(--border-secondary);
-  border-radius: 4px;
-  font-size: 0.7rem;
-  font-weight: 500;
-  cursor: pointer;
+  border-radius: 50%;
+  cursor: help;
+  margin-left: 4px;
+  vertical-align: middle;
   transition: all 0.15s ease;
 }
 
-.refresh-btn:hover:not(:disabled) {
+.info-icon:hover {
   color: var(--text-primary);
   border-color: var(--border-hover);
   background: var(--bg-card-hover);
 }
 
-.refresh-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
+.card-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
-.refresh-btn.loading .refresh-icon {
+.last-refresh {
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+}
+
+.last-refresh:empty {
+  display: none;
+}
+
+.next-refresh {
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  padding-left: 8px;
+  border-left: 1px solid var(--border-primary);
+}
+
+.next-refresh:empty {
+  display: none;
+}
+
+.refresh-status {
+  display: inline-flex;
+  align-items: center;
+  color: var(--accent-primary);
+  padding-left: 8px;
+}
+
+.refresh-spinner {
   animation: spin 1s linear infinite;
 }
 
@@ -362,7 +383,8 @@ main {
   flex-shrink: 0;
 }
 
-/* ==================== CUSTOM ACCOUNTS ==================== */
+/* ==================== PINNED ACCOUNTS ==================== */
+.pinned-accounts-section,
 .custom-accounts-section {
   margin-bottom: 16px;
   padding: 12px;
@@ -371,7 +393,11 @@ main {
   border: 1px solid var(--border-primary);
 }
 
+.pinned-accounts-header,
 .custom-accounts-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
   font-size: 0.7rem;
   font-weight: 600;
   color: var(--text-muted);
@@ -380,12 +406,14 @@ main {
   margin-bottom: 10px;
 }
 
+.pinned-accounts-form,
 .custom-accounts-form {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
 }
 
+.pinned-accounts-form input,
 .custom-accounts-form input {
   flex: 1;
   min-width: 150px;
@@ -399,11 +427,13 @@ main {
   transition: border-color 0.15s ease;
 }
 
+.pinned-accounts-form input:focus,
 .custom-accounts-form input:focus {
   outline: none;
   border-color: var(--accent-primary);
 }
 
+.pinned-accounts-form input::placeholder,
 .custom-accounts-form input::placeholder {
   color: var(--text-placeholder);
 }
@@ -415,9 +445,74 @@ main {
   font-size: 0.75rem;
 }
 
-#custom-nickname-input {
+/* Pin Icon Styles */
+.pin-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  cursor: pointer;
+  opacity: 0.3;
+  transition: all 0.15s ease;
+  flex-shrink: 0;
+  border-radius: 3px;
+}
+
+.pin-icon:hover {
+  opacity: 1;
+  background: var(--bg-card-hover);
+}
+
+.pin-icon svg {
+  width: 12px;
+  height: 12px;
+  fill: currentColor;
+}
+
+/* Unpinned state - gray, low opacity */
+.pin-icon.unpinned {
+  color: var(--text-muted);
+}
+
+/* Pinned from leaderboard - gray pin */
+.pin-icon.pinned-leaderboard {
+  opacity: 1;
+  color: var(--text-secondary);
+}
+
+/* Custom pinned - gold pin */
+.pin-icon.pinned-custom {
+  opacity: 1;
+  color: #f59e0b;
+}
+
+.pin-icon.pinned-leaderboard:hover,
+.pin-icon.pinned-custom:hover {
+  color: var(--negative);
+}
+
+/* Pinned row highlight */
+.leaderboard-table tr.pinned-row {
+  background: rgba(245, 158, 11, 0.03);
+}
+
+.leaderboard-table tr.pinned-row:hover {
+  background: rgba(245, 158, 11, 0.06);
+}
+
+/* Address cell with pin icon */
+.address-cell-with-pin {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.address-cell-with-pin .address-link {
   flex: 1;
-  min-width: 120px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .add-custom-btn {
@@ -1152,19 +1247,25 @@ td {
   white-space: nowrap;
 }
 
+/* Holdings column needs to wrap to show both BTC and ETH */
+.leaderboard-table td.holds-cell {
+  white-space: normal;
+  overflow: visible;
+}
+
 /* Column widths for leaderboard */
 .leaderboard-table th:nth-child(1),
-.leaderboard-table td:nth-child(1) { width: 28%; } /* Address */
+.leaderboard-table td:nth-child(1) { width: 25%; } /* Address */
 .leaderboard-table th:nth-child(2),
-.leaderboard-table td:nth-child(2) { width: 10%; } /* Win% */
+.leaderboard-table td:nth-child(2) { width: 9%; } /* Win% */
 .leaderboard-table th:nth-child(3),
-.leaderboard-table td:nth-child(3) { width: 10%; } /* Trades */
+.leaderboard-table td:nth-child(3) { width: 9%; } /* Trades */
 .leaderboard-table th:nth-child(4),
-.leaderboard-table td:nth-child(4) { width: 20%; } /* Holdings */
+.leaderboard-table td:nth-child(4) { width: 24%; } /* Holdings */
 .leaderboard-table th:nth-child(5),
-.leaderboard-table td:nth-child(5) { width: 14%; } /* PnL */
+.leaderboard-table td:nth-child(5) { width: 13%; } /* PnL */
 .leaderboard-table th:nth-child(6),
-.leaderboard-table td:nth-child(6) { width: 18%; } /* 30D Curve */
+.leaderboard-table td:nth-child(6) { width: 20%; } /* PnL Curve */
 
 /* Sparkline styles */
 .sparkline-cell {

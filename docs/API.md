@@ -46,22 +46,51 @@ Leaderboard scanning and address management.
 - `period` - Period in days (default: 30)
 - `limit` - Max entries to return (default: 20)
 
-### Custom Accounts
+### Pinned Accounts
 
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
-| `/custom-accounts` | GET | No | List custom accounts (max 3) |
-| `/custom-accounts` | POST | No | Add custom account |
-| `/custom-accounts/:address` | DELETE | No | Remove custom account |
-| `/custom-accounts/:address/nickname` | PUT | No | Update nickname |
+| `/pinned-accounts` | GET | No | List all pinned accounts |
+| `/pinned-accounts/leaderboard` | POST | No | Pin account from leaderboard (unlimited) |
+| `/pinned-accounts/custom` | POST | No | Add custom pinned account (max 3) |
+| `/pinned-accounts/:address` | DELETE | No | Unpin account |
 
-**POST `/custom-accounts` Body:**
+**POST `/pinned-accounts/leaderboard` Body:**
 ```json
 {
-  "address": "0x...",
-  "nickname": "Optional Name"
+  "address": "0x..."
 }
 ```
+
+**POST `/pinned-accounts/custom` Body:**
+```json
+{
+  "address": "0x..."
+}
+```
+
+**GET `/pinned-accounts` Response:**
+```json
+{
+  "accounts": [
+    { "id": 1, "address": "0x...", "isCustom": false, "pinnedAt": "..." },
+    { "id": 2, "address": "0x...", "isCustom": true, "pinnedAt": "..." }
+  ],
+  "count": 2,
+  "customCount": 1,
+  "maxCustomAllowed": 3
+}
+```
+
+### Custom Accounts (Legacy)
+
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/custom-accounts` | GET | No | List custom accounts (redirects to pinned) |
+| `/custom-accounts` | POST | No | Add custom account (redirects to pinned) |
+| `/custom-accounts/:address` | DELETE | No | Remove custom account (redirects to pinned) |
+
+> **Note**: Legacy endpoints are kept for backward compatibility but use the new pinned accounts system internally.
 
 ### Addresses (Legacy)
 
