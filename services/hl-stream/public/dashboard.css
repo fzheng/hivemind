@@ -470,21 +470,35 @@ main {
   fill: currentColor;
 }
 
-/* Unpinned state - gray, low opacity */
+/* Unpinned state - very subtle, low contrast */
 .pin-icon.unpinned {
   color: var(--text-muted);
+  opacity: 0.25;
 }
 
-/* Pinned from leaderboard - gray pin */
+/* Pinned from leaderboard - blue/cyan pin for better visibility */
 .pin-icon.pinned-leaderboard {
   opacity: 1;
-  color: var(--text-secondary);
+  color: #38bdf8; /* sky-400 - stands out on dark */
 }
 
-/* Custom pinned - gold pin */
+/* Custom pinned - bright gold/amber pin */
 .pin-icon.pinned-custom {
   opacity: 1;
-  color: #f59e0b;
+  color: #fbbf24; /* amber-400 - brighter gold */
+}
+
+/* Light theme overrides for pin colors */
+[data-theme="light"] .pin-icon.unpinned {
+  opacity: 0.3;
+}
+
+[data-theme="light"] .pin-icon.pinned-leaderboard {
+  color: #0284c7; /* sky-600 - darker for light mode */
+}
+
+[data-theme="light"] .pin-icon.pinned-custom {
+  color: #d97706; /* amber-600 - darker gold for light mode */
 }
 
 .pin-icon.pinned-leaderboard:hover,
