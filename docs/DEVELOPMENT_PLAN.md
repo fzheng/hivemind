@@ -399,38 +399,49 @@ createTicketInstrumentation(result, windowMs, stopBps)
 The following gaps exist between the documented design and current implementation:
 
 #### Gap 1: Selection Uses Posterior Mean, Not Thompson Sampling
-**Current**: `hl-sage/main.py` (lines 248-253) ranks traders by `nig_m * side` (posterior mean).
-**Designed**: Thompson Sampling should sample from posterior and rank by sampled values.
-**Impact**: No exploration of uncertain traders; system exploits only proven performers.
-**Fix**: Invoke `thompson_sample_select_nig()` from `bandit.py` in score emission pipeline, not just admin endpoints.
+**Current**: `hl-sage/main.py` (lines 248-253) ranks traders by `nig_m * side` (posterior mean). Thompson Sampling logic in `bandit.py` is only exposed via admin API endpoints, not the score emission pipeline.
+**Designed**: Thompson Sampling should sample from posterior and rank by sampled values for explore/exploit.
+**Impact**: No exploration of uncertain traders; system exploits only proven performers. New traders with few observations never get selected.
+**Fix**: Invoke `thompson_sample_select_nig()` from `bandit.py` in the score emission pipeline, not just admin endpoints.
 
 #### Gap 2: Consensus Gates Use Placeholder Risk Inputs
-**Current**: `consensus.py` (lines 244-250) uses hardcoded 1% stop distance and implicit ATR percentile of 0.5.
+**Current**: `consensus.py` (lines 244-250) uses hardcoded 1% stop distance. ATR percentile is constant 0.5 with no real volatility input.
 **Designed**: Stop distance should be ATR-based, adjusting to market volatility.
-**Impact**: EV gate and price drift calculations are constant regardless of market regime.
+**Impact**: EV gate and price drift calculations are constant regardless of market regime. Gates don't adapt to volatile vs calm markets.
 **Fix**: Add ATR feed (from `marks_1m` price history or external API) and use for dynamic stop sizing.
 
 #### Gap 3: Correlation Matrix Not Populated
-**Current**: `ConsensusDetector.correlation_matrix` is initialized empty and never populated.
-**Designed**: Daily job should compute pairwise correlations and store in `trader_corr` table.
-**Impact**: `eff_k` always falls back to default `ρ_base=0.3` for all pairs; correlation gate is ineffective.
+**Current**: `ConsensusDetector.correlation_matrix` is initialized empty and never populated from `trader_corr` table.
+**Designed**: Daily job should compute pairwise correlations and hydrate detector on startup.
+**Impact**: `eff_k` always falls back to default `ρ_base=0.3` for all pairs; correlation-adjusted gate isn't actually filtering.
 **Fix**: Implement daily correlation job (Phase 3b task 3.5) and hydrate detector on startup.
 
-#### Gap 4: ScoreEvent Weight Uses Legacy Leaderboard Value
+#### Gap 4: Position Lifecycle/Episodes Not Integrated
+**Current**: `hl-decide` processes individual fills into votes without constructing position episodes. The episode builder exists in `ts-lib/episode.ts` but isn't wired to the runtime.
+**Designed**: "One position = one data point with R-multiple" per the algorithm design.
+**Impact**: R-multiples aren't calculated in the live consensus path; NIG posteriors aren't updated from realized outcomes.
+**Fix**: Wire episode builder to hl-decide; derive one vote per position lifecycle, not per fill.
+
+#### Gap 5: Vote Weighting Unscaled
+**Current**: Consensus weights are `abs(net_delta)` clamped to 1.0, with no notional/equity normalization.
+**Designed**: Weights should reflect position conviction relative to trader's equity or account size.
+**Impact**: A tiny fill counts the same as a large notional once it crosses the cap, distorting effK/EV inputs.
+**Fix**: Normalize weights by notional/equity (e.g., `position_size / account_value`) before clamping.
+
+#### Gap 6: ScoreEvent Weight Uses Legacy Leaderboard Value
 **Current**: `hl-sage/main.py` (line 263) emits `weight=state["weight"]` from leaderboard, even when score is NIG-based.
 **Designed**: Weight should reflect NIG confidence (e.g., derived from posterior variance or κ).
-**Impact**: Downstream consumers may interpret weight as confidence, but it's the legacy leaderboard weight.
+**Impact**: Downstream consumers interpret weight as confidence, but it's the legacy leaderboard weight.
 **Fix**: Derive weight from posterior (e.g., `1/sqrt(variance)` or `κ/(κ+10)`) or document that it's legacy.
 
-#### Gap 5: E2E Tests Fragile and Require Manual Setup
-**Current**: `playwright.config.ts` has `webServer` commented out; specs use loose selectors and don't assert backend effects.
+#### Gap 7: E2E Tests Fragile and Require Manual Setup
+**Current**: `playwright.config.ts` has `webServer` commented out; specs use loose selectors and often short-circuit when elements aren't present. Tests don't assert backend effects (pin/unpin responses).
 **Designed**: Tests should be self-contained with automatic app startup and verify state changes.
 **Impact**: CI/CD may fail if dashboard not pre-started; tests may pass without verifying functionality.
 **Fix**: Enable webServer config, add `data-testid` selectors, assert backend responses for pin/unpin operations.
 
-#### Gap 6: CI Runs Unit Tests Only, Not E2E
-**Current**: CI workflow runs `npm run test:coverage` (Jest unit tests). Quant tests ARE included.
-**Note**: E2E tests (Playwright) are NOT run in CI - they require a running dashboard.
+#### Gap 8: CI Runs Unit Tests Only, Not E2E
+**Current**: CI workflow runs `npm run test:coverage` (Jest unit tests). Quant tests ARE included. E2E (Playwright) not run.
 **Impact**: UI regressions won't be caught in CI; only unit-level algorithm tests run.
 **Fix**: Add Docker-based E2E stage to CI or document that E2E is manual-only.
 
@@ -456,10 +467,12 @@ The following gaps exist between the documented design and current implementatio
 - [ ] Pass dynamic stop_bps to consensus gates
 - [ ] Consider regime-specific ATR multipliers
 
-#### 3.7 Episode-Based Votes
-- [ ] hl-decide consumes episodes from ts-lib
-- [ ] One vote per trader derived from episode state, not individual fills
-- [ ] Weight votes by position conviction (size/equity)
+#### 3.7 Episode-Based Votes & Position Lifecycle
+- [ ] Wire episode builder from ts-lib to hl-decide runtime
+- [ ] One vote per trader derived from position lifecycle, not individual fills
+- [ ] Calculate R-multiples on position close and update NIG posteriors
+- [ ] Normalize vote weights by notional/equity (not just clamped abs(net_delta))
+- [ ] Track position entry/exit for proper R calculation
 
 ### Environment Variables
 ```bash
@@ -702,14 +715,24 @@ Self code review verified the following runtime integrations:
 - `db/migrations/019_consensus_signals.sql` - Consensus signals table
 
 **Phase 3b (In Progress - Remaining)**:
-- Replace posterior-mean selection with Thompson Sampling in score emission
+- Replace posterior-mean selection with Thompson Sampling in score emission pipeline
 - Derive ScoreEvent.weight from NIG posterior (not legacy leaderboard weight)
-- Implement daily correlation computation job
-- Hydrate ConsensusDetector.correlation_matrix from trader_corr table
+- Implement daily correlation computation job and hydrate detector on startup
 - Replace hardcoded 1% stop with ATR-based dynamic stops
-- Wire episode builder to hl-decide for episode-based votes
-- Weight votes by position conviction
+- Wire episode builder to hl-decide for position lifecycle tracking
+- Calculate R-multiples on position close, update NIG posteriors
+- Normalize vote weights by notional/equity (not just clamped delta)
 - Improve E2E test reliability (data-testid selectors, backend assertions)
+
+**Summary of 8 Known Gaps**:
+1. Selection = posterior mean, not Thompson Sampling
+2. Consensus = hardcoded 1% stop, no ATR
+3. Correlation matrix = empty, effK defaults to ρ=0.3
+4. Episodes = not integrated, fills processed individually
+5. Vote weights = clamped delta, no notional normalization
+6. ScoreEvent.weight = legacy leaderboard, not NIG-derived
+7. E2E tests = fragile selectors, no backend assertions
+8. CI = unit tests only, E2E manual
 
 ---
 
