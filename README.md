@@ -23,10 +23,10 @@ The Alpha Pool automatically filters out noise traders with 7 quality gates:
 
 | Filter | Default | Description |
 |--------|---------|-------------|
-| Min 30d PnL | $1,000 | Only profitable traders |
-| Min 30d ROI | 1% | Consistent positive returns |
-| Min Account | $10,000 | Minimum account value |
-| Min Week Vlm | $1,000 | Must be actively trading |
+| Min 30d PnL | $10,000 | Only profitable traders |
+| Min 30d ROI | 10% | Consistent positive returns |
+| Min Account | $100,000 | Minimum account value |
+| Min Week Vlm | $10,000 | Must be actively trading |
 | Max Orders/Day | 100 | Filters out HFT bots via fill history |
 | Subaccounts | Excluded | Filters subaccounts (address:X format) |
 | BTC/ETH History | Required | Must have traded BTC or ETH |
