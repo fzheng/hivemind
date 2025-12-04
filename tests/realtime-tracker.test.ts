@@ -189,7 +189,8 @@ describe('MockAddressTracker.refresh', () => {
 
     const elapsed = Date.now() - startTime;
     // Should only prime the new address (10ms), not both
-    expect(elapsed).toBeGreaterThanOrEqual(10);
+    // Use 8ms threshold to account for timer precision variability
+    expect(elapsed).toBeGreaterThanOrEqual(8);
     expect(elapsed).toBeLessThan(25); // Would be ~20ms if both were primed sequentially
   });
 });

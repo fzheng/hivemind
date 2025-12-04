@@ -125,6 +125,9 @@ data/
 # TernJS port file
 .tern-port
 
+# VSCode settings (local IDE config)
+.vscode/
+
 # Stores VSCode versions used for testing VSCode extensions
 .vscode-test
 
@@ -152,3 +155,8 @@ temp_*.json
 playwright-report/
 test-results/
 playwright/.cache/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo

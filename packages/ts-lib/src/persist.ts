@@ -1058,6 +1058,221 @@ export async function validatePositionChain(
   }
 }
 
+// =====================
+// Price History (marks_1m)
+// =====================
+
+/**
+ * Insert a price snapshot into marks_1m table for regime detection
+ * @param asset - BTC or ETH
+ * @param price - Mid/mark price
+ * @param high - High price during candle (optional, defaults to price)
+ * @param low - Low price during candle (optional, defaults to price)
+ */
+export async function insertPriceSnapshot(args: {
+  asset: 'BTC' | 'ETH';
+  price: number;
+  high?: number;
+  low?: number;
+  ts?: Date;
+}): Promise<boolean> {
+  try {
+    const p = await getPool();
+    // Round timestamp to nearest minute for candle aggregation
+    const now = args.ts || new Date();
+    const roundedTs = new Date(Math.floor(now.getTime() / 60000) * 60000);
+
+    await p.query(
+      `INSERT INTO marks_1m (asset, ts, mid, high, low, close)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (asset, ts) DO UPDATE SET
+         high = GREATEST(marks_1m.high, EXCLUDED.high),
+         low = LEAST(marks_1m.low, EXCLUDED.low),
+         close = EXCLUDED.close`,
+      [
+        args.asset,
+        roundedTs,
+        args.price,
+        args.high ?? args.price,
+        args.low ?? args.price,
+        args.price, // close is always latest price
+      ]
+    );
+    return true;
+  } catch (e) {
+    console.error('[persist] insertPriceSnapshot failed:', e);
+    return false;
+  }
+}
+
+/**
+ * Get recent price history for regime detection
+ * @param asset - BTC or ETH
+ * @param periods - Number of periods (minutes) to fetch
+ */
+export async function getPriceHistory(
+  asset: 'BTC' | 'ETH',
+  periods: number = 60
+): Promise<Array<{ ts: string; mid: number; high: number | null; low: number | null; close: number | null }>> {
+  try {
+    const p = await getPool();
+    const { rows } = await p.query(
+      `SELECT ts, mid, high, low, close
+       FROM marks_1m
+       WHERE asset = $1
+       ORDER BY ts DESC
+       LIMIT $2`,
+      [asset, periods]
+    );
+    return rows.map((row: Record<string, unknown>) => ({
+      ts: row.ts instanceof Date ? row.ts.toISOString() : String(row.ts),
+      mid: Number(row.mid),
+      high: row.high != null ? Number(row.high) : null,
+      low: row.low != null ? Number(row.low) : null,
+      close: row.close != null ? Number(row.close) : null,
+    }));
+  } catch (e) {
+    console.error('[persist] getPriceHistory failed:', e);
+    return [];
+  }
+}
+
+// =====================
+// Trader Performance (for bandit algorithm)
+// =====================
+
+/**
+ * Initialize or get trader performance record
+ * Uses default Beta(1,1) prior if new
+ */
+export async function getOrCreateTraderPerformance(address: string): Promise<{
+  address: string;
+  total_signals: number;
+  winning_signals: number;
+  total_pnl_r: number;
+  alpha: number;
+  beta: number;
+} | null> {
+  try {
+    const p = await getPool();
+    const normalizedAddress = address.toLowerCase();
+
+    // Try to get existing, or insert with defaults
+    const { rows } = await p.query(
+      `INSERT INTO trader_performance (address)
+       VALUES ($1)
+       ON CONFLICT (address) DO UPDATE SET updated_at = NOW()
+       RETURNING address, total_signals, winning_signals, total_pnl_r, alpha, beta`,
+      [normalizedAddress]
+    );
+
+    if (rows.length === 0) return null;
+    return {
+      address: String(rows[0].address),
+      total_signals: Number(rows[0].total_signals),
+      winning_signals: Number(rows[0].winning_signals),
+      total_pnl_r: Number(rows[0].total_pnl_r),
+      alpha: Number(rows[0].alpha),
+      beta: Number(rows[0].beta),
+    };
+  } catch (e) {
+    console.error('[persist] getOrCreateTraderPerformance failed:', e);
+    return null;
+  }
+}
+
+/**
+ * Update trader performance after a signal outcome
+ * Updates Bayesian prior (alpha/beta) based on success/failure
+ * @param address - Trader address
+ * @param success - Whether the signal was profitable (result_r > 0)
+ * @param pnlR - P&L in R-multiples
+ */
+export async function updateTraderPerformance(
+  address: string,
+  success: boolean,
+  pnlR: number
+): Promise<boolean> {
+  try {
+    const p = await getPool();
+    const normalizedAddress = address.toLowerCase();
+
+    // Update statistics and Bayesian prior
+    // alpha += 1 if success, beta += 1 if failure
+    await p.query(
+      `UPDATE trader_performance SET
+         total_signals = total_signals + 1,
+         winning_signals = winning_signals + $2,
+         total_pnl_r = total_pnl_r + $3,
+         alpha = alpha + $4,
+         beta = beta + $5,
+         last_signal_at = NOW(),
+         updated_at = NOW()
+       WHERE address = $1`,
+      [
+        normalizedAddress,
+        success ? 1 : 0,
+        pnlR,
+        success ? 1 : 0,  // alpha increment
+        success ? 0 : 1,  // beta increment
+      ]
+    );
+    return true;
+  } catch (e) {
+    console.error('[persist] updateTraderPerformance failed:', e);
+    return false;
+  }
+}
+
+/**
+ * Get top traders by Thompson Sampling posterior mean (alpha / (alpha + beta))
+ * @param limit - Number of traders to return
+ * @param minSignals - Minimum signals required (default 0)
+ */
+export async function getTopTradersByPosterior(
+  limit: number = 20,
+  minSignals: number = 0
+): Promise<Array<{
+  address: string;
+  total_signals: number;
+  winning_signals: number;
+  total_pnl_r: number;
+  alpha: number;
+  beta: number;
+  posterior_mean: number;
+}>> {
+  try {
+    const p = await getPool();
+    const { rows } = await p.query(
+      `SELECT
+         address,
+         total_signals,
+         winning_signals,
+         total_pnl_r,
+         alpha,
+         beta,
+         alpha / (alpha + beta) as posterior_mean
+       FROM trader_performance
+       WHERE total_signals >= $1
+       ORDER BY posterior_mean DESC
+       LIMIT $2`,
+      [minSignals, limit]
+    );
+    return rows.map((row: Record<string, unknown>) => ({
+      address: String(row.address),
+      total_signals: Number(row.total_signals),
+      winning_signals: Number(row.winning_signals),
+      total_pnl_r: Number(row.total_pnl_r),
+      alpha: Number(row.alpha),
+      beta: Number(row.beta),
+      posterior_mean: Number(row.posterior_mean),
+    }));
+  } catch (e) {
+    console.error('[persist] getTopTradersByPosterior failed:', e);
+    return [];
+  }
+}
+
 /**
  * Get the oldest fill time we have in DB for given addresses
  */

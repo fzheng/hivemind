@@ -2,7 +2,7 @@
 Tests for hl-sage state persistence and recovery.
 """
 import pytest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import OrderedDict
 import sys
 import os
@@ -23,7 +23,7 @@ class TestStaleEviction:
 
         tracked_addresses.clear()
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         stale_time = now - timedelta(hours=STALE_THRESHOLD_HOURS + 1)
         fresh_time = now - timedelta(hours=1)
 
@@ -51,7 +51,7 @@ class TestStaleEviction:
     def test_evict_by_max_limit(self):
         """Test LRU eviction when max limit exceeded."""
         test_addresses = OrderedDict()
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         # Add more than max (use a small number for testing)
         test_max = 10
@@ -79,9 +79,9 @@ class TestStaleEviction:
         test_addresses = OrderedDict()
 
         # Add entries
-        test_addresses["0x1111"] = {"updated": datetime.utcnow()}
-        test_addresses["0x2222"] = {"updated": datetime.utcnow()}
-        test_addresses["0x3333"] = {"updated": datetime.utcnow()}
+        test_addresses["0x1111"] = {"updated": datetime.now(timezone.utc)}
+        test_addresses["0x2222"] = {"updated": datetime.now(timezone.utc)}
+        test_addresses["0x3333"] = {"updated": datetime.now(timezone.utc)}
 
         # Access the first entry (simulate re-use)
         if "0x1111" in test_addresses:
