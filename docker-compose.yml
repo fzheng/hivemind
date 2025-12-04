@@ -26,7 +26,7 @@ services:
       retries: 5
     networks: [hl_net]
     ports:
-      - "127.0.0.1:${PG_PORT:-5432}:5432"
+      - "0.0.0.0:${PG_PORT:-5432}:5432"
 
   nats:
     image: nats:2.10-alpine
@@ -42,8 +42,8 @@ services:
       start_period: 5s
     networks: [hl_net]
     ports:
-      - "127.0.0.1:${NATS_PORT:-4222}:4222"
-      - "127.0.0.1:${NATS_MONITOR_PORT:-8222}:8222"
+      - "0.0.0.0:${NATS_PORT:-4222}:4222"
+      - "0.0.0.0:${NATS_MONITOR_PORT:-8222}:8222"
 
   hl-scout:
     build:
@@ -70,7 +70,7 @@ services:
       retries: 5
     networks: [hl_net]
     ports:
-      - "127.0.0.1:${SCOUT_PORT:-4101}:8080"
+      - "0.0.0.0:${SCOUT_PORT:-4101}:8080"
 
   hl-stream:
     build:
@@ -126,7 +126,7 @@ services:
       retries: 5
     networks: [hl_net]
     ports:
-      - "127.0.0.1:${SAGE_PORT:-4103}:8080"
+      - "0.0.0.0:${SAGE_PORT:-4103}:8080"
 
   hl-decide:
     build:
@@ -152,4 +152,4 @@ services:
       retries: 5
     networks: [hl_net]
     ports:
-      - "127.0.0.1:${DECIDE_PORT:-4104}:8080"
+      - "0.0.0.0:${DECIDE_PORT:-4104}:8080"

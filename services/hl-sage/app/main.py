@@ -61,8 +61,8 @@ from .bandit import (
 
 SERVICE_NAME = "hl-sage"
 OWNER_TOKEN = os.getenv("OWNER_TOKEN", "dev-owner")
-NATS_URL = os.getenv("NATS_URL", "nats://localhost:4222")
-DB_URL = os.getenv("DATABASE_URL", "postgresql://hlbot:hlbotpassword@localhost:5432/hlbot")
+NATS_URL = os.getenv("NATS_URL", "nats://0.0.0.0:4222")
+DB_URL = os.getenv("DATABASE_URL", "postgresql://hlbot:hlbotpassword@0.0.0.0:5432/hlbot")
 MAX_TRACKED_ADDRESSES = int(os.getenv("MAX_TRACKED_ADDRESSES", "1000"))
 MAX_SCORES = int(os.getenv("MAX_SCORES", "500"))
 STALE_THRESHOLD_HOURS = int(os.getenv("STALE_THRESHOLD_HOURS", "24"))
