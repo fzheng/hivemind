@@ -322,6 +322,9 @@ async def get_trader_nig_params(address: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+ALPHA_POOL_AUTO_REFRESH = os.getenv("ALPHA_POOL_AUTO_REFRESH", "true").lower() == "true"
+
+
 @app.on_event("startup")
 async def startup_event():
     try:
@@ -338,9 +341,70 @@ async def startup_event():
         await ensure_stream(app.state.js, "HL_B", ["b.scores.v1"])
         await app.state.nc.subscribe("a.candidates.v1", cb=handle_candidate)
         await app.state.nc.subscribe("c.fills.v1", cb=handle_fill)
+
+        # Auto-refresh Alpha Pool if empty on startup
+        if ALPHA_POOL_AUTO_REFRESH:
+            asyncio.create_task(auto_refresh_alpha_pool_if_empty())
     except Exception as e:
         print(f"[hl-sage] Fatal startup error: {e}")
         raise
+
+
+async def auto_refresh_alpha_pool_if_empty():
+    """
+    Auto-refresh Alpha Pool on startup ONLY if it has NEVER been refreshed.
+
+    Checks if alpha_pool_addresses table has ANY records (active or not).
+    If completely empty, this is a fresh database and we bootstrap the pool.
+
+    Subsequent refreshes should be done via POST /alpha-pool/refresh
+    or a scheduled job.
+
+    Runs as a background task to not block service startup.
+    """
+    try:
+        # Wait a bit for database to be fully ready
+        await asyncio.sleep(5)
+
+        async with app.state.db.acquire() as conn:
+            # Check if pool has EVER been refreshed (any records, active or not)
+            total_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM alpha_pool_addresses"
+            )
+
+        if total_count == 0:
+            print(f"[hl-sage] Alpha Pool has never been refreshed, auto-refreshing (first-time setup)...")
+            traders = await fetch_leaderboard_from_api(limit=ALPHA_POOL_DEFAULT_SIZE)
+            if traders:
+                async with app.state.db.acquire() as conn:
+                    for trader in traders:
+                        await conn.execute(
+                            """
+                            INSERT INTO alpha_pool_addresses (address, nickname, account_value, pnl_30d, roi_30d, win_rate, last_refreshed, is_active)
+                            VALUES ($1, $2, $3, $4, $5, $6, NOW(), true)
+                            ON CONFLICT (address) DO UPDATE SET
+                                nickname = COALESCE(EXCLUDED.nickname, alpha_pool_addresses.nickname),
+                                account_value = EXCLUDED.account_value,
+                                pnl_30d = EXCLUDED.pnl_30d,
+                                roi_30d = EXCLUDED.roi_30d,
+                                win_rate = EXCLUDED.win_rate,
+                                last_refreshed = NOW(),
+                                is_active = true
+                            """,
+                            trader["address"],
+                            trader.get("display_name"),
+                            trader["account_value"],
+                            trader["pnl"],
+                            trader.get("roi", 0.0),
+                            trader["win_rate"],
+                        )
+                print(f"[hl-sage] Alpha Pool auto-refreshed with {len(traders)} traders")
+            else:
+                print(f"[hl-sage] Alpha Pool auto-refresh failed - no traders fetched")
+        else:
+            print(f"[hl-sage] Alpha Pool has {total_count} records (previously refreshed), skipping auto-refresh")
+    except Exception as e:
+        print(f"[hl-sage] Alpha Pool auto-refresh failed: {e}")
 
 
 @app.on_event("shutdown")
