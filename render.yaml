@@ -78,14 +78,14 @@ services:
           name: hl-scout
           property: host
       - key: SCOUT_URL
-        value: http://$(SCOUT_HOST):8080
+        value: https://$(SCOUT_HOST)
       - key: SAGE_HOST
         fromService:
           type: web
           name: hl-sage
           property: host
       - key: SAGE_URL
-        value: http://$(SAGE_HOST):8080
+        value: https://$(SAGE_HOST)
       - key: OWNER_TOKEN
         sync: false
 
