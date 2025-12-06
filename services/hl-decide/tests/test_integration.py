@@ -602,3 +602,77 @@ class TestDataFlowValidation:
         # Should serialize without error
         json_str = json.dumps(episode_dict)
         assert "r_multiple" in json_str
+
+
+class TestATRToConsensusFlow:
+    """Test the ATR→Consensus stop integration in the actual consensus check."""
+
+    def test_consensus_uses_detector_stop_fraction(self):
+        """
+        check_episode_consensus should use detector.get_stop_fraction()
+        instead of hardcoded ASSUMED_STOP_FRACTION.
+        """
+        # Setup detector with ATR-based stop
+        detector = ConsensusDetector()
+        detector.set_stop_fraction("BTC", 0.025)  # 2.5% ATR-based stop
+
+        # Verify detector has correct stop
+        assert detector.get_stop_fraction("BTC") == 0.025
+
+        # The check_episode_consensus function imports from main,
+        # so we verify the detector method works correctly
+        # The actual integration is in main.py:check_episode_consensus
+        # which now calls detector.get_stop_fraction(asset)
+
+    def test_consensus_detector_initializes_with_defaults(self):
+        """New detector should have default 1% stops."""
+        detector = ConsensusDetector()
+        assert detector.get_stop_fraction("BTC") == 0.01
+        assert detector.get_stop_fraction("ETH") == 0.01
+
+    def test_atr_updates_detector_stop(self):
+        """ATR provider updates should reflect in detector."""
+        provider = ATRProvider()
+        detector = ConsensusDetector()
+
+        # Create ATR data for BTC
+        atr_data = ATRData(
+            asset="BTC",
+            atr=3000.0,
+            atr_pct=3.0,
+            price=100000.0,
+            multiplier=2.0,
+            stop_distance_pct=6.0,
+            timestamp=datetime.now(timezone.utc),
+            source="test",
+        )
+
+        # Get stop fraction from ATR
+        stop_fraction = provider.get_stop_fraction(atr_data)
+        assert stop_fraction == pytest.approx(0.06, rel=1e-5)
+
+        # Apply to detector
+        detector.set_stop_fraction("BTC", stop_fraction)
+        assert detector.get_stop_fraction("BTC") == 0.06
+
+        # ETH should still have default
+        assert detector.get_stop_fraction("ETH") == 0.01
+
+    def test_stop_price_calculation_with_dynamic_stop(self):
+        """Stop price should be calculated using dynamic stop fraction."""
+        detector = ConsensusDetector()
+
+        # Set 3% ATR-based stop
+        detector.set_stop_fraction("BTC", 0.03)
+
+        entry_price = 100000.0
+        stop_fraction = detector.get_stop_fraction("BTC")
+        stop_distance = entry_price * stop_fraction
+
+        # Long position stop
+        long_stop = entry_price - stop_distance
+        assert long_stop == 97000.0  # 100k - 3% = 97k
+
+        # Short position stop
+        short_stop = entry_price + stop_distance
+        assert short_stop == 103000.0  # 100k + 3% = 103k

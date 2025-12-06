@@ -893,8 +893,9 @@ def check_episode_consensus(asset: str, episode_fills: list) -> Optional[Consens
     median_entry = statistics.median(v['price'] for v in agreeing_votes)
     mid_price = consensus_detector.get_current_mid(asset)
 
-    # Stop price (1% for now - will be ATR-based in Phase 3b)
-    stop_distance = median_entry * ASSUMED_STOP_FRACTION
+    # Stop price using ATR-based dynamic stop (or fallback to 1%)
+    stop_fraction = consensus_detector.get_stop_fraction(asset)
+    stop_distance = median_entry * stop_fraction
     if majority_dir == 'long':
         stop_price = median_entry - stop_distance
     else:
@@ -1092,7 +1093,19 @@ async def startup():
             hydrated = app.state.corr_provider.hydrate_detector(consensus_detector)
             print(f"[hl-decide] Loaded {corr_count} correlations, hydrated detector with {hydrated} pairs")
         else:
-            print("[hl-decide] No correlations found (using default ρ=0.3)")
+            # No correlations found - try to compute them on first startup
+            print("[hl-decide] No correlations found, computing initial correlations...")
+            try:
+                summary = await run_daily_correlation_job(app.state.db)
+                total_pairs = summary.get("btc_pairs", 0) + summary.get("eth_pairs", 0)
+                if total_pairs > 0:
+                    corr_count = await app.state.corr_provider.load()
+                    hydrated = app.state.corr_provider.hydrate_detector(consensus_detector)
+                    print(f"[hl-decide] Computed {total_pairs} correlations, hydrated detector with {hydrated} pairs")
+                else:
+                    print("[hl-decide] No correlations computed (insufficient data, using default ρ=0.3)")
+            except Exception as corr_error:
+                print(f"[hl-decide] Correlation computation failed (using default ρ=0.3): {corr_error}")
 
         # Restore state from database
         score_count, fill_count = await restore_state()

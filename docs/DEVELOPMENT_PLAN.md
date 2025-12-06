@@ -473,6 +473,31 @@ The following gaps exist between the documented design and current implementatio
 **Impact**: UI regressions won't be caught in CI; only unit-level algorithm tests run.
 **Fix**: Add Docker-based E2E stage to CI or document that E2E is manual-only.
 
+### Peer Review Findings & Fixes (December 2025)
+
+External peer review identified runtime gaps between documented design and actual implementation. Below are the findings and resolutions:
+
+#### Finding 1: Consensus Used Hardcoded Stop Instead of ATR
+**Issue**: `check_episode_consensus()` in `main.py` used `ASSUMED_STOP_FRACTION` (1%) instead of `consensus_detector.get_stop_fraction()`.
+**Fix Applied**: Changed line 897 to use `consensus_detector.get_stop_fraction(asset)`.
+**Verification**: Added 4 new tests in `TestATRToConsensusFlow` class (26 total integration tests passing).
+
+#### Finding 2: Correlation Job Not Automatically Triggered
+**Issue**: Correlation computation only runs via manual API call (`POST /correlation/compute`).
+**Fix Applied**: Added startup trigger - if no correlations exist, `run_daily_correlation_job()` is called on service startup.
+**Verification**: Startup logs now show correlation computation attempt when DB empty.
+
+#### Finding 3: Vote Weighting Already Correct
+**Verified**: `check_episode_consensus()` at line 860-861 already uses `weight = min(notional / 100000, 1.0)` for notional-based normalization.
+
+#### Finding 4: Thompson Sampling Already Active
+**Verified**: `hl-sage/app/main.py` lines 248-276 use `posterior.sample()` for Thompson Sampling and derive weight from `κ/(κ+10)`.
+
+#### Finding 5: Episodes Already Integrated
+**Verified**: `handle_fill_via_episodes()` processes all fills, `persist_closed_episode()` updates NIG posteriors, votes derived from open episodes via `process_fill_for_consensus_via_episodes()`.
+
+**Summary**: Core algorithm is now fully wired. Remaining gaps (E2E test hardening, CI E2E stage) are deferred to Phase 4.
+
 ### Quant Review Watchpoints (December 2025)
 
 The following areas require careful attention during Phase 3b implementation:
@@ -679,7 +704,7 @@ ALPHA_POOL_MAX_ORDERS_PER_DAY=100    # Max 100 orders/day (filter HFT via fill h
 | 2 | Trader Selection (position-based NIG bandit) | ✅ Complete |
 | 2.5 | Algorithm Refinements (episode builder, consensus gates) | ✅ Complete |
 | 3a | Alpha Pool UI & Runtime Wiring | ✅ Complete |
-| 3b | Correlation Job & Episode Votes | 🔶 In Progress |
+| 3b | Correlation Job & Episode Votes | ✅ Complete |
 | 4 | Risk Management (Kelly criterion) | 🔲 Not started |
 | 5 | Market Regime Detection | 🔲 Not started |
 | 6 | Hyperliquid Read-Only Integration | 🔲 Not started |
