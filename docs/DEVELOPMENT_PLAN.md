@@ -184,12 +184,12 @@ Replaced all placeholder implementations with production-ready components:
 | Component | Tests | File |
 |-----------|-------|------|
 | Thompson Sampling | 25 | `hl-sage/tests/test_thompson_sampling.py` |
-| ATR Provider | 22 | `hl-decide/tests/test_atr.py` |
-| Correlation | 23 | `hl-decide/tests/test_correlation.py` |
+| ATR Provider | 29 | `hl-decide/tests/test_atr.py` |
+| Correlation | 40 | `hl-decide/tests/test_correlation.py` |
 | Episode Builder | 30 | `hl-decide/tests/test_episode.py` |
 | Integration | 22 | `hl-decide/tests/test_integration.py` |
-| **Total Python** | **122** | |
-| TypeScript Unit | 955 | `tests/*.test.ts` |
+| **Total Python** | **146** | |
+| TypeScript Unit | 977 | `tests/*.test.ts` |
 
 **Alpha Pool Architecture (Decoupled)**:
 The Alpha Pool is now a completely independent system from the legacy leaderboard:
@@ -862,6 +862,45 @@ Self code review verified the following runtime integrations:
 6. ~~ScoreEvent.weight = legacy leaderboard, not NIG-derived~~ ✅ RESOLVED
 7. E2E tests = fragile selectors, no backend assertions (deferred to Phase 4)
 8. CI = unit tests only, E2E manual (deferred to Phase 4)
+
+#### Phase 3b Quant Review Enhancements (December 2025)
+
+Based on peer quant review, the following robustness improvements were implemented:
+
+**ATR Enhancements**:
+- [x] **ATR-based price bands**: Consensus price drift gate now uses R-units (`CONSENSUS_MAX_PRICE_DRIFT_R=0.25`) instead of fixed BPS (`CONSENSUS_MAX_PRICE_BAND_BPS=8`). Deviation = BPS / (stop_fraction × 10000).
+- [x] **ATR staleness checks**: `ATRData.is_stale` property flags data older than `ATR_MAX_STALENESS_SECONDS` (default 300s). Fallback data is always considered stale.
+- [x] **Asset-specific fallbacks**: Replaced hardcoded 0.5% fallback with `ATR_FALLBACK_BY_ASSET` (BTC: 0.4%, ETH: 0.6%) based on typical 1-min ATR profiles.
+- [x] **Fallback logging**: Warning logged when ATR uses fallback values for production visibility.
+- [x] **`get_atr_with_staleness_check()`**: New method returns tuple of (ATRData, is_stale) with optional logging.
+
+**Correlation Enhancements**:
+- [x] **Correlation staleness**: `CorrelationProvider.is_stale` flags data older than `CORR_MAX_STALENESS_DAYS` (default 7 days).
+- [x] **Time-decay**: `_decay_factor()` uses exponential decay with `CORR_DECAY_HALFLIFE_DAYS` (default 3 days). Formula: `factor = 2^(-age/halflife)`.
+- [x] **Decayed lookup**: `get_with_decay()` blends stored correlation toward `DEFAULT_CORRELATION` (0.3) based on data age.
+- [x] **Freshness check**: `check_freshness()` returns (is_fresh, message) for operational monitoring.
+- [x] **Default usage tracking**: Provider tracks how many times default correlation was used (`_default_used_count`).
+- [x] **Hydrate with decay**: `hydrate_detector(apply_decay=True)` applies decay when loading correlations into ConsensusDetector.
+
+**New Tests** (20 tests added):
+- `TestATRStaleness`: 4 tests for staleness detection
+- `TestAssetSpecificFallbacks`: 3 tests for per-asset fallback values
+- `TestCorrelationStaleness`: 3 tests for correlation data staleness
+- `TestCorrelationDecay`: 4 tests for exponential decay calculation
+- `TestGetWithDecay`: 4 tests for decayed correlation lookup
+- `TestCheckFreshness`: 3 tests for freshness status
+- `TestDecayQuantAcceptance`: 3 quant acceptance tests for decay behavior
+
+**Configuration**:
+```bash
+# ATR staleness
+ATR_MAX_STALENESS_SECONDS=300  # 5 minutes
+
+# Correlation staleness and decay
+CORR_MAX_STALENESS_DAYS=7      # Max age before full fallback
+CORR_DECAY_HALFLIFE_DAYS=3.0   # Half-life for exponential decay
+DEFAULT_CORRELATION=0.3         # Used when data missing or very stale
+```
 
 ---
 

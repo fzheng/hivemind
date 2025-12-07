@@ -25,6 +25,9 @@ from app.correlation import (
     CorrelationProvider,
     CORR_BUCKET_MINUTES,
     CORR_MIN_COMMON_BUCKETS,
+    CORR_MAX_STALENESS_DAYS,
+    CORR_DECAY_HALFLIFE_DAYS,
+    DEFAULT_CORRELATION,
 )
 
 
@@ -332,3 +335,184 @@ class TestQuantAcceptance:
 
         # This means anti-correlated traders count as independent
         # for effective-K calculation, which is the desired behavior
+
+
+class TestCorrelationStaleness:
+    """Test correlation data staleness and decay."""
+
+    def test_no_data_is_stale(self):
+        """Provider with no data should be considered stale."""
+        provider = CorrelationProvider()
+
+        assert provider.is_stale is True
+        assert provider._loaded_date is None
+
+    def test_fresh_data_is_not_stale(self):
+        """Recently loaded data should not be stale."""
+        provider = CorrelationProvider()
+        provider._loaded_date = date.today()
+        provider.correlations = {("0x1111", "0x2222"): 0.5}
+
+        assert provider.is_stale is False
+        assert provider.age_days == 0
+
+    def test_old_data_is_stale(self):
+        """Data older than max staleness should be stale."""
+        provider = CorrelationProvider()
+        provider._loaded_date = date.today() - timedelta(days=CORR_MAX_STALENESS_DAYS + 1)
+        provider.correlations = {("0x1111", "0x2222"): 0.5}
+
+        assert provider.is_stale is True
+        assert provider.age_days > CORR_MAX_STALENESS_DAYS
+
+
+class TestCorrelationDecay:
+    """Test time-based correlation decay."""
+
+    def test_no_decay_for_fresh_data(self):
+        """Fresh data should have decay factor of 1.0."""
+        provider = CorrelationProvider()
+        provider._loaded_date = date.today()
+
+        decay = provider._decay_factor()
+        assert decay == pytest.approx(1.0, rel=1e-5)
+
+    def test_half_decay_at_halflife(self):
+        """Decay should be 0.5 at half-life."""
+        provider = CorrelationProvider()
+        provider._loaded_date = date.today() - timedelta(days=CORR_DECAY_HALFLIFE_DAYS)
+
+        decay = provider._decay_factor()
+        assert decay == pytest.approx(0.5, rel=0.05)
+
+    def test_quarter_decay_at_two_halflives(self):
+        """Decay should be 0.25 at 2x half-life."""
+        provider = CorrelationProvider()
+        provider._loaded_date = date.today() - timedelta(days=2 * CORR_DECAY_HALFLIFE_DAYS)
+
+        decay = provider._decay_factor()
+        assert decay == pytest.approx(0.25, rel=0.05)
+
+    def test_zero_decay_with_no_data(self):
+        """No loaded data should have decay factor of 0."""
+        provider = CorrelationProvider()
+        provider._loaded_date = None
+
+        decay = provider._decay_factor()
+        assert decay == 0.0
+
+
+class TestGetWithDecay:
+    """Test get_with_decay method."""
+
+    def test_returns_raw_for_fresh_data(self):
+        """Fresh data should return raw correlation."""
+        provider = CorrelationProvider()
+        provider._loaded_date = date.today()
+        provider.correlations = {("0x1111", "0x2222"): 0.8}
+
+        rho = provider.get_with_decay("0x1111", "0x2222", log_default=False)
+        assert rho == pytest.approx(0.8, rel=1e-5)
+
+    def test_returns_default_for_missing_pair(self):
+        """Missing pair should return default correlation."""
+        provider = CorrelationProvider()
+        provider._loaded_date = date.today()
+        provider.correlations = {}
+
+        rho = provider.get_with_decay("0x1111", "0x2222", log_default=False)
+        assert rho == DEFAULT_CORRELATION
+
+    def test_blends_toward_default_with_age(self):
+        """Old data should blend toward default."""
+        provider = CorrelationProvider()
+        provider._loaded_date = date.today() - timedelta(days=CORR_DECAY_HALFLIFE_DAYS)
+        provider.correlations = {("0x1111", "0x2222"): 0.9}
+
+        rho = provider.get_with_decay("0x1111", "0x2222", log_default=False)
+
+        # At half-life: decayed = 0.9 * 0.5 + 0.3 * 0.5 = 0.6
+        expected = 0.9 * 0.5 + DEFAULT_CORRELATION * 0.5
+        assert rho == pytest.approx(expected, rel=0.05)
+
+    def test_converges_to_default_with_very_old_data(self):
+        """Very old data should converge to default."""
+        provider = CorrelationProvider()
+        provider._loaded_date = date.today() - timedelta(days=30)  # Very old
+        provider.correlations = {("0x1111", "0x2222"): 0.9}
+
+        rho = provider.get_with_decay("0x1111", "0x2222", log_default=False)
+
+        # Should be close to default
+        assert abs(rho - DEFAULT_CORRELATION) < 0.1
+
+
+class TestCheckFreshness:
+    """Test check_freshness method."""
+
+    def test_no_data_returns_not_fresh(self):
+        """No loaded data should not be fresh."""
+        provider = CorrelationProvider()
+
+        is_fresh, message = provider.check_freshness()
+        assert is_fresh is False
+        assert "no" in message.lower()
+
+    def test_fresh_data_returns_fresh(self):
+        """Fresh data should be fresh."""
+        provider = CorrelationProvider()
+        provider._loaded_date = date.today()
+
+        is_fresh, message = provider.check_freshness()
+        assert is_fresh is True
+        assert "fresh" in message.lower()
+
+    def test_stale_data_returns_not_fresh(self):
+        """Stale data should not be fresh."""
+        provider = CorrelationProvider()
+        provider._loaded_date = date.today() - timedelta(days=CORR_MAX_STALENESS_DAYS + 1)
+
+        is_fresh, message = provider.check_freshness()
+        assert is_fresh is False
+        assert "stale" in message.lower()
+
+
+class TestDecayQuantAcceptance:
+    """Quant acceptance tests for correlation decay."""
+
+    def test_decay_preserves_order(self):
+        """Higher correlations should stay higher after decay."""
+        provider = CorrelationProvider()
+        provider._loaded_date = date.today() - timedelta(days=2)
+        provider.correlations = {
+            ("0x1111", "0x2222"): 0.8,
+            ("0x1111", "0x3333"): 0.4,
+        }
+
+        rho_high = provider.get_with_decay("0x1111", "0x2222", log_default=False)
+        rho_low = provider.get_with_decay("0x1111", "0x3333", log_default=False)
+
+        assert rho_high > rho_low
+
+    def test_decay_bounds(self):
+        """Decayed correlation should stay in [0, 1]."""
+        provider = CorrelationProvider()
+        provider._loaded_date = date.today() - timedelta(days=5)
+        provider.correlations = {("0x1111", "0x2222"): 1.0}
+
+        rho = provider.get_with_decay("0x1111", "0x2222", log_default=False)
+
+        assert 0 <= rho <= 1
+
+    def test_default_used_count_tracked(self):
+        """Provider should track how many times default was used."""
+        provider = CorrelationProvider()
+        provider._loaded_date = date.today()
+        provider.correlations = {}
+        provider._default_used_count = 0
+
+        # Get multiple missing pairs
+        provider.get_with_decay("0x1111", "0x2222", log_default=False)
+        provider.get_with_decay("0x3333", "0x4444", log_default=False)
+
+        assert provider._default_used_count == 2

@@ -27,6 +27,8 @@ from app.atr import (
     ATR_MULTIPLIER_BTC,
     ATR_MULTIPLIER_ETH,
     ATR_FALLBACK_PCT,
+    ATR_MAX_STALENESS_SECONDS,
+    ATR_FALLBACK_BY_ASSET,
 )
 
 
@@ -146,26 +148,30 @@ class TestATRProvider:
     """Test ATR Provider functionality."""
 
     def test_fallback_atr_btc(self):
-        """Fallback ATR for BTC uses correct multiplier."""
+        """Fallback ATR for BTC uses asset-specific percentage."""
         provider = ATRProvider()
         atr_data = provider._fallback_atr("BTC", 100000.0)
 
         assert atr_data.asset == "BTC"
         assert atr_data.source == "fallback"
         assert atr_data.multiplier == ATR_MULTIPLIER_BTC
-        # Fallback atr_pct is 0.5%, multiplier is 2.0, so stop_distance_pct = 1.0%
-        assert atr_data.stop_distance_pct == pytest.approx(1.0, rel=0.01)
+        # Fallback atr_pct is 0.4% (BTC-specific), multiplier is 2.0
+        btc_fallback = ATR_FALLBACK_BY_ASSET.get("BTC", 0.5)
+        expected_stop = btc_fallback * ATR_MULTIPLIER_BTC
+        assert atr_data.stop_distance_pct == pytest.approx(expected_stop, rel=0.01)
 
     def test_fallback_atr_eth(self):
-        """Fallback ATR for ETH uses correct multiplier."""
+        """Fallback ATR for ETH uses asset-specific percentage."""
         provider = ATRProvider()
         atr_data = provider._fallback_atr("ETH", 4000.0)
 
         assert atr_data.asset == "ETH"
         assert atr_data.source == "fallback"
         assert atr_data.multiplier == ATR_MULTIPLIER_ETH
-        # Fallback atr_pct is 0.5%, multiplier is 1.5, so stop_distance_pct = 0.75%
-        assert atr_data.stop_distance_pct == pytest.approx(0.75, rel=0.01)
+        # Fallback atr_pct is 0.6% (ETH-specific), multiplier is 1.5
+        eth_fallback = ATR_FALLBACK_BY_ASSET.get("ETH", 0.5)
+        expected_stop = eth_fallback * ATR_MULTIPLIER_ETH
+        assert atr_data.stop_distance_pct == pytest.approx(expected_stop, rel=0.01)
 
     def test_get_stop_fraction(self):
         """Stop fraction correctly converts percentage to fraction."""
@@ -376,3 +382,108 @@ class TestQuantAcceptance:
         assert pnl == pytest.approx(3000.0, rel=1e-5)
         assert risk == pytest.approx(2000.0, rel=1e-5)
         assert r_multiple == pytest.approx(1.5, rel=1e-5)
+
+
+class TestATRStaleness:
+    """Test ATR data staleness checks."""
+
+    def test_fresh_data_is_not_stale(self):
+        """Fresh ATR data should not be flagged as stale."""
+        atr_data = ATRData(
+            asset="BTC",
+            atr=1500.0,
+            atr_pct=1.5,
+            price=100000.0,
+            multiplier=2.0,
+            stop_distance_pct=3.0,
+            timestamp=datetime.now(timezone.utc),
+            source="db",
+        )
+
+        assert atr_data.is_stale is False
+        assert atr_data.age_seconds < 5
+
+    def test_old_data_is_stale(self):
+        """ATR data older than max staleness should be flagged."""
+        old_time = datetime.now(timezone.utc) - timedelta(seconds=ATR_MAX_STALENESS_SECONDS + 60)
+        atr_data = ATRData(
+            asset="BTC",
+            atr=1500.0,
+            atr_pct=1.5,
+            price=100000.0,
+            multiplier=2.0,
+            stop_distance_pct=3.0,
+            timestamp=old_time,
+            source="db",
+        )
+
+        assert atr_data.is_stale is True
+        assert atr_data.age_seconds > ATR_MAX_STALENESS_SECONDS
+
+    def test_fallback_is_always_stale(self):
+        """Fallback ATR data should always be considered stale."""
+        atr_data = ATRData(
+            asset="BTC",
+            atr=500.0,
+            atr_pct=0.5,
+            price=100000.0,
+            multiplier=2.0,
+            stop_distance_pct=1.0,
+            timestamp=datetime.now(timezone.utc),
+            source="fallback",
+        )
+
+        assert atr_data.is_stale is True
+
+    def test_check_staleness_returns_message(self):
+        """check_staleness should return descriptive message."""
+        provider = ATRProvider()
+
+        # Fresh data
+        fresh_data = ATRData(
+            asset="BTC",
+            atr=1500.0,
+            atr_pct=1.5,
+            price=100000.0,
+            multiplier=2.0,
+            stop_distance_pct=3.0,
+            timestamp=datetime.now(timezone.utc),
+            source="db",
+        )
+        is_stale, message = provider.check_staleness(fresh_data)
+        assert is_stale is False
+        assert "fresh" in message.lower()
+
+        # Fallback data
+        fallback_data = provider._fallback_atr("BTC", 100000.0)
+        is_stale, message = provider.check_staleness(fallback_data)
+        assert is_stale is True
+        assert "fallback" in message.lower()
+
+
+class TestAssetSpecificFallbacks:
+    """Test asset-specific fallback ATR percentages."""
+
+    def test_btc_has_lower_fallback_than_eth(self):
+        """BTC should have lower fallback ATR % than ETH (less volatile per candle)."""
+        btc_fallback = ATR_FALLBACK_BY_ASSET.get("BTC", 0.5)
+        eth_fallback = ATR_FALLBACK_BY_ASSET.get("ETH", 0.5)
+
+        assert btc_fallback < eth_fallback
+
+    def test_fallback_values_are_reasonable(self):
+        """Fallback ATR values should be reasonable for 1-min candles."""
+        btc_fallback = ATR_FALLBACK_BY_ASSET.get("BTC", 0.5)
+        eth_fallback = ATR_FALLBACK_BY_ASSET.get("ETH", 0.5)
+
+        # Typical 1-min ATR is 0.2% - 0.8% for major cryptos
+        assert 0.2 <= btc_fallback <= 0.8
+        assert 0.3 <= eth_fallback <= 1.0
+
+    def test_unknown_asset_uses_reasonable_default(self):
+        """Unknown assets should use conservative default."""
+        provider = ATRProvider()
+        atr_data = provider._fallback_atr("SOL", 100.0)
+
+        # Unknown asset uses 0.5% default
+        assert atr_data.atr_pct == 0.5

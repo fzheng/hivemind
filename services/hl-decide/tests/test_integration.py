@@ -193,16 +193,18 @@ class TestCorrelationEffK:
 
     def test_correlation_hydrates_detector(self):
         """CorrelationProvider should populate detector's correlation matrix."""
+        from datetime import date
         provider = CorrelationProvider()
         detector = ConsensusDetector()
 
-        # Manually set correlations
+        # Manually set correlations and loaded date for fresh data
         provider.correlations[("0x1111", "0x2222")] = 0.5
         provider.correlations[("0x1111", "0x3333")] = 0.3
         provider.correlations[("0x2222", "0x3333")] = 0.4
+        provider._loaded_date = date.today()  # Mark as fresh to avoid decay
 
-        # Hydrate detector
-        count = provider.hydrate_detector(detector)
+        # Hydrate detector (apply_decay=False to test raw values)
+        count = provider.hydrate_detector(detector, apply_decay=False)
         assert count == 3
 
         # Verify detector has the correlations in its matrix

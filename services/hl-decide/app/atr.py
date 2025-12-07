@@ -36,6 +36,14 @@ ATR_MULTIPLIER_BTC = float(os.getenv("ATR_MULTIPLIER_BTC", "2.0"))
 ATR_MULTIPLIER_ETH = float(os.getenv("ATR_MULTIPLIER_ETH", "1.5"))
 ATR_FALLBACK_PCT = float(os.getenv("ATR_FALLBACK_PCT", "1.0"))  # 1%
 ATR_CACHE_TTL_SECONDS = int(os.getenv("ATR_CACHE_TTL_SECONDS", "60"))  # 1 minute
+ATR_MAX_STALENESS_SECONDS = int(os.getenv("ATR_MAX_STALENESS_SECONDS", "300"))  # 5 minutes
+
+# Asset-specific fallback percentages (typical 1-min ATR as % of price)
+# Based on historical BTC/ETH volatility analysis
+ATR_FALLBACK_BY_ASSET: Dict[str, float] = {
+    "BTC": 0.4,   # ~0.4% typical 1-min ATR for BTC
+    "ETH": 0.6,   # ~0.6% typical 1-min ATR for ETH (more volatile)
+}
 
 # Asset-specific multipliers
 ATR_MULTIPLIERS: Dict[str, float] = {
@@ -55,6 +63,19 @@ class ATRData:
     stop_distance_pct: float  # ATR * multiplier as percentage
     timestamp: datetime
     source: str  # 'db', 'calculated', 'fallback'
+
+    @property
+    def is_stale(self) -> bool:
+        """Check if ATR data exceeds max staleness threshold."""
+        if self.source == "fallback":
+            return True  # Fallback is always considered stale
+        age = (datetime.now(timezone.utc) - self.timestamp).total_seconds()
+        return age > ATR_MAX_STALENESS_SECONDS
+
+    @property
+    def age_seconds(self) -> float:
+        """Get age of data in seconds."""
+        return (datetime.now(timezone.utc) - self.timestamp).total_seconds()
 
 
 @dataclass
@@ -284,12 +305,26 @@ class ATRProvider:
         return None
 
     def _fallback_atr(self, asset: str, price: Optional[float]) -> ATRData:
-        """Return fallback ATR when no data available."""
+        """
+        Return fallback ATR when no data available.
+
+        Uses asset-specific typical ATR percentages based on historical analysis:
+        - BTC: ~0.4% typical 1-min ATR (lower volatility per candle)
+        - ETH: ~0.6% typical 1-min ATR (higher volatility)
+
+        Logs a warning when fallback is used so we can track data gaps.
+        """
         multiplier = self._get_multiplier(asset)
-        # Fallback: assume ATR is ~0.5% of price (typical for BTC 1-min candles)
-        # This gives stop_distance_pct = 0.5% * multiplier ≈ 1% for BTC with 2x multiplier
-        atr_pct = 0.5  # Conservative estimate
-        current_price = price or 100000.0  # Placeholder
+        # Use asset-specific fallback or default
+        atr_pct = ATR_FALLBACK_BY_ASSET.get(asset.upper(), 0.5)
+        current_price = price or 100000.0  # Placeholder for BTC
+
+        # Log warning about fallback usage
+        print(
+            f"[atr] WARNING: Using fallback ATR for {asset}: "
+            f"{atr_pct:.2f}% (stop={atr_pct * multiplier:.2f}%). "
+            f"No fresh ATR data available."
+        )
 
         return ATRData(
             asset=asset,
@@ -310,6 +345,54 @@ class ATRProvider:
         and consensus detection.
         """
         return atr_data.stop_distance_pct / 100.0
+
+    def check_staleness(self, atr_data: ATRData) -> Tuple[bool, str]:
+        """
+        Check if ATR data is stale and return detailed status.
+
+        Args:
+            atr_data: ATR data to check
+
+        Returns:
+            Tuple of (is_stale, status_message)
+        """
+        if atr_data.source == "fallback":
+            return (True, f"ATR using fallback for {atr_data.asset}")
+
+        age = atr_data.age_seconds
+        if age > ATR_MAX_STALENESS_SECONDS:
+            return (
+                True,
+                f"ATR for {atr_data.asset} is stale: {age:.0f}s old "
+                f"(max {ATR_MAX_STALENESS_SECONDS}s)"
+            )
+
+        return (False, f"ATR for {atr_data.asset} is fresh: {age:.0f}s old")
+
+    async def get_atr_with_staleness_check(
+        self,
+        asset: str,
+        price: Optional[float] = None,
+        log_stale: bool = True,
+    ) -> Tuple[ATRData, bool]:
+        """
+        Get ATR data with staleness check and optional logging.
+
+        Args:
+            asset: Asset symbol (BTC, ETH)
+            price: Current price (optional)
+            log_stale: Whether to log warnings for stale data
+
+        Returns:
+            Tuple of (ATRData, is_stale)
+        """
+        atr_data = await self.get_atr(asset, price)
+        is_stale, message = self.check_staleness(atr_data)
+
+        if is_stale and log_stale:
+            print(f"[atr] WARNING: {message}")
+
+        return (atr_data, is_stale)
 
     def clear_cache(self) -> None:
         """Clear the ATR cache."""

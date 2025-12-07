@@ -28,7 +28,8 @@ CONSENSUS_MIN_PCT = float(os.getenv("CONSENSUS_MIN_PCT", "0.70"))
 CONSENSUS_MIN_EFFECTIVE_K = float(os.getenv("CONSENSUS_MIN_EFFECTIVE_K", "2.0"))
 CONSENSUS_BASE_WINDOW_S = int(os.getenv("CONSENSUS_BASE_WINDOW_S", "120"))
 CONSENSUS_MAX_STALENESS_FACTOR = float(os.getenv("CONSENSUS_MAX_STALENESS_FACTOR", "1.25"))
-CONSENSUS_MAX_PRICE_BAND_BPS = float(os.getenv("CONSENSUS_MAX_PRICE_BAND_BPS", "8.0"))
+CONSENSUS_MAX_PRICE_BAND_BPS = float(os.getenv("CONSENSUS_MAX_PRICE_BAND_BPS", "8.0"))  # Legacy fallback
+CONSENSUS_MAX_PRICE_DRIFT_R = float(os.getenv("CONSENSUS_MAX_PRICE_DRIFT_R", "0.25"))  # ATR-based: 0.25 R-units
 CONSENSUS_EV_MIN_R = float(os.getenv("CONSENSUS_EV_MIN_R", "0.20"))
 CONSENSUS_SYMBOLS = os.getenv("CONSENSUS_SYMBOLS", "BTC,ETH").split(",")
 
@@ -404,6 +405,11 @@ class ConsensusDetector:
         """
         Check latency and price band gates.
 
+        Price band now uses ATR-based R-units instead of fixed BPS:
+        - Get stop_fraction from ATR provider (e.g., 1% for BTC)
+        - Convert price deviation to R-units: deviation_R = bps / (stop_fraction * 10000)
+        - Compare against CONSENSUS_MAX_PRICE_DRIFT_R (default 0.25 R)
+
         Args:
             window: Current consensus window
             votes: Agreeing votes to check
@@ -424,16 +430,28 @@ class ConsensusDetector:
         if staleness_s > max_staleness:
             return False
 
-        # Price band gate: current mid vs median voter entry
+        # Price band gate: current mid vs median voter entry (ATR-based R-units)
         median_entry = statistics.median(v.price for v in votes)
         mid_price = self.get_current_mid(window.symbol)
 
         if median_entry <= 0 or mid_price <= 0:
             return False
 
+        # Calculate price deviation in BPS
         bps_deviation = abs(mid_price - median_entry) / median_entry * 10000
 
-        return bps_deviation <= CONSENSUS_MAX_PRICE_BAND_BPS
+        # Convert BPS to R-units using ATR-based stop fraction
+        # R-units = bps_deviation / (stop_fraction_pct * 100)
+        # E.g., 8 bps with 1% stop = 8 / 100 = 0.08 R
+        stop_fraction = self.get_stop_fraction(window.symbol)
+        stop_bps = stop_fraction * 10000  # Convert fraction to BPS (0.01 -> 100 bps)
+
+        if stop_bps > 0:
+            deviation_r = bps_deviation / stop_bps
+            return deviation_r <= CONSENSUS_MAX_PRICE_DRIFT_R
+        else:
+            # Fallback to legacy BPS check if stop fraction not available
+            return bps_deviation <= CONSENSUS_MAX_PRICE_BAND_BPS
 
     def calibrated_p_win(self, votes: List[Vote], eff_k: float) -> float:
         """

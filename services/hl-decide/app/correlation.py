@@ -35,6 +35,13 @@ CORR_LOOKBACK_DAYS = int(os.getenv("CORR_LOOKBACK_DAYS", "30"))
 CORR_MIN_COMMON_BUCKETS = int(os.getenv("CORR_MIN_COMMON_BUCKETS", "10"))
 CORR_BATCH_SIZE = int(os.getenv("CORR_BATCH_SIZE", "1000"))
 
+# Staleness configuration
+CORR_MAX_STALENESS_DAYS = int(os.getenv("CORR_MAX_STALENESS_DAYS", "7"))  # Max age before full fallback
+CORR_DECAY_HALFLIFE_DAYS = float(os.getenv("CORR_DECAY_HALFLIFE_DAYS", "3.0"))  # Half-life for decay
+
+# Default correlation when data is missing or stale
+DEFAULT_CORRELATION = float(os.getenv("DEFAULT_CORRELATION", "0.3"))
+
 
 @dataclass
 class TraderSignVector:
@@ -422,16 +429,49 @@ class CorrelationProvider:
     Provides correlation data to the consensus detector.
 
     Loads correlations from database and provides lookup interface.
+    Applies time-decay to older correlations and handles staleness.
     """
 
     def __init__(self, pool: Optional[asyncpg.Pool] = None):
         self.pool = pool
         self.correlations: Dict[Tuple[str, str], float] = {}
         self._loaded_date: Optional[date] = None
+        self._default_used_count: int = 0
 
     def set_pool(self, pool: asyncpg.Pool) -> None:
         """Set the database pool."""
         self.pool = pool
+
+    @property
+    def is_stale(self) -> bool:
+        """Check if loaded correlations exceed max staleness."""
+        if self._loaded_date is None:
+            return True
+        age_days = (date.today() - self._loaded_date).days
+        return age_days > CORR_MAX_STALENESS_DAYS
+
+    @property
+    def age_days(self) -> int:
+        """Get age of loaded correlations in days."""
+        if self._loaded_date is None:
+            return float('inf')
+        return (date.today() - self._loaded_date).days
+
+    def _decay_factor(self) -> float:
+        """
+        Calculate decay factor based on data age.
+
+        Uses exponential decay: factor = 2^(-age/halflife)
+        - Age 0: factor = 1.0 (no decay)
+        - Age = halflife: factor = 0.5
+        - Age >> halflife: factor -> 0
+        """
+        if self._loaded_date is None:
+            return 0.0
+        age_days = (date.today() - self._loaded_date).days
+        if age_days <= 0:
+            return 1.0
+        return math.pow(2, -age_days / CORR_DECAY_HALFLIFE_DAYS)
 
     async def load(self, as_of_date: Optional[date] = None) -> int:
         """
@@ -448,6 +488,16 @@ class CorrelationProvider:
 
         self.correlations = await load_correlations(self.pool, as_of_date)
         self._loaded_date = as_of_date or date.today()
+        self._default_used_count = 0
+
+        # Log staleness warning if applicable
+        if self.is_stale:
+            print(
+                f"[correlation] WARNING: Correlation data is stale "
+                f"({self.age_days} days old, max {CORR_MAX_STALENESS_DAYS} days). "
+                f"Using default ρ={DEFAULT_CORRELATION} for new pairs."
+            )
+
         return len(self.correlations)
 
     def get(self, addr_a: str, addr_b: str) -> Optional[float]:
@@ -464,20 +514,95 @@ class CorrelationProvider:
         key = tuple(sorted([addr_a.lower(), addr_b.lower()]))
         return self.correlations.get(key)
 
-    def hydrate_detector(self, detector) -> int:
+    def get_with_decay(self, addr_a: str, addr_b: str, log_default: bool = True) -> float:
+        """
+        Get correlation with time-decay applied.
+
+        Blends stored correlation toward default based on data age:
+        - Fresh data (decay=1.0): Use stored correlation
+        - Stale data (decay=0.0): Use default correlation
+        - In between: Weighted blend
+
+        Args:
+            addr_a: First trader address
+            addr_b: Second trader address
+            log_default: Whether to log when default is used
+
+        Returns:
+            Decayed correlation value (always returns a value, never None)
+        """
+        raw_rho = self.get(addr_a, addr_b)
+
+        if raw_rho is None:
+            # No stored correlation, use default
+            self._default_used_count += 1
+            if log_default and self._default_used_count <= 5:
+                print(
+                    f"[correlation] Using default ρ={DEFAULT_CORRELATION} "
+                    f"for pair ({addr_a[:8]}..., {addr_b[:8]}...) - "
+                    f"no stored correlation found"
+                )
+            return DEFAULT_CORRELATION
+
+        # Apply decay
+        decay = self._decay_factor()
+        if decay >= 0.99:
+            return raw_rho  # No significant decay
+
+        # Blend toward default: decayed = raw * decay + default * (1 - decay)
+        decayed_rho = raw_rho * decay + DEFAULT_CORRELATION * (1 - decay)
+        return decayed_rho
+
+    def check_freshness(self) -> Tuple[bool, str]:
+        """
+        Check freshness of correlation data.
+
+        Returns:
+            Tuple of (is_fresh, status_message)
+        """
+        if self._loaded_date is None:
+            return (False, "No correlation data loaded")
+
+        age_days = self.age_days
+        decay = self._decay_factor()
+
+        if self.is_stale:
+            return (
+                False,
+                f"Correlations stale: {age_days} days old "
+                f"(max {CORR_MAX_STALENESS_DAYS}), decay={decay:.2f}"
+            )
+
+        return (
+            True,
+            f"Correlations fresh: {age_days} days old, decay={decay:.2f}"
+        )
+
+    def hydrate_detector(self, detector, apply_decay: bool = True) -> int:
         """
         Hydrate a ConsensusDetector with loaded correlations.
 
         Args:
             detector: ConsensusDetector instance
+            apply_decay: Whether to apply time-decay
 
         Returns:
             Number of pairs added
         """
+        decay = self._decay_factor() if apply_decay else 1.0
         count = 0
+
         for (addr_a, addr_b), rho in self.correlations.items():
+            if apply_decay and decay < 0.99:
+                rho = rho * decay + DEFAULT_CORRELATION * (1 - decay)
             detector.update_correlation(addr_a, addr_b, rho)
             count += 1
+
+        # Log summary
+        is_fresh, message = self.check_freshness()
+        status = "✓" if is_fresh else "⚠"
+        print(f"[correlation] {status} Hydrated detector with {count} pairs. {message}")
+
         return count
 
 
