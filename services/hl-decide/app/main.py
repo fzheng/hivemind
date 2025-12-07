@@ -53,6 +53,9 @@ MAX_FILLS = int(os.getenv("MAX_FILLS", "500"))
 RECONCILE_INTERVAL_HOURS = int(os.getenv("RECONCILE_INTERVAL_HOURS", "6"))  # Run every 6 hours
 RECONCILE_ON_STARTUP = os.getenv("RECONCILE_ON_STARTUP", "true").lower() == "true"
 
+# Correlation refresh settings
+CORR_REFRESH_INTERVAL_HOURS = int(os.getenv("CORR_REFRESH_INTERVAL_HOURS", "24"))  # Daily by default
+
 # R-multiple calculation: assumed stop loss fraction (1% = 0.01)
 ASSUMED_STOP_FRACTION = float(os.getenv("ASSUMED_STOP_FRACTION", "0.01"))
 
@@ -935,6 +938,44 @@ async def periodic_reconciliation_task():
             await asyncio.sleep(60)  # Wait 1 minute before retrying
 
 
+async def periodic_correlation_refresh_task():
+    """
+    Background task that periodically refreshes trader correlations.
+
+    Runs daily (configurable via CORR_REFRESH_INTERVAL_HOURS) to keep
+    the correlation matrix up-to-date with recent trading patterns.
+
+    The correlation decay mechanism ensures stale data is gradually
+    blended toward the default ρ=0.3, but refreshing keeps data fresh.
+    """
+    interval_seconds = CORR_REFRESH_INTERVAL_HOURS * 3600
+
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+
+            print(f"[hl-decide] Starting correlation refresh (every {CORR_REFRESH_INTERVAL_HOURS}h)...")
+            summary = await run_daily_correlation_job(app.state.db)
+            total_pairs = summary.get("btc_pairs", 0) + summary.get("eth_pairs", 0)
+
+            if total_pairs > 0:
+                # Reload and hydrate detector with fresh correlations
+                corr_provider = get_correlation_provider()
+                await corr_provider.load()
+                hydrated = corr_provider.hydrate_detector(consensus_detector)
+                print(f"[hl-decide] Correlation refresh: computed {total_pairs} pairs, hydrated {hydrated}")
+            else:
+                print("[hl-decide] Correlation refresh: no pairs computed (insufficient data)")
+
+        except asyncio.CancelledError:
+            print("[hl-decide] Correlation refresh task cancelled")
+            break
+        except Exception as e:
+            print(f"[hl-decide] Correlation refresh error: {e}")
+            # Continue running despite errors
+            await asyncio.sleep(300)  # Wait 5 minutes before retrying
+
+
 def enforce_limits():
     """Enforce memory limits on scores and fills using LRU eviction."""
     while len(scores) > MAX_SCORES:
@@ -1346,9 +1387,11 @@ async def startup():
         await app.state.nc.subscribe("b.scores.v1", cb=handle_score)
         await app.state.nc.subscribe("c.fills.v1", cb=handle_fill)
 
-        # Start periodic reconciliation background task
+        # Start periodic background tasks
         app.state.reconcile_task = asyncio.create_task(periodic_reconciliation_task())
+        app.state.corr_refresh_task = asyncio.create_task(periodic_correlation_refresh_task())
         print(f"[hl-decide] Periodic reconciliation scheduled every {RECONCILE_INTERVAL_HOURS} hours")
+        print(f"[hl-decide] Correlation refresh scheduled every {CORR_REFRESH_INTERVAL_HOURS} hours")
 
         print("[hl-decide] Started with position-based tracking, ATR stops, and correlation matrix")
     except Exception as e:
@@ -1358,13 +1401,15 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    # Cancel periodic reconciliation task
-    if hasattr(app.state, "reconcile_task"):
-        app.state.reconcile_task.cancel()
-        try:
-            await app.state.reconcile_task
-        except asyncio.CancelledError:
-            pass
+    # Cancel periodic background tasks
+    for task_name in ["reconcile_task", "corr_refresh_task"]:
+        if hasattr(app.state, task_name):
+            task = getattr(app.state, task_name)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     if hasattr(app.state, "nc"):
         await app.state.nc.drain()

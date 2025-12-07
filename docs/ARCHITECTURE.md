@@ -149,6 +149,8 @@ Key configuration (see `.env.example`):
 | `LEADERBOARD_SELECT_COUNT` | Traders to track (default 10) |
 | `ATR_STRICT_MODE` | Block signals on stale ATR (default true) |
 | `VOTE_WEIGHT_MODE` | Weight calculation mode (log/equity/linear) |
+| `CORR_REFRESH_INTERVAL_HOURS` | Correlation refresh interval (default 24) |
+| `CORR_DECAY_HALFLIFE_DAYS` | Correlation decay half-life (default 3) |
 
 ## Testing
 
