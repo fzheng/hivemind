@@ -180,6 +180,20 @@ weight_gini_gauge = Gauge(
     registry=registry,
 )
 
+# Risk limit metrics
+signal_risk_rejected_counter = Counter(
+    "decide_signal_risk_rejected_total",
+    "Signals rejected by risk limits",
+    labelnames=["reason"],
+    registry=registry,
+)
+signal_generated_counter = Counter(
+    "decide_signal_generated_total",
+    "Signals that passed all gates including risk limits",
+    labelnames=["symbol", "direction"],
+    registry=registry,
+)
+
 
 def calculate_gini(weights: list[float]) -> float:
     """
@@ -1390,6 +1404,16 @@ def check_episode_consensus(asset: str, episode_fills: list) -> Optional[Consens
         trigger_addresses=[v.address for v in agreeing_votes],
     )
 
+    # Gate 5: Risk limits fail-safe
+    from .consensus import check_risk_limits
+    passes_risk, risk_reason = check_risk_limits(signal)
+    if not passes_risk:
+        signal_risk_rejected_counter.labels(reason=risk_reason.split()[0]).inc()
+        print(f"[consensus] Signal rejected by risk limits: {risk_reason}")
+        return None
+
+    # All gates passed including risk limits
+    signal_generated_counter.labels(symbol=asset, direction=majority_dir).inc()
     return signal
 
 

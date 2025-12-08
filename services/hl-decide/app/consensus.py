@@ -51,6 +51,76 @@ VOTE_WEIGHT_MODE = os.getenv("VOTE_WEIGHT_MODE", "log")  # Default to log until 
 VOTE_WEIGHT_LOG_BASE = float(os.getenv("VOTE_WEIGHT_LOG_BASE", "10000.0"))  # $10k base for log
 VOTE_WEIGHT_MAX = float(os.getenv("VOTE_WEIGHT_MAX", "1.0"))  # Max weight per trader
 
+# ============================================================================
+# RISK DEFAULTS & FAIL-SAFES
+# ============================================================================
+# Until Kelly/risk sizing is implemented, enforce conservative static limits.
+# These are hard caps that prevent over-exposure regardless of signal quality.
+#
+# NOTE: These are conservative defaults. Adjust based on account size and risk tolerance.
+# These values should be overridden by proper Kelly sizing when Phase 4 is complete.
+# ============================================================================
+
+# Maximum position size as fraction of account equity (per position)
+# Default 2% = very conservative, prevents catastrophic single-trade losses
+MAX_POSITION_SIZE_PCT = float(os.getenv("MAX_POSITION_SIZE_PCT", "2.0"))
+
+# Maximum total exposure (sum of all open positions) as fraction of equity
+# Default 10% = allows up to 5 concurrent 2% positions
+MAX_TOTAL_EXPOSURE_PCT = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "10.0"))
+
+# Maximum daily loss before halting signals (as fraction of equity)
+# Default 5% = stop trading after 5% drawdown in a day
+MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "5.0"))
+
+# Minimum EV required to generate a signal (in R-multiples)
+# Higher values = fewer but higher quality signals
+# Note: This overrides CONSENSUS_EV_MIN_R for risk management
+MIN_SIGNAL_EV_R = float(os.getenv("MIN_SIGNAL_EV_R", str(CONSENSUS_EV_MIN_R)))
+
+# Minimum confidence (p_win) required for signal generation
+# Default 0.55 = require at least 55% estimated win probability
+MIN_SIGNAL_CONFIDENCE = float(os.getenv("MIN_SIGNAL_CONFIDENCE", "0.55"))
+
+# Maximum leverage allowed (if/when execution layer is added)
+# Default 1.0 = no leverage until proper risk sizing is implemented
+MAX_LEVERAGE = float(os.getenv("MAX_LEVERAGE", "1.0"))
+
+# Cooldown period between signals for the same symbol (seconds)
+# Prevents rapid-fire entries that could compound losses
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "300"))  # 5 minutes
+
+
+def check_risk_limits(signal: "ConsensusSignal") -> Tuple[bool, str]:
+    """
+    Check if a signal passes conservative risk limits.
+
+    This is a fail-safe before any position sizing logic.
+    Returns (passes, reason).
+
+    Args:
+        signal: The consensus signal to check
+
+    Returns:
+        Tuple of (passes_checks, reason_if_failed)
+    """
+    # Check minimum confidence
+    if signal.p_win < MIN_SIGNAL_CONFIDENCE:
+        return (
+            False,
+            f"Confidence {signal.p_win:.2f} < minimum {MIN_SIGNAL_CONFIDENCE:.2f}"
+        )
+
+    # Check minimum EV
+    if signal.ev_net_r < MIN_SIGNAL_EV_R:
+        return (
+            False,
+            f"EV {signal.ev_net_r:.3f}R < minimum {MIN_SIGNAL_EV_R:.3f}R"
+        )
+
+    # All checks passed
+    return (True, "")
+
 
 @dataclass
 class Fill:
