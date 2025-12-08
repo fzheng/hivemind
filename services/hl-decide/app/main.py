@@ -93,6 +93,167 @@ position_pnl_histogram = Histogram(
     buckets=(-2, -1, -0.5, 0, 0.5, 1, 2, 5),
 )
 
+# Data quality observability metrics
+from prometheus_client import Gauge
+
+# ATR metrics - track staleness and fallback usage
+atr_stale_counter = Counter(
+    "decide_atr_stale_total",
+    "Times ATR data was stale",
+    labelnames=["asset"],
+    registry=registry,
+)
+atr_fallback_counter = Counter(
+    "decide_atr_fallback_total",
+    "Times ATR used fallback (hardcoded or realized_vol)",
+    labelnames=["asset", "source"],
+    registry=registry,
+)
+atr_age_gauge = Gauge(
+    "decide_atr_age_seconds",
+    "Current age of ATR data in seconds",
+    labelnames=["asset"],
+    registry=registry,
+)
+atr_blocked_counter = Counter(
+    "decide_atr_blocked_total",
+    "Times gating was blocked due to stale ATR (strict mode)",
+    labelnames=["asset"],
+    registry=registry,
+)
+
+# Correlation metrics - track staleness and default usage
+corr_stale_gauge = Gauge(
+    "decide_correlation_stale",
+    "Whether correlation data is stale (1=stale, 0=fresh)",
+    registry=registry,
+)
+corr_age_gauge = Gauge(
+    "decide_correlation_age_days",
+    "Age of correlation data in days",
+    registry=registry,
+)
+corr_decay_gauge = Gauge(
+    "decide_correlation_decay_factor",
+    "Current decay factor applied to correlations (1=no decay, 0=full decay)",
+    registry=registry,
+)
+corr_default_used_counter = Counter(
+    "decide_correlation_default_used_total",
+    "Times default correlation was used (no stored data)",
+    registry=registry,
+)
+corr_pairs_loaded_gauge = Gauge(
+    "decide_correlation_pairs_loaded",
+    "Number of correlation pairs currently loaded",
+    registry=registry,
+)
+
+# Effective-K metrics - track when default ρ is used
+effk_default_fallback_counter = Counter(
+    "decide_effk_default_fallback_total",
+    "Times effK calculation used default ρ for a pair",
+    registry=registry,
+)
+effk_value_histogram = Histogram(
+    "decide_effk_value",
+    "Effective-K values in consensus checks",
+    registry=registry,
+    buckets=(1, 2, 3, 5, 7, 10, 15, 20, 50),
+)
+
+# Weight distribution metrics
+weight_histogram = Histogram(
+    "decide_vote_weight",
+    "Vote weight values in consensus",
+    registry=registry,
+    buckets=(0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9, 1.0),
+)
+weight_max_gauge = Gauge(
+    "decide_vote_weight_max",
+    "Maximum vote weight in recent consensus check",
+    registry=registry,
+)
+weight_gini_gauge = Gauge(
+    "decide_vote_weight_gini",
+    "Gini coefficient of vote weights (0=equal, 1=concentrated)",
+    registry=registry,
+)
+
+
+def calculate_gini(weights: list[float]) -> float:
+    """
+    Calculate Gini coefficient for a list of weights.
+
+    Gini = 0 means perfect equality (all weights equal)
+    Gini = 1 means perfect inequality (one weight = 1, rest = 0)
+
+    Args:
+        weights: List of weight values
+
+    Returns:
+        Gini coefficient between 0 and 1
+    """
+    if not weights or len(weights) < 2:
+        return 0.0
+
+    sorted_weights = sorted(weights)
+    n = len(sorted_weights)
+    total = sum(sorted_weights)
+
+    if total == 0:
+        return 0.0
+
+    # Calculate using the formula: G = (2 * sum(i * x_i) - (n + 1) * sum(x_i)) / (n * sum(x_i))
+    cumulative = sum((i + 1) * w for i, w in enumerate(sorted_weights))
+    gini = (2 * cumulative - (n + 1) * total) / (n * total)
+
+    return max(0.0, min(1.0, gini))
+
+
+def update_weight_metrics(weights: list[float]) -> None:
+    """
+    Update weight distribution metrics from a consensus check.
+
+    Args:
+        weights: List of vote weights from consensus check
+    """
+    if not weights:
+        return
+
+    # Record each weight in histogram
+    for w in weights:
+        weight_histogram.observe(w)
+
+    # Update max weight gauge
+    weight_max_gauge.set(max(weights))
+
+    # Update Gini coefficient gauge
+    gini = calculate_gini(weights)
+    weight_gini_gauge.set(gini)
+
+
+def update_correlation_metrics(provider) -> None:
+    """
+    Update correlation observability metrics from the provider.
+
+    Args:
+        provider: CorrelationProvider instance
+    """
+    # Update staleness gauge
+    corr_stale_gauge.set(1.0 if provider.is_stale else 0.0)
+
+    # Update age gauge
+    age = provider.age_days if provider._loaded_date else -1
+    if age != float('inf'):
+        corr_age_gauge.set(age)
+
+    # Update decay factor
+    corr_decay_gauge.set(provider._decay_factor())
+
+    # Update pairs loaded
+    corr_pairs_loaded_gauge.set(len(provider.correlations))
+
 
 async def ensure_stream(js, name: str, subjects):
     """Ensures a NATS JetStream stream exists."""
@@ -679,6 +840,21 @@ async def update_atr_for_consensus() -> None:
             atr_data = await atr_provider.get_atr(symbol)
             stop_fraction = atr_provider.get_stop_fraction(atr_data)
 
+            # Update ATR observability metrics
+            atr_age_gauge.labels(asset=symbol).set(atr_data.age_seconds)
+
+            if atr_data.is_stale:
+                atr_stale_counter.labels(asset=symbol).inc()
+
+            if atr_data.source in ("fallback_hardcoded", "realized_vol"):
+                atr_fallback_counter.labels(asset=symbol, source=atr_data.source).inc()
+
+            # Check if gating should be blocked (strict mode)
+            should_block, block_reason = atr_provider.should_block_gate(atr_data)
+            if should_block:
+                atr_blocked_counter.labels(asset=symbol).inc()
+                print(f"[hl-decide] ATR BLOCKED for {symbol}: {block_reason}")
+
             # Update consensus detector
             consensus_detector.set_stop_fraction(symbol, stop_fraction)
 
@@ -687,7 +863,7 @@ async def update_atr_for_consensus() -> None:
             # This affects new episodes; existing ones keep their original stop
             episode_config.default_stop_fraction = stop_fraction
 
-            print(f"[hl-decide] {symbol} ATR stop: {stop_fraction*100:.2f}% (source: {atr_data.source})")
+            print(f"[hl-decide] {symbol} ATR stop: {stop_fraction*100:.2f}% (source: {atr_data.source}, age: {atr_data.age_seconds:.0f}s)")
 
     except Exception as e:
         print(f"[hl-decide] Failed to update ATR for consensus: {e}")
@@ -963,6 +1139,10 @@ async def periodic_correlation_refresh_task():
                 corr_provider = get_correlation_provider()
                 await corr_provider.load()
                 hydrated = corr_provider.hydrate_detector(consensus_detector)
+
+                # Update correlation observability metrics
+                update_correlation_metrics(corr_provider)
+
                 print(f"[hl-decide] Correlation refresh: computed {total_pairs} pairs, hydrated {hydrated}")
             else:
                 print("[hl-decide] Correlation refresh: no pairs computed (insufficient data)")
@@ -1136,6 +1316,10 @@ def check_episode_consensus(asset: str, episode_fills: list) -> Optional[Consens
     # Gate 2: Effective-K (correlation-adjusted)
     weights = {v.address: v.weight for v in agreeing_votes}
     eff_k = consensus_detector.eff_k_from_corr(weights)
+
+    # Record effK and weight metrics for observability
+    effk_value_histogram.observe(eff_k)
+    update_weight_metrics(list(weights.values()))
 
     if eff_k < CONSENSUS_MIN_EFFECTIVE_K:
         return None
@@ -1357,6 +1541,7 @@ async def startup():
         corr_count = await app.state.corr_provider.load()
         if corr_count > 0:
             hydrated = app.state.corr_provider.hydrate_detector(consensus_detector)
+            update_correlation_metrics(app.state.corr_provider)
             print(f"[hl-decide] Loaded {corr_count} correlations, hydrated detector with {hydrated} pairs")
         else:
             # No correlations found - try to compute them on first startup
@@ -1367,6 +1552,7 @@ async def startup():
                 if total_pairs > 0:
                     corr_count = await app.state.corr_provider.load()
                     hydrated = app.state.corr_provider.hydrate_detector(consensus_detector)
+                    update_correlation_metrics(app.state.corr_provider)
                     print(f"[hl-decide] Computed {total_pairs} correlations, hydrated detector with {hydrated} pairs")
                 else:
                     print("[hl-decide] No correlations computed (insufficient data, using default ρ=0.3)")
