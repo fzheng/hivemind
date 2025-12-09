@@ -2434,6 +2434,59 @@ td {
   font-weight: 600;
 }
 
+/* Alpha Pool holdings cell */
+.alpha-pool-table .holds-cell {
+  white-space: nowrap;
+}
+
+.alpha-pool-table .holds-cell .holding-chip {
+  padding: 2px 6px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+  font-size: 0.7rem;
+  font-family: 'Monaco', 'Consolas', monospace;
+  margin-right: 4px;
+  cursor: help;
+}
+
+.alpha-pool-table .holds-cell .no-position {
+  color: var(--text-muted);
+  opacity: 0.5;
+}
+
+/* Alpha Pool signals cell with tooltip */
+.alpha-pool-table .signals-cell {
+  cursor: help;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+
+/* Alpha Pool last activity cell */
+.alpha-pool-table .last-activity-cell {
+  white-space: nowrap;
+  font-size: 0.8rem;
+}
+
+.alpha-pool-table .no-activity {
+  color: var(--text-muted);
+  opacity: 0.5;
+}
+
+.alpha-pool-table .activity-time {
+  color: var(--text-secondary);
+}
+
+/* Alpha Pool Activity time toggle - clickable to switch between relative/absolute */
+.alpha-pool-table .activity-time.clickable {
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+
+.alpha-pool-table .activity-time.clickable:hover {
+  color: var(--accent-primary);
+  text-decoration: underline;
+}
+
 .alpha-pool-table td a {
   color: #60a5fa;
   text-decoration: none;

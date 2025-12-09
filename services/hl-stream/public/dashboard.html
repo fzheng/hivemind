@@ -141,12 +141,13 @@
                 <thead>
                   <tr>
                     <th>Address</th>
+                    <th title="Current BTC perpetual position (hover for details)">BTC</th>
+                    <th title="Current ETH perpetual position (hover for details)">ETH</th>
                     <th title="30-day PnL curve from Hyperliquid">PnL Curve</th>
-                    <th title="Expected R-multiple (posterior mean)">μ (E[R])</th>
-                    <th title="Effective sample size (confidence)">κ (conf)</th>
-                    <th title="Total closed positions">Signals</th>
-                    <th title="Average realized R-multiple">Avg R</th>
+                    <th title="30-day realized PnL from curve">30d PnL</th>
+                    <th title="Total closed positions (hover for NIG stats)">Signals</th>
                     <th title="Selected for current consensus window">Selected</th>
+                    <th title="Most recent trading activity (click values to toggle format)" data-testid="alpha-pool-last-activity-header">Last Activity</th>
                   </tr>
                 </thead>
                 <tbody id="alpha-pool-table" data-testid="alpha-pool-tbody"></tbody>

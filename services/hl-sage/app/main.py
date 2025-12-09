@@ -375,6 +375,12 @@ async def startup_event():
         # Auto-refresh Alpha Pool if empty on startup
         if ALPHA_POOL_AUTO_REFRESH:
             asyncio.create_task(auto_refresh_alpha_pool_if_empty())
+
+        # Start periodic fill sync for Alpha Pool addresses
+        asyncio.create_task(periodic_alpha_pool_fill_sync())
+
+        # Start periodic Alpha Pool refresh (every ALPHA_POOL_REFRESH_HOURS)
+        asyncio.create_task(periodic_alpha_pool_refresh())
     except Exception as e:
         print(f"[hl-sage] Fatal startup error: {e}")
         raise
@@ -415,6 +421,113 @@ async def auto_refresh_alpha_pool_if_empty():
     except Exception as e:
         await _refresh_state.fail(str(e))
         print(f"[hl-sage] Alpha Pool auto-refresh failed: {e}")
+
+
+# Interval for periodic Alpha Pool fill sync (in seconds)
+ALPHA_POOL_FILL_SYNC_INTERVAL = int(os.getenv("ALPHA_POOL_FILL_SYNC_INTERVAL", "300"))  # 5 minutes default
+
+
+async def periodic_alpha_pool_fill_sync():
+    """
+    Periodically sync fills for Alpha Pool addresses.
+
+    This ensures new fills from Alpha Pool traders are captured even though
+    the realtime WebSocket only tracks legacy leaderboard addresses.
+
+    Runs every ALPHA_POOL_FILL_SYNC_INTERVAL seconds (default: 5 minutes).
+    """
+    # Wait for startup to complete
+    await asyncio.sleep(30)
+    print(f"[hl-sage] Starting periodic Alpha Pool fill sync (interval: {ALPHA_POOL_FILL_SYNC_INTERVAL}s)")
+
+    while True:
+        try:
+            # Get active Alpha Pool addresses
+            async with app.state.db.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT address FROM alpha_pool_addresses
+                    WHERE is_active = true
+                    ORDER BY last_refreshed DESC
+                    LIMIT 50
+                    """
+                )
+
+            if not rows:
+                await asyncio.sleep(ALPHA_POOL_FILL_SYNC_INTERVAL)
+                continue
+
+            addresses = [row["address"] for row in rows]
+            print(f"[hl-sage] Syncing fills for {len(addresses)} Alpha Pool addresses...")
+
+            # Backfill recent fills for these addresses
+            results = await backfill_historical_fills_for_addresses(app.state.db, addresses)
+            total_inserted = sum(results.values())
+
+            if total_inserted > 0:
+                print(f"[hl-sage] Fill sync complete: {total_inserted} new fills inserted")
+            else:
+                print(f"[hl-sage] Fill sync complete: no new fills")
+
+        except Exception as e:
+            print(f"[hl-sage] Fill sync error: {e}")
+
+        await asyncio.sleep(ALPHA_POOL_FILL_SYNC_INTERVAL)
+
+
+async def periodic_alpha_pool_refresh():
+    """
+    Periodically refresh the Alpha Pool from Hyperliquid leaderboard.
+
+    Checks if the pool is overdue for refresh (based on ALPHA_POOL_REFRESH_HOURS)
+    and triggers a refresh if needed.
+
+    This ensures the pool stays fresh without manual intervention.
+    """
+    # Wait for startup to complete and initial auto-refresh (if any)
+    await asyncio.sleep(120)  # 2 minutes
+
+    refresh_interval_seconds = ALPHA_POOL_REFRESH_HOURS * 3600
+    print(f"[hl-sage] Starting periodic Alpha Pool refresh (interval: {ALPHA_POOL_REFRESH_HOURS}h)")
+
+    while True:
+        try:
+            # Check if refresh is needed
+            async with app.state.db.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT MAX(last_refreshed) as last_refreshed
+                    FROM alpha_pool_addresses
+                    WHERE is_active = true
+                    """
+                )
+
+            if row and row["last_refreshed"]:
+                last_refreshed = row["last_refreshed"]
+                now = datetime.now(timezone.utc)
+                age_seconds = (now - last_refreshed).total_seconds()
+
+                if age_seconds >= refresh_interval_seconds:
+                    print(f"[hl-sage] Alpha Pool is {age_seconds / 3600:.1f}h old, triggering refresh...")
+                    # Check if refresh is already running
+                    if not _refresh_state.is_running:
+                        await _background_refresh_task(limit=ALPHA_POOL_DEFAULT_SIZE)
+                    else:
+                        print(f"[hl-sage] Refresh already in progress, skipping")
+                else:
+                    hours_until_refresh = (refresh_interval_seconds - age_seconds) / 3600
+                    print(f"[hl-sage] Alpha Pool refresh not needed yet ({hours_until_refresh:.1f}h until due)")
+            else:
+                # No data, trigger refresh
+                print(f"[hl-sage] No Alpha Pool data, triggering initial refresh...")
+                if not _refresh_state.is_running:
+                    await _background_refresh_task(limit=ALPHA_POOL_DEFAULT_SIZE)
+
+        except Exception as e:
+            print(f"[hl-sage] Periodic refresh check error: {e}")
+
+        # Check every hour
+        await asyncio.sleep(3600)
 
 
 @app.on_event("shutdown")
@@ -815,6 +928,43 @@ async def fetch_user_fills_from_api(
     return []
 
 
+async def publish_fill_to_nats(payload: Dict[str, Any]) -> None:
+    """
+    Publish a backfilled fill to NATS for hl-decide to process.
+
+    Converts the hl_events payload format to FillEvent format and publishes
+    to c.fills.v1 subject for episode building and consensus detection.
+
+    Args:
+        payload: Fill payload in hl_events format
+    """
+    try:
+        # Convert to FillEvent format
+        fill_event = {
+            "fill_id": payload.get("hash") or f"backfill-{payload['address']}-{payload['at']}",
+            "source": "hyperliquid",
+            "address": payload["address"],
+            "asset": payload["symbol"].upper(),
+            "side": "buy" if "Long" in payload["action"] and ("Open" in payload["action"] or "Increase" in payload["action"]) else "sell",
+            "size": float(payload["size"]),
+            "price": float(payload["priceUsd"]),
+            "start_position": float(payload.get("startPosition", 0)),
+            "realized_pnl": float(payload["realizedPnlUsd"]) if payload.get("realizedPnlUsd") is not None else None,
+            "ts": payload["at"],
+            "meta": {"backfilled": True},
+        }
+
+        # Publish to NATS
+        if hasattr(app.state, "nc") and app.state.nc.is_connected:
+            await app.state.nc.publish(
+                "c.fills.v1",
+                json.dumps(fill_event).encode(),
+            )
+    except Exception as e:
+        # Don't fail backfill if NATS publish fails
+        print(f"[hl-sage] Failed to publish fill to NATS: {e}")
+
+
 async def backfill_historical_fills_for_addresses(
     pool: asyncpg.Pool,
     addresses: List[str],
@@ -919,6 +1069,8 @@ async def backfill_historical_fills_for_addresses(
                     # asyncpg returns "INSERT 0 1" for successful insert, "INSERT 0 0" if no rows inserted
                     if result and result.endswith("1"):
                         inserted += 1
+                        # Publish to NATS for hl-decide to process
+                        await publish_fill_to_nats(payload)
                 except asyncpg.exceptions.UniqueViolationError:
                     # Duplicate hash - expected, skip
                     pass
@@ -941,7 +1093,7 @@ async def backfill_historical_fills_for_addresses(
 async def fetch_pnl_curve_from_api(
     client: httpx.AsyncClient,
     address: str,
-    window: str = "month",
+    window: str = "perpMonth",
     retries: int = 0,
 ) -> List[Dict[str, Any]]:
     """
@@ -950,7 +1102,7 @@ async def fetch_pnl_curve_from_api(
     Args:
         client: Async HTTP client
         address: Ethereum address
-        window: Time window ('day', 'week', 'month', 'allTime', 'period_30', etc.)
+        window: Time window ('perpMonth', 'perpWeek', 'month', 'week', etc.)
         retries: Current retry count
 
     Returns:
@@ -990,8 +1142,9 @@ async def fetch_pnl_curve_from_api(
             if not isinstance(row, list) or len(row) < 2:
                 continue
             window_name = str(row[0] or "")
-            # Match 'month' or 'period_30' for 30-day curve
-            if window_name == window or window_name == "month":
+            # Match 'perpMonth' for 30-day perp-only PnL (excludes spot, funding noise)
+            # Fall back to 'month' if perpMonth not available
+            if window_name == window or window_name == "perpMonth":
                 history_data = row[1] or {}
                 pnl_history = history_data.get("pnlHistory", [])
                 if not isinstance(pnl_history, list):
@@ -1022,17 +1175,17 @@ async def fetch_pnl_curve_from_api(
 
 async def get_pnl_curves_for_addresses(
     addresses: List[str],
-    window: str = "month",
+    window: str = "perpMonth",
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
     Fetch PnL curves for multiple addresses from Hyperliquid API with caching.
 
     Uses in-memory cache with TTL to avoid unnecessary API calls.
-    30-day PnL curves don't change frequently, so caching is safe.
+    30-day perp-only PnL curves don't change frequently, so caching is safe.
 
     Args:
         addresses: List of Ethereum addresses
-        window: Time window (default 'month' for 30-day curve)
+        window: Time window (default 'perpMonth' for 30-day perp-only curve)
 
     Returns:
         Dict mapping address -> list of {ts, value} points

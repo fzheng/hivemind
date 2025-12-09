@@ -76,6 +76,84 @@ Leaderboard → Quality Filter → Alpha Pool → Thompson Sampling → Consensu
 | `MAX_LEVERAGE` | 1x | No leverage until Kelly |
 | `SIGNAL_COOLDOWN_SECONDS` | 300s | Anti rapid-fire |
 
+**Alpha Pool Fill Sync (Phase 3d):**
+- Periodic fill sync every 5 minutes (`ALPHA_POOL_FILL_SYNC_INTERVAL`)
+- New fills published to NATS for episode building
+- Frontend polls every 30 seconds for real-time updates
+- 21 new tests for fill sync and NATS publishing
+
+**Alpha Pool Auto-Refresh (Phase 3d):**
+- Automatic pool refresh every 24 hours (`ALPHA_POOL_REFRESH_HOURS`)
+- Hourly check determines if refresh is due
+- Consensus signals polled every 60 seconds in frontend
+- Real API calls replace mock data in dashboard
+
+---
+
+## E2E Testing Guide
+
+### How to Test Phase 3
+
+1. **Start Services:**
+```bash
+docker compose up -d
+```
+
+2. **Verify Alpha Pool:**
+```bash
+# Check pool has traders
+curl http://localhost:4103/alpha-pool | jq '.count'
+
+# Check fills are being synced
+curl http://localhost:4102/dashboard/api/alpha-pool/fills?limit=3
+```
+
+3. **Monitor Consensus Detection:**
+```bash
+# Watch for consensus signals
+docker compose logs -f hl-decide 2>&1 | grep -i "consensus\|signal"
+
+# Check signal stats
+curl http://localhost:4104/consensus/stats
+```
+
+4. **Verify Episode Building:**
+```bash
+# Episodes are built from fills
+curl http://localhost:4104/episode/status
+```
+
+### Understanding Consensus Signals
+
+**Real Signals vs Placeholder:**
+- Real signals appear when ≥3 Alpha Pool traders agree on direction
+- Dashboard shows "Waiting for consensus..." if no signals yet
+- Check `consensus_signals` table for historical data
+
+**When Signals Fire:**
+1. Multiple traders open same-direction positions
+2. All 5 consensus gates pass (dispersion, effK, freshness, price drift, EV)
+3. Risk fail-safes pass (confidence, EV threshold)
+
+**If No Signals Appear:**
+- Check that traders are actively trading (fills appearing)
+- Check ATR data freshness (stale ATR blocks signals)
+- Check correlation data (default ρ=0.3 used if not computed)
+- Verify consensus thresholds aren't too strict for current activity
+
+### Test Commands
+
+```bash
+# Run all tests
+npm test && cd services/hl-sage && python -m pytest && cd services/hl-decide && python -m pytest
+
+# Run E2E tests
+npm run test:e2e
+
+# Check test coverage
+npm run test:coverage
+```
+
 ---
 
 ## Phase 4: Risk Management (Next)

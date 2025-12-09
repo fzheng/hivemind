@@ -993,6 +993,53 @@ export async function getBackfillFills(opts: {
 }
 
 /**
+ * Get the most recent fill timestamp for each address.
+ * Used to display "Last Activity" in the dashboard without being dominated by HFT traders.
+ * @param addresses Array of addresses to get last activity for
+ * @returns Map of address to most recent fill timestamp
+ */
+export async function getLastActivityPerAddress(
+  addresses: string[]
+): Promise<Record<string, string>> {
+  if (addresses.length === 0) {
+    return {};
+  }
+  try {
+    const p = await getPool();
+    const normalizedAddresses = addresses.map(a => a.toLowerCase());
+
+    // Use DISTINCT ON to get the most recent fill per address efficiently
+    const sql = `
+      SELECT DISTINCT ON (address)
+        address,
+        COALESCE((payload->>'at')::timestamptz, at) AS last_activity
+      FROM hl_events
+      WHERE type = 'trade'
+        AND address = ANY($1)
+        AND (payload->>'symbol' IN ('BTC', 'ETH') OR (payload->>'symbol' IS NULL))
+      ORDER BY address, last_activity DESC
+    `;
+
+    const { rows } = await p.query(sql, [normalizedAddresses]);
+
+    const result: Record<string, string> = {};
+    for (const row of rows) {
+      const addr = String(row.address).toLowerCase();
+      const timeValue = row.last_activity;
+      const timeUtc = timeValue instanceof Date
+        ? timeValue.toISOString()
+        : String(timeValue);
+      result[addr] = timeUtc;
+    }
+
+    return result;
+  } catch (e) {
+    console.error('[persist] getLastActivityPerAddress failed:', e);
+    return {};
+  }
+}
+
+/**
  * Deletes all trade events for a given address and symbol.
  * Used for data repair when position chain is corrupted.
  */

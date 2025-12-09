@@ -1202,93 +1202,109 @@ function initBanditControls() {
   }
 }
 
-// Mock AI recommendations data
-const mockAIRecommendations = [
-  {
-    time: new Date(Date.now() - 2 * 60000).toISOString(),
-    symbol: 'BTC',
-    action: 'LONG',
-    entry: 97250,
-    stopLoss: 96500,
-    takeProfit: 99000,
-    status: 'active'
-  },
-  {
-    time: new Date(Date.now() - 15 * 60000).toISOString(),
-    symbol: 'ETH',
-    action: 'SHORT',
-    entry: 3580,
-    stopLoss: 3650,
-    takeProfit: 3450,
-    status: 'active'
-  },
-  {
-    time: new Date(Date.now() - 45 * 60000).toISOString(),
-    symbol: 'BTC',
-    action: 'LONG',
-    entry: 96800,
-    stopLoss: 96200,
-    takeProfit: 97500,
-    status: 'tp_hit'
-  },
-  {
-    time: new Date(Date.now() - 2 * 3600000).toISOString(),
-    symbol: 'ETH',
-    action: 'LONG',
-    entry: 3520,
-    stopLoss: 3480,
-    takeProfit: 3600,
-    status: 'tp_hit'
-  },
-  {
-    time: new Date(Date.now() - 5 * 3600000).toISOString(),
-    symbol: 'BTC',
-    action: 'SHORT',
-    entry: 97100,
-    stopLoss: 97500,
-    takeProfit: 96200,
-    status: 'sl_hit'
+// Consensus signals cache (fetched from hl-decide via API)
+let consensusSignals = [];
+let consensusSignalsLoading = false;
+
+/**
+ * Fetch real consensus signals from hl-decide
+ */
+async function fetchConsensusSignals() {
+  if (consensusSignalsLoading) return;
+  consensusSignalsLoading = true;
+
+  try {
+    const res = await fetch(`${API_BASE}/consensus/signals?limit=20`);
+    if (!res.ok) throw new Error('Failed to fetch consensus signals');
+    const data = await res.json();
+    consensusSignals = data.signals || [];
+    renderAIRecommendations();
+  } catch (err) {
+    console.error('Failed to fetch consensus signals:', err);
+  } finally {
+    consensusSignalsLoading = false;
   }
-];
+}
 
 function renderAIRecommendations() {
   if (!aiRecommendationsTable) return;
 
-  const rows = mockAIRecommendations.map(rec => {
-    const actionClass = rec.action === 'LONG' ? 'buy' : 'sell';
+  // Show empty state if no real signals
+  if (consensusSignals.length === 0) {
+    aiRecommendationsTable.innerHTML = `
+      <tr>
+        <td colspan="7">
+          <div class="waiting-state">
+            <span class="waiting-icon">⏳</span>
+            <span class="waiting-text">Waiting for consensus signals...</span>
+            <span class="waiting-hint">Signals appear when ≥3 Alpha Pool traders agree on direction</span>
+          </div>
+        </td>
+      </tr>
+    `;
+    if (aiStatusEl) {
+      aiStatusEl.innerHTML = `
+        <span class="ai-status-dot inactive"></span>
+        No Active Signals
+      `;
+    }
+    return;
+  }
+
+  const rows = consensusSignals.map(signal => {
+    // Map API fields to display format
+    const action = signal.direction?.toUpperCase() || (signal.side === 'buy' ? 'LONG' : 'SHORT');
+    const actionClass = action === 'LONG' ? 'buy' : 'sell';
+
+    // Determine status from signal data
     let statusClass = '';
     let statusText = '';
+    const status = signal.status || signal.outcome || 'active';
 
-    switch (rec.status) {
+    switch (status.toLowerCase()) {
       case 'active':
+      case 'open':
         statusClass = 'status-active';
         statusText = 'Active';
         break;
       case 'tp_hit':
+      case 'win':
         statusClass = 'status-tp';
         statusText = 'TP Hit';
         break;
       case 'sl_hit':
+      case 'loss':
         statusClass = 'status-sl';
         statusText = 'SL Hit';
         break;
       case 'expired':
+      case 'timeout':
         statusClass = 'status-expired';
         statusText = 'Expired';
         break;
+      case 'closed':
+        statusClass = 'status-closed';
+        statusText = 'Closed';
+        break;
       default:
         statusClass = '';
-        statusText = rec.status;
+        statusText = status;
     }
+
+    // Get prices from signal
+    const entry = signal.entry_price || signal.median_price || 0;
+    const stopLoss = signal.stop_price || signal.stop_loss || 0;
+    const takeProfit = signal.take_profit || signal.ev_r || 0;
+    const time = signal.created_at || signal.ts || signal.time;
 
     return `
       <tr>
-        <td data-label="Time">${fmtTime(rec.time)}</td>
-        <td data-label="Symbol">${rec.symbol}</td>
-        <td data-label="Action"><span class="pill ${actionClass}">${rec.action}</span></td>
-        <td data-label="Entry">${fmtPrice(rec.entry)}</td>
-        <td data-label="SL">${fmtPrice(rec.stopLoss)}</td>
-        <td data-label="TP">${fmtPrice(rec.takeProfit)}</td>
+        <td data-label="Time">${fmtTime(time)}</td>
+        <td data-label="Symbol">${signal.asset || signal.symbol || 'BTC'}</td>
+        <td data-label="Action"><span class="pill ${actionClass}">${action}</span></td>
+        <td data-label="Entry">${fmtPrice(entry)}</td>
+        <td data-label="SL">${fmtPrice(stopLoss)}</td>
+        <td data-label="TP">${fmtPrice(takeProfit)}</td>
         <td data-label="Status"><span class="ai-status-badge ${statusClass}">${statusText}</span></td>
       </tr>
     `;
@@ -1298,9 +1314,12 @@ function renderAIRecommendations() {
 
   // Update AI status
   if (aiStatusEl) {
-    const activeCount = mockAIRecommendations.filter(r => r.status === 'active').length;
+    const activeCount = consensusSignals.filter(s => {
+      const status = (s.status || s.outcome || 'active').toLowerCase();
+      return status === 'active' || status === 'open';
+    }).length;
     aiStatusEl.innerHTML = `
-      <span class="ai-status-dot"></span>
+      <span class="ai-status-dot${activeCount > 0 ? '' : ' inactive'}"></span>
       ${activeCount} Active Signal${activeCount !== 1 ? 's' : ''}
     `;
   }
@@ -2165,7 +2184,8 @@ async function init() {
   await refreshFills();
   // Load Alpha Pool fills from dedicated endpoint (independent from legacy fills)
   await refreshAlphaFills();
-  renderAIRecommendations();
+  // Fetch real consensus signals from hl-decide
+  await fetchConsensusSignals();
   refreshBanditStatus();
   connectWs();
   // Continue polling until positions are ready (if not already)
@@ -2174,10 +2194,19 @@ async function init() {
   }
   setInterval(refreshSummary, 30_000);
   setInterval(refreshFills, 20_000);
+  setInterval(refreshAlphaFills, 30_000); // Refresh Alpha Pool fills every 30 seconds
+  setInterval(fetchConsensusSignals, 60_000); // Refresh consensus signals every minute
   setInterval(refreshBanditStatus, 60_000); // Refresh bandit every minute
 }
 
 document.addEventListener('DOMContentLoaded', init);
+
+// Click handler for activity-time toggle (event delegation)
+document.addEventListener('click', (e) => {
+  if (e.target.classList.contains('activity-time') && e.target.classList.contains('clickable')) {
+    toggleAlphaPoolTimeMode();
+  }
+});
 
 // =====================
 // Tab Navigation
@@ -2237,12 +2266,16 @@ const alphaPoolRefreshStatus = document.getElementById('alpha-pool-refresh-statu
 
 let alphaPoolData = [];
 let alphaPoolAddresses = new Set();
+let alphaPoolHoldings = {}; // { address: [{ symbol, size, entryPrice, liquidationPrice, leverage }] }
+let alphaPoolLastActivity = {}; // { address: ISO timestamp }
+let alphaPoolTimeMode = 'relative'; // 'relative' or 'absolute' - toggles on click
 let alphaFillsCache = []; // Separate cache for Alpha Pool fills
 let alphaFillsLoading = false;
 let refreshStatusPolling = null;
 let lastRefreshCompleted = null;
 let isRefreshRunning = false; // Track if a refresh is in progress (for empty state message)
 let currentRefreshStatus = null; // Store full status for loading UI
+let alphaFillsTimeDisplayMode = 'absolute'; // 'absolute' or 'relative' for Alpha Pool activity time
 
 /**
  * Fetch and render Alpha Pool data
@@ -2253,7 +2286,7 @@ async function refreshAlphaPool() {
   if (alphaPoolTable && alphaPoolData.length === 0 && !isRefreshRunning) {
     alphaPoolTable.innerHTML = `
       <tr>
-        <td colspan="7">
+        <td colspan="8">
           <div class="alpha-pool-loading">
             <span class="loading-spinner"></span>
             <span class="loading-text">Loading Alpha Pool traders...</span>
@@ -2265,12 +2298,30 @@ async function refreshAlphaPool() {
   }
 
   try {
-    const res = await fetch(`${API_BASE}/alpha-pool`);
-    if (!res.ok) throw new Error('Failed to fetch alpha pool');
-    const data = await res.json();
+    // Fetch Alpha Pool data, holdings, and last activity in parallel
+    const [poolRes, holdingsRes, lastActivityRes] = await Promise.all([
+      fetch(`${API_BASE}/alpha-pool`),
+      fetch(`${API_BASE}/alpha-pool/holdings`),
+      fetch(`${API_BASE}/alpha-pool/last-activity`)
+    ]);
+
+    if (!poolRes.ok) throw new Error('Failed to fetch alpha pool');
+    const data = await poolRes.json();
 
     alphaPoolData = data.traders || [];
     alphaPoolAddresses = new Set(alphaPoolData.map(t => t.address.toLowerCase()));
+
+    // Process holdings data
+    if (holdingsRes.ok) {
+      const holdingsData = await holdingsRes.json();
+      alphaPoolHoldings = holdingsData.holdings || {};
+    }
+
+    // Process last activity per address (uses dedicated endpoint to avoid HFT domination)
+    if (lastActivityRes.ok) {
+      const lastActivityData = await lastActivityRes.json();
+      alphaPoolLastActivity = lastActivityData.lastActivity || {};
+    }
 
     // Update badge with selected count
     const selectedCount = alphaPoolData.filter(t => t.is_selected).length;
@@ -2342,7 +2393,7 @@ async function refreshAlphaPool() {
     if (alphaPoolTable) {
       alphaPoolTable.innerHTML = `
         <tr>
-          <td colspan="7">
+          <td colspan="8">
             <div class="error-state">
               <span class="error-icon">⚠️</span>
               <span class="error-title">Failed to load Alpha Pool</span>
@@ -2370,7 +2421,7 @@ function renderAlphaPoolTable() {
       const progressText = currentRefreshStatus && currentRefreshStatus.progress > 0 ? `${currentRefreshStatus.progress}%` : '';
       alphaPoolTable.innerHTML = `
         <tr>
-          <td colspan="7">
+          <td colspan="8">
             <div class="alpha-pool-loading">
               <span class="loading-spinner"></span>
               <span class="loading-text" id="loading-step-text">${stepText}</span>
@@ -2383,7 +2434,7 @@ function renderAlphaPoolTable() {
     } else {
       alphaPoolTable.innerHTML = `
         <tr>
-          <td colspan="7">
+          <td colspan="8">
             <div class="empty-state">
               <span class="empty-icon">🎯</span>
               <span class="empty-title">No Alpha Pool Data</span>
@@ -2398,12 +2449,32 @@ function renderAlphaPoolTable() {
   }
 
   alphaPoolTable.innerHTML = alphaPoolData.map(trader => {
-    const muClass = trader.nig_m > 0 ? 'mu-positive' : trader.nig_m < 0 ? 'mu-negative' : '';
-    const confClass = trader.effective_samples >= 30 ? 'confidence-high' : trader.effective_samples < 10 ? 'confidence-low' : '';
     const rowClass = trader.is_selected ? 'selected' : '';
     const shortAddr = `${trader.address.slice(0, 6)}...${trader.address.slice(-4)}`;
     const displayName = trader.nickname || shortAddr;
     const sparklineCell = generateSparkline(trader.pnl_curve || []);
+
+    // Separate BTC and ETH holdings
+    const addrLower = trader.address.toLowerCase();
+    const holdings = alphaPoolHoldings[addrLower] || [];
+    const btcHolding = getBtcHolding(holdings);
+    const ethHolding = getEthHolding(holdings);
+    const btcCell = formatSingleHolding(btcHolding);
+    const ethCell = formatSingleHolding(ethHolding);
+
+    // Calculate 30d PnL from curve - show negative for losses
+    const pnl30d = calculate30dPnL(trader.pnl_curve || []);
+    const pnl30dClass = pnl30d >= 0 ? 'mu-positive' : 'mu-negative';
+    const pnl30dFormatted = pnl30d !== null
+      ? `${pnl30d >= 0 ? '+' : '-'}$${Math.abs(pnl30d).toLocaleString(undefined, { maximumFractionDigits: 0 })}`
+      : '—';
+
+    // Signals with NIG stats tooltip
+    const statsTooltip = `μ (E[R]): ${trader.nig_m >= 0 ? '+' : ''}${trader.nig_m.toFixed(3)}&#10;κ (conf): ${trader.effective_samples.toFixed(0)}&#10;Avg R: ${trader.avg_r >= 0 ? '+' : ''}${trader.avg_r.toFixed(3)}&#10;Total PnL (R): ${trader.total_pnl_r >= 0 ? '+' : ''}${trader.total_pnl_r.toFixed(2)}`;
+
+    // Last activity
+    const lastActivity = alphaPoolLastActivity[addrLower];
+    const lastActivityCell = formatAlphaLastActivity(lastActivity);
 
     return `
       <tr class="${rowClass}">
@@ -2412,15 +2483,111 @@ function renderAlphaPoolTable() {
             ${displayName}
           </a>
         </td>
+        <td class="holds-cell">${btcCell}</td>
+        <td class="holds-cell">${ethCell}</td>
         <td class="sparkline-cell">${sparklineCell}</td>
-        <td class="${muClass}">${trader.nig_m >= 0 ? '+' : ''}${trader.nig_m.toFixed(3)}</td>
-        <td class="${confClass}">${trader.effective_samples.toFixed(0)}</td>
-        <td>${trader.total_signals}</td>
-        <td class="${trader.avg_r >= 0 ? 'mu-positive' : 'mu-negative'}">${trader.avg_r >= 0 ? '+' : ''}${trader.avg_r.toFixed(3)}</td>
+        <td class="${pnl30dClass}">${pnl30dFormatted}</td>
+        <td class="signals-cell" title="${statsTooltip}">${trader.total_signals}</td>
         <td>${trader.is_selected ? '<span class="selected-badge" title="Selected for consensus"></span>' : ''}</td>
+        <td class="last-activity-cell">${lastActivityCell}</td>
       </tr>
     `;
   }).join('');
+}
+
+/**
+ * Format a single holding position with tooltip
+ */
+function formatSingleHolding(pos) {
+  if (!pos || !Number.isFinite(pos.size) || Math.abs(pos.size) < 0.0001) {
+    return '<span class="no-position">—</span>';
+  }
+  const size = Number(pos.size);
+  const symbol = (pos.symbol || '').toUpperCase();
+  const direction = size >= 0 ? 'holding-long' : 'holding-short';
+  const magnitude = Math.abs(size);
+  const precision = magnitude >= 1 ? 2 : 4;
+  const signed = `${size >= 0 ? '+' : ''}${size.toFixed(precision)}`;
+
+  // Build tooltip with entry price, size, and leverage
+  const tooltipParts = [];
+  tooltipParts.push(`Size: ${signed} ${symbol}`);
+  if (pos.entryPrice != null && Number.isFinite(pos.entryPrice)) {
+    tooltipParts.push(`Entry: $${pos.entryPrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
+  }
+  if (pos.leverage != null && Number.isFinite(pos.leverage)) {
+    tooltipParts.push(`Leverage: ${pos.leverage}x`);
+  }
+  const tooltip = tooltipParts.join('&#10;');
+
+  return `<span class="holding-chip ${direction}" title="${tooltip}">${signed}</span>`;
+}
+
+/**
+ * Get BTC position from holdings array
+ */
+function getBtcHolding(positions) {
+  if (!positions || positions.length === 0) return null;
+  return positions.find(p => (p.symbol || '').toUpperCase() === 'BTC');
+}
+
+/**
+ * Get ETH position from holdings array
+ */
+function getEthHolding(positions) {
+  if (!positions || positions.length === 0) return null;
+  return positions.find(p => (p.symbol || '').toUpperCase() === 'ETH');
+}
+
+/**
+ * Calculate 30-day PnL from curve data
+ */
+function calculate30dPnL(pnlCurve) {
+  if (!pnlCurve || pnlCurve.length < 2) return null;
+  // Curve is sorted by timestamp, last value minus first value
+  const firstValue = parseFloat(pnlCurve[0]?.value ?? 0);
+  const lastValue = parseFloat(pnlCurve[pnlCurve.length - 1]?.value ?? 0);
+  return lastValue - firstValue;
+}
+
+/**
+ * Format last activity time for Alpha Pool table.
+ * Clickable to toggle between relative and absolute time display.
+ */
+function formatAlphaLastActivity(timestamp) {
+  if (!timestamp) return '<span class="no-activity">—</span>';
+  const date = new Date(timestamp);
+  if (isNaN(date.getTime())) return '<span class="no-activity">—</span>';
+
+  // Format absolute date as "Dec 8, 14:26"
+  const absoluteStr = date.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ', ' +
+    date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  // Format relative time (e.g., "2h ago")
+  const relativeStr = fmtRelativeTime(timestamp);
+
+  // Display based on current mode
+  const displayStr = alphaPoolTimeMode === 'relative' ? relativeStr : absoluteStr;
+  const tooltipStr = alphaPoolTimeMode === 'relative' ? absoluteStr : relativeStr;
+
+  return `<span class="activity-time clickable" data-ts="${timestamp}" data-absolute="${absoluteStr}" data-relative="${relativeStr}" title="Click to toggle (${tooltipStr})">${displayStr}</span>`;
+}
+
+/**
+ * Toggle time display mode between relative and absolute
+ */
+function toggleAlphaPoolTimeMode() {
+  alphaPoolTimeMode = alphaPoolTimeMode === 'relative' ? 'absolute' : 'relative';
+  // Update all activity-time elements without full re-render
+  document.querySelectorAll('#alpha-pool-table .activity-time.clickable').forEach(el => {
+    const absolute = el.getAttribute('data-absolute');
+    const relative = el.getAttribute('data-relative');
+    if (absolute && relative) {
+      const displayStr = alphaPoolTimeMode === 'relative' ? relative : absolute;
+      const tooltipStr = alphaPoolTimeMode === 'relative' ? absolute : relative;
+      el.textContent = displayStr;
+      el.title = `Click to toggle (${tooltipStr})`;
+    }
+  });
 }
 
 /**
@@ -2586,7 +2753,8 @@ function renderAlphaFills() {
     const symbol = fill.symbol || fill.asset || 'BTC';
     // Handle both field naming conventions (time_utc from API, at from WS)
     const timeStr = fill.time_utc || fill.at;
-    const time = timeStr ? new Date(timeStr).toLocaleTimeString() : '—';
+    // Format time based on current display mode
+    const timeCell = formatAlphaFillTime(timeStr);
     // Handle both field naming conventions (size_signed from API, size from WS)
     const size = Math.abs(fill.size_signed ?? fill.size ?? 0);
     // Handle both field naming conventions (price_usd from API, priceUsd/price from WS)
@@ -2598,7 +2766,7 @@ function renderAlphaFills() {
 
     return `
       <tr>
-        <td>${time}</td>
+        <td class="alpha-time-cell clickable" data-ts="${timeStr || ''}">${timeCell}</td>
         <td>
           <a href="https://hypurrscan.io/address/${fill.address}" target="_blank" rel="noopener" class="address-link">
             ${shortAddr}
@@ -2611,6 +2779,62 @@ function renderAlphaFills() {
       </tr>
     `;
   }).join('');
+
+  // Add click handlers for time cells
+  setupAlphaTimeClickHandlers();
+}
+
+/**
+ * Format Alpha Pool fill time based on display mode
+ */
+function formatAlphaFillTime(timeStr) {
+  if (!timeStr) return '—';
+  const date = new Date(timeStr);
+  if (isNaN(date.getTime())) return '—';
+
+  if (alphaFillsTimeDisplayMode === 'relative') {
+    return fmtRelativeTime(timeStr);
+  } else {
+    // Absolute: MM/DD HH:MM:SS
+    const month = (date.getMonth() + 1).toString().padStart(2, '0');
+    const day = date.getDate().toString().padStart(2, '0');
+    const time = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    return `${month}/${day} ${time}`;
+  }
+}
+
+/**
+ * Setup click handlers for time cells to toggle display mode
+ */
+function setupAlphaTimeClickHandlers() {
+  const timeCells = document.querySelectorAll('.alpha-time-cell.clickable');
+  timeCells.forEach(cell => {
+    cell.addEventListener('click', toggleAlphaFillsTimeMode);
+  });
+
+  // Also setup the header click
+  const header = document.querySelector('[data-testid="alpha-fills-table"] thead th:first-child');
+  if (header && !header.dataset.listenerAdded) {
+    header.dataset.listenerAdded = 'true';
+    header.addEventListener('click', toggleAlphaFillsTimeMode);
+  }
+}
+
+/**
+ * Toggle between absolute and relative time display for Alpha Pool fills
+ */
+function toggleAlphaFillsTimeMode() {
+  alphaFillsTimeDisplayMode = alphaFillsTimeDisplayMode === 'absolute' ? 'relative' : 'absolute';
+
+  // Update header text
+  const header = document.querySelector('[data-testid="alpha-fills-table"] thead th:first-child');
+  if (header) {
+    header.textContent = alphaFillsTimeDisplayMode === 'absolute' ? 'Time ⏱' : 'Time 🕐';
+    header.title = `Click to switch to ${alphaFillsTimeDisplayMode === 'absolute' ? 'relative' : 'absolute'} time`;
+  }
+
+  // Re-render fills
+  renderAlphaFills();
 }
 
 /**

@@ -40,8 +40,10 @@ import {
   publishJson,
   FillEventSchema,
   getBackfillFills,
+  getLastActivityPerAddress,
   getOldestFillTime,
   fetchUserFills,
+  fetchPerpPositions,
   insertTradeIfNew,
   getCurrentPrices,
   onPriceChange,
@@ -674,6 +676,88 @@ async function main() {
     } catch (err: any) {
       logger.error('alpha_pool_fills_failed', { err: err?.message });
       res.status(500).json({ error: 'Failed to fetch Alpha Pool fills' });
+    }
+  });
+
+  // Alpha Pool last activity endpoint - gets most recent fill timestamp per address
+  // This avoids HFT traders dominating the regular fills endpoint
+  app.get('/dashboard/api/alpha-pool/last-activity', async (req, res) => {
+    res.set('Cache-Control', 'max-age=30'); // Cache for 30 seconds
+    try {
+      // Get Alpha Pool addresses from hl-sage
+      const alphaRes = await fetch(`${sageUrl}/alpha-pool/addresses?active_only=true&limit=500`);
+      if (!alphaRes.ok) {
+        return res.status(502).json({ error: 'Failed to fetch Alpha Pool addresses' });
+      }
+      const alphaData = await alphaRes.json();
+      const alphaAddresses = (alphaData?.addresses || []).map((a: any) => normalizeAddress(a.address));
+
+      if (alphaAddresses.length === 0) {
+        return res.json({ lastActivity: {} });
+      }
+
+      // Get last activity per address from database
+      const lastActivity = await getLastActivityPerAddress(alphaAddresses);
+
+      res.json({ lastActivity });
+    } catch (err: any) {
+      logger.error('alpha_pool_last_activity_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to fetch Alpha Pool last activity' });
+    }
+  });
+
+  // Alpha Pool holdings endpoint - fetches current positions for Alpha Pool addresses
+  app.get('/dashboard/api/alpha-pool/holdings', async (req, res) => {
+    res.set('Cache-Control', 'max-age=30'); // Cache for 30 seconds
+    try {
+      // Get Alpha Pool addresses from hl-sage
+      const alphaRes = await fetch(`${sageUrl}/alpha-pool/addresses?active_only=true&limit=500`);
+      if (!alphaRes.ok) {
+        return res.status(502).json({ error: 'Failed to fetch Alpha Pool addresses' });
+      }
+      const alphaData = await alphaRes.json();
+      const alphaAddresses: string[] = (alphaData?.addresses || []).map((a: any) => normalizeAddress(a.address));
+
+      if (alphaAddresses.length === 0) {
+        return res.json({ holdings: {} });
+      }
+
+      // Fetch positions for each address (rate limited, in parallel with concurrency limit)
+      const CONCURRENCY = 5;
+      const holdings: Record<string, any[]> = {};
+
+      for (let i = 0; i < alphaAddresses.length; i += CONCURRENCY) {
+        const batch = alphaAddresses.slice(i, i + CONCURRENCY);
+        const results = await Promise.allSettled(
+          batch.map(async (addr) => {
+            const positions = await fetchPerpPositions(addr);
+            // Only include BTC and ETH positions
+            return {
+              address: addr,
+              positions: positions.filter(p =>
+                p.symbol === 'BTC' || p.symbol === 'ETH'
+              ).map(p => ({
+                symbol: p.symbol,
+                size: p.size,
+                entryPrice: p.entryPriceUsd,
+                liquidationPrice: null, // Will be calculated client-side if needed
+                leverage: p.leverage
+              }))
+            };
+          })
+        );
+
+        for (const result of results) {
+          if (result.status === 'fulfilled' && result.value.positions.length > 0) {
+            holdings[result.value.address.toLowerCase()] = result.value.positions;
+          }
+        }
+      }
+
+      res.json({ holdings, addressCount: alphaAddresses.length });
+    } catch (err: any) {
+      logger.error('alpha_pool_holdings_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to fetch Alpha Pool holdings' });
     }
   });
 
