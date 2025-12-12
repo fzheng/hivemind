@@ -113,10 +113,11 @@ wipe:
 	@echo "Run 'make init' to populate the Alpha Pool."
 
 # Initialize Alpha Pool with historical data (run after fresh install)
+# Uses npm script which works cross-platform (Windows, Mac, Linux)
 init:
 	@echo "Initializing Alpha Pool with historical data..."
 	@echo "This may take several minutes depending on the number of traders."
-	bash scripts/init-alpha-pool.sh
+	npm run init:alpha-pool
 
 # Follow logs
 logs:

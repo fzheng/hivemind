@@ -21,33 +21,52 @@ docker compose exec postgres psql -U hlbot -d hlbot -c "\dt risk_governor_state"
 
 ## 0. Fresh Install: Initialize Alpha Pool
 
-After a fresh `docker compose up -d`, you must populate the Alpha Pool with historical data before FDR qualification can work.
+After a fresh `docker compose up -d`, the Alpha Pool will be automatically initialized.
 
-### Option 1: Initialization Script (Recommended)
+### Automatic Initialization (Default)
 
+When hl-sage starts and detects an empty Alpha Pool (fresh database), it automatically:
+1. Refreshes the pool from Hyperliquid leaderboard (50 traders)
+2. Backfills historical fills for all new addresses
+3. Creates an initial snapshot for FDR qualification
+
+**Watch the logs to see initialization progress:**
 ```bash
-# Run the initialization script
-./scripts/init-alpha-pool.sh
-
-# With custom options
-./scripts/init-alpha-pool.sh --limit 100    # More traders from leaderboard
-./scripts/init-alpha-pool.sh --delay 1000   # Slower backfill (safer rate limit)
-./scripts/init-alpha-pool.sh --help         # Show all options
+docker compose logs -f hl-sage
 ```
 
-The script will:
-1. Wait for hl-sage to be healthy
-2. Refresh Alpha Pool from Hyperliquid leaderboard
-3. Backfill historical fills for all addresses
-4. Create an initial snapshot for FDR qualification
+You'll see:
+```
+[hl-sage] Fresh install detected: Alpha Pool is empty
+[hl-sage] Starting automatic initialization...
+[hl-sage] [1/2] Refreshing Alpha Pool from leaderboard...
+[hl-sage] [2/2] Creating initial snapshot for FDR qualification...
+[hl-sage] Initial snapshot created: 3/53 traders FDR-qualified
+[hl-sage] Automatic initialization complete!
+```
 
-### Option 2: NPM Script
+### Manual Initialization (Optional)
+
+If you prefer to run initialization manually or with custom options:
+
+#### Option 1: NPM Script (Cross-platform)
 
 ```bash
 npm run init:alpha-pool
+
+# With custom options
+node scripts/init-alpha-pool.mjs --limit 100 --delay 1000
 ```
 
-### Option 3: Manual API Calls
+#### Option 2: Bash Script (Linux/Mac/Git Bash)
+
+```bash
+./scripts/init-alpha-pool.sh
+./scripts/init-alpha-pool.sh --limit 100    # More traders from leaderboard
+./scripts/init-alpha-pool.sh --delay 1000   # Slower backfill (safer rate limit)
+```
+
+#### Option 3: Manual API Calls
 
 ```bash
 # Step 1: Refresh pool from leaderboard (auto-backfills new addresses)

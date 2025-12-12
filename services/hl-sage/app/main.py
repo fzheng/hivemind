@@ -420,11 +420,18 @@ async def get_trader_nig_params(address: str) -> Optional[Dict[str, Any]]:
 
 
 ALPHA_POOL_AUTO_REFRESH = os.getenv("ALPHA_POOL_AUTO_REFRESH", "true").lower() == "true"
+ALPHA_POOL_AUTO_INIT = os.getenv("ALPHA_POOL_AUTO_INIT", "true").lower() == "true"
+ALPHA_POOL_AUTO_INIT_DELAY_MS = int(os.getenv("ALPHA_POOL_AUTO_INIT_DELAY_MS", "500"))
 
 
 async def auto_refresh_alpha_pool_if_empty():
     """
-    Auto-refresh Alpha Pool on startup ONLY if it has NEVER been refreshed.
+    Auto-initialize Alpha Pool on startup if it has NEVER been refreshed.
+
+    This is the main fresh-install initialization flow:
+    1. Detects if this is a fresh database (no records in alpha_pool_addresses)
+    2. Refreshes the pool from Hyperliquid leaderboard (auto-backfills new addresses)
+    3. Creates an initial snapshot for FDR qualification
 
     Checks if alpha_pool_addresses table has ANY records (active or not).
     If completely empty, this is a fresh database and we bootstrap the pool.
@@ -448,15 +455,30 @@ async def auto_refresh_alpha_pool_if_empty():
             )
 
         if total_count == 0:
-            print(f"[hl-sage] Alpha Pool has never been refreshed, auto-refreshing (first-time setup)...")
-            # Use _background_refresh_task to properly set is_running=true
-            # This allows the dashboard to detect the refresh is in progress
+            print(f"[hl-sage] Fresh install detected: Alpha Pool is empty")
+            print(f"[hl-sage] Starting automatic initialization...")
+
+            # Step 1: Refresh Alpha Pool from leaderboard (includes auto-backfill)
+            print(f"[hl-sage] [1/2] Refreshing Alpha Pool from leaderboard...")
             await _background_refresh_task(limit=ALPHA_POOL_DEFAULT_SIZE)
+
+            # Step 2: Create initial snapshot for FDR qualification
+            if ALPHA_POOL_AUTO_INIT:
+                print(f"[hl-sage] [2/2] Creating initial snapshot for FDR qualification...")
+                try:
+                    snapshot_result = await create_daily_snapshot(app.state.db)
+                    fdr_count = snapshot_result.get("fdr_qualified", 0)
+                    total = snapshot_result.get("total_traders", 0)
+                    print(f"[hl-sage] Initial snapshot created: {fdr_count}/{total} traders FDR-qualified")
+                except Exception as snapshot_err:
+                    print(f"[hl-sage] Initial snapshot failed: {snapshot_err}")
+
+            print(f"[hl-sage] Automatic initialization complete!")
         else:
-            print(f"[hl-sage] Alpha Pool has {total_count} records (previously refreshed), skipping auto-refresh")
+            print(f"[hl-sage] Alpha Pool has {total_count} records (previously refreshed), skipping auto-init")
     except Exception as e:
         await _refresh_state.fail(str(e))
-        print(f"[hl-sage] Alpha Pool auto-refresh failed: {e}")
+        print(f"[hl-sage] Alpha Pool auto-init failed: {e}")
 
 
 # Interval for periodic Alpha Pool fill sync (in seconds)

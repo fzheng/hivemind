@@ -350,26 +350,41 @@ SNAPSHOT_MIN_EPISODES=30
 SNAPSHOT_MIN_AVG_R_NET=0.05
 ```
 
-### Fresh Install: Initialize Alpha Pool
+### Fresh Install: Automatic Initialization
 
-After a fresh docker deployment, run the initialization script:
+When you run `docker compose up -d` on a fresh database, **hl-sage automatically initializes the Alpha Pool**:
+
+1. Detects empty Alpha Pool (fresh install)
+2. Refreshes from Hyperliquid leaderboard (50 traders)
+3. Backfills historical fills for all addresses
+4. Creates initial snapshot for FDR qualification
+
+**Watch initialization progress:**
+```bash
+docker compose logs -f hl-sage
+```
+
+#### Manual Initialization (Optional)
+
+If automatic init is disabled or you want custom options:
 
 ```bash
 # Option 1: Make command
 make init
 
-# Option 2: NPM script
+# Option 2: NPM script (cross-platform)
 npm run init:alpha-pool
 
-# Option 3: Direct script
-./scripts/init-alpha-pool.sh
+# Option 3: With custom options
+node scripts/init-alpha-pool.mjs --limit 100 --delay 1000
 ```
 
-The script will:
-1. Wait for hl-sage to be healthy
-2. Refresh Alpha Pool from Hyperliquid leaderboard
-3. Backfill historical fills for all addresses (respects rate limits)
-4. Create initial snapshot for FDR qualification
+#### Disable Automatic Initialization
+
+Set in docker-compose.yml or .env:
+```bash
+ALPHA_POOL_AUTO_INIT=false
+```
 
 See [Phase 3f Test Cases](PHASE_3F_TEST_CASES.md) for detailed verification steps.
 
