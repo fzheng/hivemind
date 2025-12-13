@@ -1772,9 +1772,20 @@ async def check_episode_consensus(asset: str, episode_fills: list) -> Optional[C
         trigger_addresses=[v.address for v in agreeing_votes],
     )
 
-    # Gate 5: Risk limits fail-safe
+    # Gate 5: Risk limits fail-safe (regime-aware)
     from .consensus import check_risk_limits
-    passes_risk, risk_reason = check_risk_limits(signal)
+
+    # Get current regime for regime-adjusted confidence threshold
+    current_regime = None
+    try:
+        regime_detector = get_regime_detector(app.state.db)
+        regime_analysis = await regime_detector.detect_regime(asset)
+        if regime_analysis:
+            current_regime = regime_analysis.regime.value
+    except Exception:
+        pass  # Fall back to static threshold
+
+    passes_risk, risk_reason = check_risk_limits(signal, regime=current_regime)
 
     gate_results.append(GateResult(
         name="risk_limits",

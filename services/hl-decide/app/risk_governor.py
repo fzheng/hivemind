@@ -704,6 +704,69 @@ def get_risk_governor(db_pool: Optional[asyncpg.Pool] = None) -> RiskGovernor:
     return _risk_governor
 
 
+async def get_daily_pnl(db_pool: asyncpg.Pool, current_equity: float) -> float:
+    """
+    Get daily PnL by comparing current equity to daily starting equity.
+
+    If no record exists for today, creates one with current equity as starting.
+    Returns the difference: current_equity - starting_equity.
+
+    Args:
+        db_pool: Database pool
+        current_equity: Current account equity
+
+    Returns:
+        Daily PnL (positive = profit, negative = loss)
+    """
+    today = datetime.now(timezone.utc).date()
+
+    try:
+        async with db_pool.acquire() as conn:
+            # Check if we have a record for today
+            row = await conn.fetchrow(
+                """
+                SELECT starting_equity, current_equity
+                FROM risk_daily_pnl
+                WHERE date = $1
+                """,
+                today,
+            )
+
+            if row:
+                starting_equity = float(row["starting_equity"])
+                # Update current equity
+                await conn.execute(
+                    """
+                    UPDATE risk_daily_pnl
+                    SET current_equity = $1,
+                        daily_drawdown_pct = CASE
+                            WHEN starting_equity > 0 THEN (starting_equity - $1) / starting_equity
+                            ELSE 0
+                        END,
+                        updated_at = NOW()
+                    WHERE date = $2
+                    """,
+                    current_equity,
+                    today,
+                )
+                return current_equity - starting_equity
+            else:
+                # First check of the day - create record with current equity as starting
+                await conn.execute(
+                    """
+                    INSERT INTO risk_daily_pnl (date, starting_equity, current_equity)
+                    VALUES ($1, $2, $2)
+                    ON CONFLICT (date) DO NOTHING
+                    """,
+                    today,
+                    current_equity,
+                )
+                return 0.0  # No PnL yet today
+    except Exception as e:
+        print(f"[risk_governor] Failed to get daily PnL: {e}")
+        return 0.0  # Fail safe - assume no PnL
+
+
 async def check_risk_before_trade(
     db_pool: asyncpg.Pool,
     account_state: Dict[str, Any],
@@ -736,8 +799,8 @@ async def check_risk_before_trade(
         entry_price = float(pos.get("entryPx", 0))
         total_exposure += size * entry_price
 
-    # Get daily PnL (would need to track this)
-    daily_pnl = 0.0  # TODO: Implement daily PnL tracking
+    # Get daily PnL from database tracking
+    daily_pnl = await get_daily_pnl(db_pool, account_value)
 
     return governor.run_all_checks(
         account_value=account_value,

@@ -91,7 +91,10 @@ MAX_LEVERAGE = float(os.getenv("MAX_LEVERAGE", "1.0"))
 SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "300"))  # 5 minutes
 
 
-def check_risk_limits(signal: "ConsensusSignal") -> Tuple[bool, str]:
+def check_risk_limits(
+    signal: "ConsensusSignal",
+    regime: Optional[str] = None,
+) -> Tuple[bool, str]:
     """
     Check if a signal passes conservative risk limits.
 
@@ -100,15 +103,33 @@ def check_risk_limits(signal: "ConsensusSignal") -> Tuple[bool, str]:
 
     Args:
         signal: The consensus signal to check
+        regime: Optional market regime for adjusted thresholds
+                (TRENDING, RANGING, VOLATILE, UNKNOWN)
 
     Returns:
         Tuple of (passes_checks, reason_if_failed)
     """
+    # Get regime-adjusted confidence threshold
+    min_confidence = MIN_SIGNAL_CONFIDENCE
+
+    if regime:
+        try:
+            from .regime import get_regime_adjusted_confidence, MarketRegime
+            # Map string to enum
+            regime_enum = MarketRegime[regime.upper()] if regime else MarketRegime.UNKNOWN
+            # get_regime_adjusted_confidence adjusts confidence UP for trending, DOWN for volatile
+            # For risk limits, we want to RAISE the threshold in volatile regimes (require higher confidence)
+            # So we use it directly on the minimum required confidence
+            min_confidence = get_regime_adjusted_confidence(MIN_SIGNAL_CONFIDENCE, regime_enum)
+        except (KeyError, ImportError, Exception):
+            pass  # Fall back to static threshold
+
     # Check minimum confidence
-    if signal.p_win < MIN_SIGNAL_CONFIDENCE:
+    if signal.p_win < min_confidence:
+        regime_note = f" ({regime})" if regime else ""
         return (
             False,
-            f"Confidence {signal.p_win:.2f} < minimum {MIN_SIGNAL_CONFIDENCE:.2f}"
+            f"Confidence {signal.p_win:.2f} < minimum {min_confidence:.2f}{regime_note}"
         )
 
     # Check minimum EV

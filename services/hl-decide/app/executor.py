@@ -235,13 +235,14 @@ class HyperliquidExecutor:
 
         # Risk Governor hard limits check
         try:
-            from .risk_governor import check_risk_from_account_state
+            from .risk_governor import check_risk_before_trade
             account_state = await self.get_account_state()
             if account_state:
-                risk_result = await check_risk_from_account_state(db, account_state)
+                # Note: proposed_size_usd will be refined after Kelly sizing
+                risk_result = await check_risk_before_trade(db, account_state, proposed_size_usd=0)
                 if not risk_result.allowed:
-                    reasons = [w for w in risk_result.warnings if "blocked" in w.lower() or "exceeded" in w.lower()]
-                    reason_str = reasons[0] if reasons else "Risk governor blocked"
+                    reason_str = risk_result.reason or "Risk governor blocked"
+                    context["risk_governor_reason"] = reason_str
                     context["risk_governor_warnings"] = risk_result.warnings
                     return False, f"Risk governor: {reason_str}", context
                 # Store warnings for logging
@@ -370,6 +371,25 @@ class HyperliquidExecutor:
             # REAL EXECUTION PATH
             exchange = get_exchange()
             if exchange.can_execute:
+                # Circuit breaker check before real execution
+                try:
+                    from .risk_governor import get_risk_governor
+                    governor = get_risk_governor(db)
+                    # Check if we have existing position in this symbol
+                    has_position = await self.get_current_exposure() > 0
+                    cb_result = governor.run_circuit_breaker_checks(symbol, has_position)
+                    if not cb_result.allowed:
+                        result = ExecutionResult(
+                            status="rejected",
+                            error_message=f"Circuit breaker: {cb_result.reason}",
+                            exposure_before=context.get("exposure_before"),
+                            kelly_result=kelly_result,
+                        )
+                        await self._log_execution(db, decision_id, symbol, direction, config, result)
+                        return result
+                except Exception as e:
+                    print(f"[executor] Circuit breaker check failed (allowing execution): {e}")
+
                 try:
                     from .hl_exchange import execute_market_order
                     is_buy = (direction == "long")

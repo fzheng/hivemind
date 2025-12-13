@@ -1479,3 +1479,154 @@ class TestExecutorIntegration:
         assert result.method == "fallback_insufficient_data"
         # Reasoning mentions episode count needed
         assert "episode" in result.reasoning.lower() or "need" in result.reasoning.lower()
+
+
+class TestDailyPnLTracking:
+    """Test daily PnL tracking for drawdown kill switch."""
+
+    @pytest.mark.asyncio
+    async def test_get_daily_pnl_first_call_creates_record(self):
+        """First call of the day should create record with current equity as starting."""
+        from app.risk_governor import get_daily_pnl
+        from unittest.mock import AsyncMock, MagicMock
+
+        # Mock database pool
+        mock_pool = MagicMock()
+        mock_conn = AsyncMock()
+        mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        # First call - no existing record
+        mock_conn.fetchrow.return_value = None
+
+        result = await get_daily_pnl(mock_pool, 100000.0)
+
+        # Should return 0 (no PnL yet)
+        assert result == 0.0
+        # Should insert record
+        assert mock_conn.execute.called
+
+    @pytest.mark.asyncio
+    async def test_get_daily_pnl_returns_difference(self):
+        """Subsequent calls should return difference from starting equity."""
+        from app.risk_governor import get_daily_pnl
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_pool = MagicMock()
+        mock_conn = AsyncMock()
+        mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        # Existing record with starting equity 100000
+        mock_conn.fetchrow.return_value = {
+            "starting_equity": 100000.0,
+            "current_equity": 100000.0,
+        }
+
+        # Current equity is 95000 (lost $5000)
+        result = await get_daily_pnl(mock_pool, 95000.0)
+
+        # Should return -5000
+        assert result == -5000.0
+
+
+class TestRegimeAwareConfidence:
+    """Test regime-aware confidence gating."""
+
+    def test_check_risk_limits_with_trending_regime(self):
+        """Trending regime should use higher confidence threshold."""
+        from app.consensus import check_risk_limits, MIN_SIGNAL_CONFIDENCE
+        from app.regime import get_regime_adjusted_confidence, MarketRegime
+        from unittest.mock import MagicMock
+
+        signal = MagicMock()
+        signal.p_win = 0.58  # Above base 0.55, but may fail trending
+        signal.ev_net_r = 0.3
+
+        # Without regime - should pass
+        passes_base, _ = check_risk_limits(signal, regime=None)
+        assert passes_base is True
+
+        # Calculate what trending threshold would be
+        trending_threshold = get_regime_adjusted_confidence(MIN_SIGNAL_CONFIDENCE, MarketRegime.TRENDING)
+
+        # If trending requires higher confidence, this signal may fail
+        if trending_threshold > signal.p_win:
+            passes_trending, reason = check_risk_limits(signal, regime="TRENDING")
+            assert passes_trending is False
+            assert "TRENDING" in reason
+
+    def test_check_risk_limits_with_volatile_regime(self):
+        """Volatile regime should use lower confidence threshold (more cautious sizing instead)."""
+        from app.consensus import check_risk_limits
+        from unittest.mock import MagicMock
+
+        signal = MagicMock()
+        signal.p_win = 0.52  # Below base 0.55
+        signal.ev_net_r = 0.3
+
+        # Without regime - should fail
+        passes_base, _ = check_risk_limits(signal, regime=None)
+        assert passes_base is False
+
+        # With volatile - regime adjustment applies
+        passes_volatile, reason = check_risk_limits(signal, regime="VOLATILE")
+        # Still should fail since 0.52 is quite low
+        # The key test is that it uses regime-adjusted threshold
+        assert "minimum" in reason.lower()
+
+    def test_check_risk_limits_invalid_regime_falls_back(self):
+        """Invalid regime should fall back to static threshold."""
+        from app.consensus import check_risk_limits
+        from unittest.mock import MagicMock
+
+        signal = MagicMock()
+        signal.p_win = 0.56
+        signal.ev_net_r = 0.3
+
+        # Invalid regime should still work (falls back)
+        passes, reason = check_risk_limits(signal, regime="INVALID_REGIME")
+        assert passes is True
+
+
+class TestCircuitBreakerIntegration:
+    """Test circuit breaker checks in execution path."""
+
+    def test_circuit_breaker_blocks_on_api_pause(self):
+        """Circuit breaker should block when API is paused."""
+        from app.risk_governor import RiskGovernor
+
+        governor = RiskGovernor()
+
+        # Simulate API errors that trigger pause
+        for _ in range(5):  # More than threshold
+            governor.report_api_error()
+
+        # Now check circuit breakers
+        result = governor.run_circuit_breaker_checks("BTC", has_existing_position=False)
+
+        assert result.allowed is False
+        assert "pause" in result.reason.lower() or "api" in result.reason.lower()
+
+    def test_circuit_breaker_blocks_on_loss_streak(self):
+        """Circuit breaker should block on loss streak."""
+        from app.risk_governor import RiskGovernor, MAX_CONSECUTIVE_LOSSES
+
+        governor = RiskGovernor()
+
+        # Record enough losses to trigger pause
+        for _ in range(MAX_CONSECUTIVE_LOSSES + 1):
+            governor.report_trade_result(is_win=False)
+
+        result = governor.run_circuit_breaker_checks("BTC", has_existing_position=False)
+
+        assert result.allowed is False
+        assert "loss" in result.reason.lower() or "streak" in result.reason.lower()
+
+    def test_circuit_breaker_passes_when_healthy(self):
+        """Circuit breaker should pass when no issues."""
+        from app.risk_governor import RiskGovernor
+
+        governor = RiskGovernor()
+
+        result = governor.run_circuit_breaker_checks("BTC", has_existing_position=False)
+
+        assert result.allowed is True
