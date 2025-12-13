@@ -98,6 +98,7 @@ const MAX_CUSTOM_PINNED = 3;
 let fillsCache = [];
 let dashboardPeriod = 30;
 let addressMeta = {};
+let legacyAddresses = new Set(); // Addresses in Legacy Leaderboard (for WebSocket fill filtering)
 let customPinnedCount = 0;
 let positionsReady = false; // Track whether positions have been loaded
 
@@ -992,10 +993,17 @@ function renderAddresses(stats = [], profiles = {}, holdings = {}) {
         : '';
       const addrLower = (row.address || '').toLowerCase();
       const rowClass = isPinned ? 'pinned-row' : '';
+
+      // Subscription method indicator (websocket vs polling)
+      const subInfo = subscriptionMethods[addrLower];
+      const subMethod = subInfo?.method || 'none';
+      const subIndicator = formatSubscriptionIndicator(subMethod, subInfo?.sources || [], addrLower);
+
       return `
         <tr class="${rowClass}" data-address="${addrLower}">
           <td data-label="Address" title="Score: ${scoreValue}">
             <div class="address-cell-with-pin">
+              ${subIndicator}
               ${pinIcon}
               <a class="address-link" href="https://hypurrscan.io/address/${row.address}" target="_blank" rel="noopener noreferrer">
                 ${shortAddress(row.address)}
@@ -1201,93 +1209,109 @@ function initBanditControls() {
   }
 }
 
-// Mock AI recommendations data
-const mockAIRecommendations = [
-  {
-    time: new Date(Date.now() - 2 * 60000).toISOString(),
-    symbol: 'BTC',
-    action: 'LONG',
-    entry: 97250,
-    stopLoss: 96500,
-    takeProfit: 99000,
-    status: 'active'
-  },
-  {
-    time: new Date(Date.now() - 15 * 60000).toISOString(),
-    symbol: 'ETH',
-    action: 'SHORT',
-    entry: 3580,
-    stopLoss: 3650,
-    takeProfit: 3450,
-    status: 'active'
-  },
-  {
-    time: new Date(Date.now() - 45 * 60000).toISOString(),
-    symbol: 'BTC',
-    action: 'LONG',
-    entry: 96800,
-    stopLoss: 96200,
-    takeProfit: 97500,
-    status: 'tp_hit'
-  },
-  {
-    time: new Date(Date.now() - 2 * 3600000).toISOString(),
-    symbol: 'ETH',
-    action: 'LONG',
-    entry: 3520,
-    stopLoss: 3480,
-    takeProfit: 3600,
-    status: 'tp_hit'
-  },
-  {
-    time: new Date(Date.now() - 5 * 3600000).toISOString(),
-    symbol: 'BTC',
-    action: 'SHORT',
-    entry: 97100,
-    stopLoss: 97500,
-    takeProfit: 96200,
-    status: 'sl_hit'
+// Consensus signals cache (fetched from hl-decide via API)
+let consensusSignals = [];
+let consensusSignalsLoading = false;
+
+/**
+ * Fetch real consensus signals from hl-decide
+ */
+async function fetchConsensusSignals() {
+  if (consensusSignalsLoading) return;
+  consensusSignalsLoading = true;
+
+  try {
+    const res = await fetch(`${API_BASE}/consensus/signals?limit=20`);
+    if (!res.ok) throw new Error('Failed to fetch consensus signals');
+    const data = await res.json();
+    consensusSignals = data.signals || [];
+    renderAIRecommendations();
+  } catch (err) {
+    console.error('Failed to fetch consensus signals:', err);
+  } finally {
+    consensusSignalsLoading = false;
   }
-];
+}
 
 function renderAIRecommendations() {
   if (!aiRecommendationsTable) return;
 
-  const rows = mockAIRecommendations.map(rec => {
-    const actionClass = rec.action === 'LONG' ? 'buy' : 'sell';
+  // Show empty state if no real signals
+  if (consensusSignals.length === 0) {
+    aiRecommendationsTable.innerHTML = `
+      <tr>
+        <td colspan="7">
+          <div class="waiting-state">
+            <span class="waiting-icon">⏳</span>
+            <span class="waiting-text">Waiting for consensus signals...</span>
+            <span class="waiting-hint">Signals appear when ≥3 Alpha Pool traders agree on direction</span>
+          </div>
+        </td>
+      </tr>
+    `;
+    if (aiStatusEl) {
+      aiStatusEl.innerHTML = `
+        <span class="ai-status-dot inactive"></span>
+        No Active Signals
+      `;
+    }
+    return;
+  }
+
+  const rows = consensusSignals.map(signal => {
+    // Map API fields to display format
+    const action = signal.direction?.toUpperCase() || (signal.side === 'buy' ? 'LONG' : 'SHORT');
+    const actionClass = action === 'LONG' ? 'buy' : 'sell';
+
+    // Determine status from signal data
     let statusClass = '';
     let statusText = '';
+    const status = signal.status || signal.outcome || 'active';
 
-    switch (rec.status) {
+    switch (status.toLowerCase()) {
       case 'active':
+      case 'open':
         statusClass = 'status-active';
         statusText = 'Active';
         break;
       case 'tp_hit':
+      case 'win':
         statusClass = 'status-tp';
         statusText = 'TP Hit';
         break;
       case 'sl_hit':
+      case 'loss':
         statusClass = 'status-sl';
         statusText = 'SL Hit';
         break;
       case 'expired':
+      case 'timeout':
         statusClass = 'status-expired';
         statusText = 'Expired';
         break;
+      case 'closed':
+        statusClass = 'status-closed';
+        statusText = 'Closed';
+        break;
       default:
         statusClass = '';
-        statusText = rec.status;
+        statusText = status;
     }
+
+    // Get prices from signal
+    const entry = signal.entry_price || signal.median_price || 0;
+    const stopLoss = signal.stop_price || signal.stop_loss || 0;
+    const takeProfit = signal.take_profit || signal.ev_r || 0;
+    const time = signal.created_at || signal.ts || signal.time;
 
     return `
       <tr>
-        <td data-label="Time">${fmtTime(rec.time)}</td>
-        <td data-label="Symbol">${rec.symbol}</td>
-        <td data-label="Action"><span class="pill ${actionClass}">${rec.action}</span></td>
-        <td data-label="Entry">${fmtPrice(rec.entry)}</td>
-        <td data-label="SL">${fmtPrice(rec.stopLoss)}</td>
-        <td data-label="TP">${fmtPrice(rec.takeProfit)}</td>
+        <td data-label="Time">${fmtTime(time)}</td>
+        <td data-label="Symbol">${signal.asset || signal.symbol || 'BTC'}</td>
+        <td data-label="Action"><span class="pill ${actionClass}">${action}</span></td>
+        <td data-label="Entry">${fmtPrice(entry)}</td>
+        <td data-label="SL">${fmtPrice(stopLoss)}</td>
+        <td data-label="TP">${fmtPrice(takeProfit)}</td>
         <td data-label="Status"><span class="ai-status-badge ${statusClass}">${statusText}</span></td>
       </tr>
     `;
@@ -1297,9 +1321,12 @@ function renderAIRecommendations() {
 
   // Update AI status
   if (aiStatusEl) {
-    const activeCount = mockAIRecommendations.filter(r => r.status === 'active').length;
+    const activeCount = consensusSignals.filter(s => {
+      const status = (s.status || s.outcome || 'active').toLowerCase();
+      return status === 'active' || status === 'open';
+    }).length;
     aiStatusEl.innerHTML = `
-      <span class="ai-status-dot"></span>
+      <span class="ai-status-dot${activeCount > 0 ? '' : ' inactive'}"></span>
       ${activeCount} Active Signal${activeCount !== 1 ? 's' : ''}
     `;
   }
@@ -1390,10 +1417,10 @@ function renderGroupRow(group, isNew = false) {
 function renderAggregatedFills() {
   if (aggregatedGroups.length === 0) {
     fillsTable.innerHTML = `<tr><td colspan="7">
-      <div class="fills-empty-state">
-        <span class="empty-icon">📊</span>
-        <p>No BTC/ETH fills yet</p>
-        <span class="empty-hint">Fills will appear here as they happen</span>
+      <div class="waiting-state">
+        <span class="waiting-icon">📡</span>
+        <span class="waiting-text">Waiting for live fills...</span>
+        <span class="waiting-hint">BTC/ETH trades will appear in real-time as they happen</span>
       </div>
     </td></tr>`;
     updateFillsUI();
@@ -1547,8 +1574,13 @@ async function pollPositionsUntilReady() {
 
 async function refreshSummary() {
   try {
-    const summaryUrl = `${API_BASE}/summary?period=${dashboardPeriod}&limit=${TOP_TABLE_LIMIT}`;
-    const data = await fetchJson(summaryUrl);
+    // Fetch summary and subscription data in parallel
+    const [summaryData] = await Promise.all([
+      fetchJson(`${API_BASE}/summary?period=${dashboardPeriod}&limit=${TOP_TABLE_LIMIT}`),
+      refreshSubscriptionStatus() // Shared function for subscription methods AND status
+    ]);
+    const data = summaryData;
+
     const rows = Array.isArray(data.stats)
       ? data.stats
       : Array.isArray(data.selected)
@@ -1556,9 +1588,12 @@ async function refreshSummary() {
         : [];
     const holdings = normalizeHoldings(data.holdings || {});
     addressMeta = {};
+    legacyAddresses = new Set(); // Reset legacy addresses
     rows.forEach((row) => {
       if (!row?.address) return;
-      addressMeta[row.address.toLowerCase()] = { remark: row.remark || null };
+      const lowerAddr = row.address.toLowerCase();
+      addressMeta[lowerAddr] = { remark: row.remark || null };
+      legacyAddresses.add(lowerAddr); // Track for WebSocket fill filtering
     });
     renderAddresses(rows, data.profiles || {}, holdings);
 
@@ -1579,13 +1614,17 @@ async function refreshSummary() {
 
 async function refreshFills() {
   try {
-    const data = await fetchJson(`${API_BASE}/fills?limit=40`);
-    const newFills = data.fills || [];
+    // Fetch fills and subscription status in parallel
+    const [fillsData] = await Promise.all([
+      fetchJson(`${API_BASE}/legacy/fills?limit=40`),
+      refreshSubscriptionStatus() // Shared function for subscription data
+    ]);
+    const newFills = fillsData.fills || [];
 
     if (fillsCache.length === 0) {
       // Initial load - just use the new fills
       fillsCache = newFills;
-      hasMoreFills = data.hasMore !== false;
+      hasMoreFills = fillsData.hasMore !== false;
     } else {
       // Incremental update - merge new fills at the front, keeping loaded history
       // Find fills that are newer than our current newest
@@ -1673,9 +1712,18 @@ function connectWs() {
               resulting_position: resultingPos,
               price_usd: e.priceUsd ?? e.payload?.priceUsd ?? null,
               closed_pnl_usd: e.realizedPnlUsd ?? e.payload?.realizedPnlUsd ?? null,
-              symbol
+              symbol,
+              hash: e.hash || e.payload?.hash,
+              at: e.at,
+              side: sizeNum >= 0 ? 'buy' : 'sell'
             };
-            pushFill(row);
+            // Add to legacy fills cache ONLY if address is in legacy leaderboard
+            const addrLower = (e.address || '').toLowerCase();
+            if (legacyAddresses.has(addrLower)) {
+              pushFill(row);
+            }
+            // Also add to Alpha Pool fills cache if address is in pool
+            addAlphaFillFromWs(row);
           });
       }
     } catch (err) {
@@ -2000,7 +2048,8 @@ async function loadMoreFills() {
 
   try {
     const beforeTime = fillsOldestTime || new Date().toISOString();
-    const url = `${API_BASE}/fills/backfill?before=${encodeURIComponent(beforeTime)}&limit=30`;
+    // Use Legacy-specific endpoint for Legacy tab fills
+    const url = `${API_BASE}/legacy/fills/backfill?before=${encodeURIComponent(beforeTime)}&limit=30`;
     const data = await fetchJson(url);
 
     if (data.fills && data.fills.length > 0) {
@@ -2075,7 +2124,8 @@ async function fetchHistoryFromAPI() {
   }
 
   try {
-    const response = await fetch(`${API_BASE}/fills/fetch-history`, {
+    // Use Legacy-specific endpoint for Legacy tab historical fills
+    const response = await fetch(`${API_BASE}/legacy/fills/fetch-history`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ limit: 50 })
@@ -2147,9 +2197,10 @@ async function init() {
   await refreshAlphaPool();
   // Await initial fills load to prevent double-render flash
   await refreshFills();
-  // Render Alpha Pool activity after both datasets are loaded
-  renderAlphaFills();
-  renderAIRecommendations();
+  // Load Alpha Pool fills from dedicated endpoint (independent from legacy fills)
+  await refreshAlphaFills();
+  // Fetch real consensus signals from hl-decide
+  await fetchConsensusSignals();
   refreshBanditStatus();
   connectWs();
   // Continue polling until positions are ready (if not already)
@@ -2158,10 +2209,19 @@ async function init() {
   }
   setInterval(refreshSummary, 30_000);
   setInterval(refreshFills, 20_000);
+  setInterval(refreshAlphaFills, 30_000); // Refresh Alpha Pool fills every 30 seconds
+  setInterval(fetchConsensusSignals, 60_000); // Refresh consensus signals every minute
   setInterval(refreshBanditStatus, 60_000); // Refresh bandit every minute
 }
 
 document.addEventListener('DOMContentLoaded', init);
+
+// Click handler for activity-time toggle (event delegation)
+document.addEventListener('click', (e) => {
+  if (e.target.classList.contains('activity-time') && e.target.classList.contains('clickable')) {
+    toggleAlphaPoolTimeMode();
+  }
+});
 
 // =====================
 // Tab Navigation
@@ -2188,6 +2248,11 @@ function switchTab(tabId) {
   // Load data for the tab if needed
   if (tabId === 'alpha-pool') {
     refreshAlphaPool();
+  } else if (tabId === 'legacy-leaderboard') {
+    // Clear stale data and refresh Legacy fills when switching to this tab
+    fillsCache = [];
+    aggregatedGroups = [];
+    refreshFills();
   }
 
   // Store preference
@@ -2209,26 +2274,67 @@ tabButtons.forEach(btn => {
 const alphaPoolTable = document.getElementById('alpha-pool-table');
 const alphaPoolStats = document.getElementById('alpha-pool-stats');
 const alphaPoolConfig = document.getElementById('alpha-pool-config');
-const alphaPoolRefreshBtn = document.getElementById('alpha-pool-refresh-btn');
 const alphaFillsTable = document.getElementById('alpha-fills-table');
 const alphaFillsCount = document.getElementById('alpha-fills-count');
 const alphaPoolBadge = document.getElementById('alpha-pool-badge');
+const alphaPoolRefreshStatus = document.getElementById('alpha-pool-refresh-status');
 
 let alphaPoolData = [];
 let alphaPoolAddresses = new Set();
+let alphaPoolHoldings = {}; // { address: [{ symbol, size, entryPrice, liquidationPrice, leverage }] }
+let alphaPoolLastActivity = {}; // { address: ISO timestamp }
+let alphaPoolTimeMode = 'relative'; // 'relative' or 'absolute' - toggles on click
+let alphaFillsCache = []; // Separate cache for Alpha Pool fills
+let alphaFillsLoading = false;
+let refreshStatusPolling = null; // { id: number, interval: number } or null
+let lastRefreshCompleted = null;
+let isRefreshRunning = false; // Track if a refresh is in progress (for empty state message)
+let currentRefreshStatus = null; // Store full status for loading UI
+let alphaFillsTimeDisplayMode = 'absolute'; // 'absolute' or 'relative' for Alpha Pool activity time
+let subscriptionMethods = {}; // { address: { method: 'websocket'|'polling'|'none', sources: string[] } }
+let subscriptionStatus = { maxWebSocketSlots: 10, addressesByMethod: { websocket: 0, polling: 0, none: 0 } }; // Subscription status for slot tracking
+let activePopover = null; // Currently open subscription popover
+
+/**
+ * Fetch subscription status and methods (shared by all tabs)
+ * This must be called before rendering any tab that shows subscription indicators
+ */
+async function refreshSubscriptionStatus() {
+  try {
+    const [subscriptionsRes, statusRes] = await Promise.all([
+      fetch(`${API_BASE}/subscriptions/methods`),
+      fetch(`${API_BASE}/subscriptions/status`)
+    ]);
+
+    // Process subscription methods (websocket vs polling)
+    if (subscriptionsRes.ok) {
+      subscriptionMethods = await subscriptionsRes.json();
+    }
+
+    // Process subscription status for slot indicator
+    if (statusRes.ok) {
+      subscriptionStatus = await statusRes.json();
+      updateWebSocketSlotsIndicator();
+    }
+  } catch (err) {
+    console.error('Failed to fetch subscription status:', err);
+  }
+}
 
 /**
  * Fetch and render Alpha Pool data
  */
 async function refreshAlphaPool() {
   // Show loading state if table is empty
-  if (alphaPoolTable && alphaPoolData.length === 0) {
+  // But if refresh is running, let renderAlphaPoolTable() show the proper refresh progress
+  if (alphaPoolTable && alphaPoolData.length === 0 && !isRefreshRunning) {
     alphaPoolTable.innerHTML = `
       <tr>
-        <td colspan="7">
+        <td colspan="8">
           <div class="alpha-pool-loading">
             <span class="loading-spinner"></span>
-            <span>Loading Alpha Pool traders...</span>
+            <span class="loading-text">Loading Alpha Pool traders...</span>
+            <span class="loading-hint">Fetching data from server</span>
           </div>
         </td>
       </tr>
@@ -2236,12 +2342,32 @@ async function refreshAlphaPool() {
   }
 
   try {
-    const res = await fetch(`${API_BASE}/alpha-pool`);
-    if (!res.ok) throw new Error('Failed to fetch alpha pool');
-    const data = await res.json();
+    // Fetch Alpha Pool data, holdings, last activity in parallel
+    // Also refresh subscription status (shared with Legacy tab)
+    const [poolRes, holdingsRes, lastActivityRes] = await Promise.all([
+      fetch(`${API_BASE}/alpha-pool`),
+      fetch(`${API_BASE}/alpha-pool/holdings`),
+      fetch(`${API_BASE}/alpha-pool/last-activity`),
+      refreshSubscriptionStatus() // Shared function for subscription data
+    ]);
+
+    if (!poolRes.ok) throw new Error('Failed to fetch alpha pool');
+    const data = await poolRes.json();
 
     alphaPoolData = data.traders || [];
     alphaPoolAddresses = new Set(alphaPoolData.map(t => t.address.toLowerCase()));
+
+    // Process holdings data
+    if (holdingsRes.ok) {
+      const holdingsData = await holdingsRes.json();
+      alphaPoolHoldings = holdingsData.holdings || {};
+    }
+
+    // Process last activity per address (uses dedicated endpoint to avoid HFT domination)
+    if (lastActivityRes.ok) {
+      const lastActivityData = await lastActivityRes.json();
+      alphaPoolLastActivity = lastActivityData.lastActivity || {};
+    }
 
     // Update badge with selected count
     const selectedCount = alphaPoolData.filter(t => t.is_selected).length;
@@ -2251,7 +2377,11 @@ async function refreshAlphaPool() {
 
     // Update stats
     if (alphaPoolStats) {
-      alphaPoolStats.textContent = `${data.count} traders | ${selectedCount} selected`;
+      if (alphaPoolData.length > 0) {
+        alphaPoolStats.textContent = `${data.count} traders | ${selectedCount} selected`;
+      } else {
+        alphaPoolStats.textContent = 'No data';
+      }
     }
 
     // Update config display with refresh timing
@@ -2298,12 +2428,27 @@ async function refreshAlphaPool() {
       `;
     }
 
-    // Render table
+    // Render table (handles empty state internally)
     renderAlphaPoolTable();
   } catch (err) {
     console.error('Alpha pool fetch error:', err);
     if (alphaPoolStats) {
-      alphaPoolStats.textContent = 'Error loading';
+      alphaPoolStats.textContent = 'Error';
+    }
+    // Show error state in table
+    if (alphaPoolTable) {
+      alphaPoolTable.innerHTML = `
+        <tr>
+          <td colspan="8">
+            <div class="error-state">
+              <span class="error-icon">⚠️</span>
+              <span class="error-title">Failed to load Alpha Pool</span>
+              <span class="error-message">Could not connect to server. Please check your connection and try again.</span>
+              <button class="error-action" onclick="refreshAlphaPool()">Retry</button>
+            </div>
+          </td>
+        </tr>
+      `;
     }
   }
 }
@@ -2314,30 +2459,533 @@ async function refreshAlphaPool() {
 function renderAlphaPoolTable() {
   if (!alphaPoolTable) return;
 
+  // Handle empty state - no traders in pool
+  if (alphaPoolData.length === 0) {
+    // Show different message if refresh is running
+    if (isRefreshRunning) {
+      const stepText = currentRefreshStatus ? formatRefreshStep(currentRefreshStatus.current_step) : 'Starting...';
+      const progressText = currentRefreshStatus && currentRefreshStatus.progress > 0 ? `${currentRefreshStatus.progress}%` : '';
+      alphaPoolTable.innerHTML = `
+        <tr>
+          <td colspan="8">
+            <div class="alpha-pool-loading">
+              <span class="loading-spinner"></span>
+              <span class="loading-text" id="loading-step-text">${stepText}</span>
+              <span class="loading-progress" id="loading-progress-text">${progressText}</span>
+              <span class="loading-hint">Fetching and filtering top traders from Hyperliquid. This may take a few minutes.</span>
+            </div>
+          </td>
+        </tr>
+      `;
+    } else {
+      alphaPoolTable.innerHTML = `
+        <tr>
+          <td colspan="8">
+            <div class="empty-state">
+              <span class="empty-icon">🎯</span>
+              <span class="empty-title">No Alpha Pool Data</span>
+              <span class="empty-message">The Alpha Pool hasn't been populated yet. Click the button below to fetch top traders from Hyperliquid.</span>
+              <button class="empty-action" onclick="triggerAlphaPoolRefresh()" id="refresh-alpha-pool-btn">Refresh Alpha Pool</button>
+            </div>
+          </td>
+        </tr>
+      `;
+    }
+    return;
+  }
+
   alphaPoolTable.innerHTML = alphaPoolData.map(trader => {
-    const muClass = trader.nig_m > 0 ? 'mu-positive' : trader.nig_m < 0 ? 'mu-negative' : '';
-    const confClass = trader.effective_samples >= 30 ? 'confidence-high' : trader.effective_samples < 10 ? 'confidence-low' : '';
     const rowClass = trader.is_selected ? 'selected' : '';
     const shortAddr = `${trader.address.slice(0, 6)}...${trader.address.slice(-4)}`;
     const displayName = trader.nickname || shortAddr;
     const sparklineCell = generateSparkline(trader.pnl_curve || []);
 
+    // Separate BTC and ETH holdings
+    const addrLower = trader.address.toLowerCase();
+    const holdings = alphaPoolHoldings[addrLower] || [];
+    const btcHolding = getBtcHolding(holdings);
+    const ethHolding = getEthHolding(holdings);
+    const btcCell = formatSingleHolding(btcHolding);
+    const ethCell = formatSingleHolding(ethHolding);
+
+    // Calculate 30d PnL from curve - show negative for losses
+    const pnl30d = calculate30dPnL(trader.pnl_curve || []);
+    const pnl30dClass = pnl30d >= 0 ? 'mu-positive' : 'mu-negative';
+    const pnl30dFormatted = pnl30d !== null
+      ? `${pnl30d >= 0 ? '+' : '-'}$${Math.abs(pnl30d).toLocaleString(undefined, { maximumFractionDigits: 0 })}`
+      : '—';
+
+    // Signals with NIG stats tooltip
+    const statsTooltip = `μ (E[R]): ${trader.nig_m >= 0 ? '+' : ''}${trader.nig_m.toFixed(3)}&#10;κ (conf): ${trader.effective_samples.toFixed(0)}&#10;Avg R: ${trader.avg_r >= 0 ? '+' : ''}${trader.avg_r.toFixed(3)}&#10;Total PnL (R): ${trader.total_pnl_r >= 0 ? '+' : ''}${trader.total_pnl_r.toFixed(2)}`;
+
+    // Last activity
+    const lastActivity = alphaPoolLastActivity[addrLower];
+    const lastActivityCell = formatAlphaLastActivity(lastActivity);
+
+    // Subscription method indicator (websocket vs polling)
+    const subInfo = subscriptionMethods[addrLower];
+    const subMethod = subInfo?.method || 'none';
+    const subIndicator = formatSubscriptionIndicator(subMethod, subInfo?.sources || [], addrLower);
+
     return `
       <tr class="${rowClass}">
         <td>
-          <a href="https://hypurrscan.io/address/${trader.address}" target="_blank" rel="noopener" class="address-link" title="${trader.address}">
-            ${displayName}
-          </a>
+          <span class="address-cell">
+            ${subIndicator}
+            <a href="https://hypurrscan.io/address/${trader.address}" target="_blank" rel="noopener" class="address-link" title="${trader.address}">
+              ${displayName}
+            </a>
+          </span>
         </td>
+        <td class="holds-cell">${btcCell}</td>
+        <td class="holds-cell">${ethCell}</td>
         <td class="sparkline-cell">${sparklineCell}</td>
-        <td class="${muClass}">${trader.nig_m >= 0 ? '+' : ''}${trader.nig_m.toFixed(3)}</td>
-        <td class="${confClass}">${trader.effective_samples.toFixed(0)}</td>
-        <td>${trader.total_signals}</td>
-        <td class="${trader.avg_r >= 0 ? 'mu-positive' : 'mu-negative'}">${trader.avg_r >= 0 ? '+' : ''}${trader.avg_r.toFixed(3)}</td>
+        <td class="${pnl30dClass}">${pnl30dFormatted}</td>
+        <td class="signals-cell" title="${statsTooltip}">${trader.total_signals}</td>
         <td>${trader.is_selected ? '<span class="selected-badge" title="Selected for consensus"></span>' : ''}</td>
+        <td class="last-activity-cell">${lastActivityCell}</td>
       </tr>
     `;
   }).join('');
+}
+
+/**
+ * Format subscription method indicator (clickable for promote/demote)
+ */
+function formatSubscriptionIndicator(method, sources, address) {
+  const addrLower = (address || '').toLowerCase();
+  if (method === 'websocket') {
+    const tooltip = `Real-time WebSocket\nSources: ${sources.join(', ') || 'unknown'}\nClick to manage`;
+    return `<span class="sub-indicator sub-websocket clickable" data-testid="sub-method-${addrLower}" data-address="${addrLower}" data-method="websocket" title="${tooltip}" onclick="showSubscriptionPopover(event, '${addrLower}')">⚡</span>`;
+  } else if (method === 'polling') {
+    const tooltip = `Polling (5-min interval)\nSources: ${sources.join(', ') || 'unknown'}\nClick to promote`;
+    return `<span class="sub-indicator sub-polling clickable" data-testid="sub-method-${addrLower}" data-address="${addrLower}" data-method="polling" title="${tooltip}" onclick="showSubscriptionPopover(event, '${addrLower}')">⏱️</span>`;
+  }
+  return '';
+}
+
+/**
+ * Update WebSocket slots indicator in header
+ */
+function updateWebSocketSlotsIndicator() {
+  const indicator = document.getElementById('ws-slots-indicator');
+  const valueEl = document.getElementById('ws-slots-value');
+  if (!indicator || !valueEl) return;
+
+  const used = subscriptionStatus.addressesByMethod?.websocket || 0;
+  const max = subscriptionStatus.maxWebSocketSlots || 10;
+  const available = max - used;
+
+  valueEl.textContent = `${used}/${max}`;
+  indicator.title = `WebSocket slots: ${used} used, ${available} available`;
+
+  // Update styling based on availability
+  indicator.classList.remove('slots-available', 'slots-full');
+  if (available > 0) {
+    indicator.classList.add('slots-available');
+  } else {
+    indicator.classList.add('slots-full');
+  }
+}
+
+/**
+ * Show subscription popover for promote/demote
+ */
+function showSubscriptionPopover(event, address) {
+  event.stopPropagation();
+
+  // Close any existing popover
+  closeSubscriptionPopover();
+
+  const subInfo = subscriptionMethods[address];
+  if (!subInfo) return;
+
+  const method = subInfo.method;
+  const sources = subInfo.sources || [];
+  const isPinned = sources.includes('pinned');
+  const used = subscriptionStatus.addressesByMethod?.websocket || 0;
+  const max = subscriptionStatus.maxWebSocketSlots || 10;
+  const available = max - used;
+
+  // Create popover
+  const popover = document.createElement('div');
+  popover.className = 'sub-popover';
+  popover.id = 'sub-popover';
+  popover.setAttribute('data-testid', 'subscription-popover');
+
+  const shortAddr = `${address.slice(0, 6)}...${address.slice(-4)}`;
+  const methodIcon = method === 'websocket' ? '⚡' : '⏱️';
+  const methodLabel = method === 'websocket' ? 'WebSocket (real-time)' : 'Polling (5-min)';
+
+  let actionHtml = '';
+  let warningHtml = '';
+
+  if (method === 'websocket') {
+    // WebSocket address
+    if (isPinned) {
+      // Case 1: Pinned + WebSocket
+      // Show message that unpin is via pin icon
+      warningHtml = `<div class="sub-popover-warning" data-testid="popover-pinned-message">Pinned addresses always use WebSocket.<br>Click the pin icon to unpin and free this slot.</div>`;
+    } else {
+      // Case 2: Unpinned + WebSocket (auto-assigned or manually promoted)
+      // Can demote to polling to free a slot
+      actionHtml = `<button class="sub-popover-action demote" data-testid="demote-btn" onclick="demoteAddress('${address}')">Demote to polling</button>`;
+      warningHtml = `<div class="sub-popover-warning">Free this WebSocket slot for another address</div>`;
+    }
+  } else {
+    // Polling address
+    if (isPinned) {
+      // Case: Pinned but on polling (shouldn't happen normally, but handle it)
+      warningHtml = `<div class="sub-popover-warning">Pinned address using polling (all slots full)</div>`;
+    } else if (available > 0) {
+      // Case 4: Unpinned + Polling + slots available
+      // Can promote to WebSocket
+      actionHtml = `<button class="sub-popover-action promote" data-testid="promote-btn" onclick="promoteAddress('${address}')">Promote to WebSocket</button>`;
+      warningHtml = `<div class="sub-popover-warning" data-testid="popover-slots-available">${available} slot${available !== 1 ? 's' : ''} available</div>`;
+    } else {
+      // Case 5: Unpinned + Polling + no slots
+      // Cannot promote, must demote another first
+      warningHtml = `<div class="sub-popover-warning" data-testid="popover-no-slots">All ${max} WebSocket slots in use.<br>Demote another address to free a slot.</div>`;
+    }
+  }
+
+  popover.innerHTML = `
+    <div class="sub-popover-header">${shortAddr}</div>
+    <div class="sub-popover-method">${methodIcon} ${methodLabel}</div>
+    <div class="sub-popover-sources">Sources: ${sources.join(', ') || 'none'}</div>
+    ${actionHtml}
+    ${warningHtml}
+  `;
+
+  // Position popover near the click
+  const rect = event.target.getBoundingClientRect();
+  popover.style.position = 'fixed';
+  popover.style.top = `${rect.bottom + 5}px`;
+  popover.style.left = `${rect.left}px`;
+
+  // Ensure popover stays on screen
+  document.body.appendChild(popover);
+  const popoverRect = popover.getBoundingClientRect();
+  if (popoverRect.right > window.innerWidth - 10) {
+    popover.style.left = `${window.innerWidth - popoverRect.width - 10}px`;
+  }
+  if (popoverRect.bottom > window.innerHeight - 10) {
+    popover.style.top = `${rect.top - popoverRect.height - 5}px`;
+  }
+
+  activePopover = popover;
+
+  // Close on outside click
+  setTimeout(() => {
+    document.addEventListener('click', closeSubscriptionPopover, { once: true });
+  }, 0);
+}
+
+/**
+ * Close subscription popover
+ */
+function closeSubscriptionPopover() {
+  if (activePopover) {
+    activePopover.remove();
+    activePopover = null;
+  }
+}
+
+/**
+ * Get priority number for sources (lower = higher priority)
+ */
+function getSourcePriority(sources) {
+  const priorities = { pinned: 0, legacy: 1, 'alpha-pool': 2 };
+  let minPriority = 100;
+  for (const source of (sources || [])) {
+    const p = priorities[source] ?? 100;
+    if (p < minPriority) minPriority = p;
+  }
+  return minPriority;
+}
+
+/**
+ * Promote address to WebSocket (manual promotion)
+ */
+async function promoteAddress(address) {
+  closeSubscriptionPopover();
+
+  try {
+    // Use the new promote API endpoint
+    const response = await fetch(`${API_BASE}/subscriptions/promote`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ address })
+    });
+
+    if (response.ok) {
+      // Refresh data to see updated subscriptions
+      await refreshSubscriptionStatus();
+      await refreshSummary();
+      await refreshAlphaPool();
+    } else {
+      const err = await response.json();
+      console.error('Failed to promote address:', err);
+      alert(`Failed to promote: ${err.error || 'Unknown error'}`);
+    }
+  } catch (err) {
+    console.error('Error promoting address:', err);
+    alert('Failed to promote address');
+  }
+}
+
+/**
+ * Demote address from WebSocket to polling (manual demotion)
+ */
+async function demoteAddress(address) {
+  closeSubscriptionPopover();
+
+  try {
+    // Use the new demote API endpoint
+    const response = await fetch(`${API_BASE}/subscriptions/demote`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ address })
+    });
+
+    if (response.ok) {
+      // Refresh data to see updated subscriptions
+      await refreshSubscriptionStatus();
+      await refreshSummary();
+      await refreshAlphaPool();
+    } else {
+      const err = await response.json();
+      console.error('Failed to demote address:', err);
+      alert(`Failed to demote: ${err.error || 'Unknown error'}`);
+    }
+  } catch (err) {
+    console.error('Error demoting address:', err);
+    alert('Failed to demote address');
+  }
+}
+
+/**
+ * Format a single holding position with tooltip
+ */
+function formatSingleHolding(pos) {
+  if (!pos || !Number.isFinite(pos.size) || Math.abs(pos.size) < 0.0001) {
+    return '<span class="no-position">—</span>';
+  }
+  const size = Number(pos.size);
+  const symbol = (pos.symbol || '').toUpperCase();
+  const direction = size >= 0 ? 'holding-long' : 'holding-short';
+  const magnitude = Math.abs(size);
+  const precision = magnitude >= 1 ? 2 : 4;
+  const signed = `${size >= 0 ? '+' : ''}${size.toFixed(precision)}`;
+
+  // Build tooltip with entry price, size, and leverage
+  const tooltipParts = [];
+  tooltipParts.push(`Size: ${signed} ${symbol}`);
+  if (pos.entryPrice != null && Number.isFinite(pos.entryPrice)) {
+    tooltipParts.push(`Entry: $${pos.entryPrice.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
+  }
+  if (pos.leverage != null && Number.isFinite(pos.leverage)) {
+    tooltipParts.push(`Leverage: ${pos.leverage}x`);
+  }
+  const tooltip = tooltipParts.join('&#10;');
+
+  return `<span class="holding-chip ${direction}" title="${tooltip}">${signed}</span>`;
+}
+
+/**
+ * Get BTC position from holdings array
+ */
+function getBtcHolding(positions) {
+  if (!positions || positions.length === 0) return null;
+  return positions.find(p => (p.symbol || '').toUpperCase() === 'BTC');
+}
+
+/**
+ * Get ETH position from holdings array
+ */
+function getEthHolding(positions) {
+  if (!positions || positions.length === 0) return null;
+  return positions.find(p => (p.symbol || '').toUpperCase() === 'ETH');
+}
+
+/**
+ * Calculate 30-day PnL from curve data
+ */
+function calculate30dPnL(pnlCurve) {
+  if (!pnlCurve || pnlCurve.length < 2) return null;
+  // Curve is sorted by timestamp, last value minus first value
+  const firstValue = parseFloat(pnlCurve[0]?.value ?? 0);
+  const lastValue = parseFloat(pnlCurve[pnlCurve.length - 1]?.value ?? 0);
+  return lastValue - firstValue;
+}
+
+/**
+ * Format last activity time for Alpha Pool table.
+ * Clickable to toggle between relative and absolute time display.
+ */
+function formatAlphaLastActivity(timestamp) {
+  if (!timestamp) return '<span class="no-activity">—</span>';
+  const date = new Date(timestamp);
+  if (isNaN(date.getTime())) return '<span class="no-activity">—</span>';
+
+  // Format absolute date as "Dec 8, 14:26"
+  const absoluteStr = date.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ', ' +
+    date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  // Format relative time (e.g., "2h ago")
+  const relativeStr = fmtRelativeTime(timestamp);
+
+  // Display based on current mode
+  const displayStr = alphaPoolTimeMode === 'relative' ? relativeStr : absoluteStr;
+  const tooltipStr = alphaPoolTimeMode === 'relative' ? absoluteStr : relativeStr;
+
+  return `<span class="activity-time clickable" data-ts="${timestamp}" data-absolute="${absoluteStr}" data-relative="${relativeStr}" title="Click to toggle (${tooltipStr})">${displayStr}</span>`;
+}
+
+/**
+ * Toggle time display mode between relative and absolute
+ */
+function toggleAlphaPoolTimeMode() {
+  alphaPoolTimeMode = alphaPoolTimeMode === 'relative' ? 'absolute' : 'relative';
+  // Update all activity-time elements without full re-render
+  document.querySelectorAll('#alpha-pool-table .activity-time.clickable').forEach(el => {
+    const absolute = el.getAttribute('data-absolute');
+    const relative = el.getAttribute('data-relative');
+    if (absolute && relative) {
+      const displayStr = alphaPoolTimeMode === 'relative' ? relative : absolute;
+      const tooltipStr = alphaPoolTimeMode === 'relative' ? absolute : relative;
+      el.textContent = displayStr;
+      el.title = `Click to toggle (${tooltipStr})`;
+    }
+  });
+}
+
+/**
+ * Trigger Alpha Pool refresh from Hyperliquid API
+ */
+async function triggerAlphaPoolRefresh() {
+  const btn = document.getElementById('refresh-alpha-pool-btn');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Refreshing...';
+  }
+
+  try {
+    const res = await fetch(`${API_BASE}/alpha-pool/refresh?limit=50&background=true`, { method: 'POST' });
+
+    // Handle 409 Conflict - refresh already in progress
+    if (res.status === 409) {
+      // Set running state and show loading UI
+      isRefreshRunning = true;
+      renderAlphaPoolTable();
+      startRefreshStatusPolling();
+      return;
+    }
+
+    if (!res.ok) throw new Error('Refresh failed');
+
+    // Start polling for refresh status
+    isRefreshRunning = true;
+    renderAlphaPoolTable();
+    startRefreshStatusPolling();
+  } catch (err) {
+    console.error('Alpha pool refresh error:', err);
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = 'Refresh Alpha Pool';
+    }
+    alert('Failed to start refresh. Please try again.');
+  }
+}
+
+/**
+ * Fetch Alpha Pool fills from the dedicated endpoint
+ */
+async function refreshAlphaFills() {
+  if (alphaFillsLoading) return;
+  alphaFillsLoading = true;
+
+  // Show loading state if cache is empty
+  if (alphaFillsTable && alphaFillsCache.length === 0) {
+    alphaFillsTable.innerHTML = `
+      <tr>
+        <td colspan="6">
+          <div class="alpha-pool-loading">
+            <span class="loading-spinner"></span>
+            <span class="loading-text">Loading Alpha Pool activity...</span>
+            <span class="loading-hint">Fetching recent trades</span>
+          </div>
+        </td>
+      </tr>
+    `;
+  }
+
+  try {
+    const res = await fetch(`${API_BASE}/alpha-pool/fills?limit=50`);
+    if (!res.ok) throw new Error('Failed to fetch alpha pool fills');
+    const data = await res.json();
+
+    // Merge with existing cache, avoiding duplicates
+    const existingIds = new Set(alphaFillsCache.map(f => f.hash || f.fill_id || `${f.address}-${f.time_utc}`));
+    const newFills = (data.fills || []).filter(f => {
+      const id = f.hash || f.fill_id || `${f.address}-${f.time_utc}`;
+      return !existingIds.has(id);
+    });
+
+    if (newFills.length > 0) {
+      alphaFillsCache = [...alphaFillsCache, ...newFills];
+      // Sort by time descending
+      alphaFillsCache.sort((a, b) => {
+        const timeA = new Date(a.time_utc || a.at || 0).getTime();
+        const timeB = new Date(b.time_utc || b.at || 0).getTime();
+        return timeB - timeA;
+      });
+      // Keep only most recent 200
+      alphaFillsCache = alphaFillsCache.slice(0, 200);
+    }
+
+    renderAlphaFills();
+  } catch (err) {
+    console.error('Failed to fetch alpha pool fills:', err);
+    if (alphaFillsCache.length === 0 && alphaFillsTable) {
+      alphaFillsTable.innerHTML = `
+        <tr>
+          <td colspan="6">
+            <div class="error-state">
+              <span class="error-icon">⚠️</span>
+              <span class="error-title">Failed to load activity</span>
+              <span class="error-message">Could not fetch trades. Please try again.</span>
+              <button class="error-action" onclick="refreshAlphaFills()">Retry</button>
+            </div>
+          </td>
+        </tr>
+      `;
+    }
+  } finally {
+    alphaFillsLoading = false;
+  }
+}
+
+/**
+ * Add a WebSocket fill to Alpha Pool cache if it's from a pool address
+ */
+function addAlphaFillFromWs(fill) {
+  if (!alphaPoolAddresses.has(fill.address?.toLowerCase())) return;
+
+  // Check for duplicates
+  const id = fill.hash || fill.fill_id || `${fill.address}-${fill.at}`;
+  const exists = alphaFillsCache.some(f => {
+    const existingId = f.hash || f.fill_id || `${f.address}-${f.time_utc || f.at}`;
+    return existingId === id;
+  });
+
+  if (!exists) {
+    alphaFillsCache.unshift(fill);
+    // Keep only most recent 200
+    if (alphaFillsCache.length > 200) {
+      alphaFillsCache = alphaFillsCache.slice(0, 200);
+    }
+    renderAlphaFills();
+  }
 }
 
 /**
@@ -2346,11 +2994,25 @@ function renderAlphaPoolTable() {
 function renderAlphaFills() {
   if (!alphaFillsTable) return;
 
-  // Filter fills to only show Alpha Pool traders
-  const alphaFills = fillsCache.filter(f => alphaPoolAddresses.has(f.address?.toLowerCase()));
+  // Use the dedicated Alpha Pool fills cache
+  const alphaFills = alphaFillsCache;
 
   if (alphaFillsCount) {
     alphaFillsCount.textContent = `${alphaFills.length} fills`;
+  }
+
+  if (alphaFills.length === 0) {
+    if (!alphaFillsLoading) {
+      alphaFillsTable.innerHTML = `
+        <tr><td colspan="6">
+          <div class="waiting-state">
+            <span class="waiting-icon">📡</span>
+            <span class="waiting-text">Waiting for Alpha Pool activity...</span>
+            <span class="waiting-hint">Trades from selected traders will appear in real-time</span>
+          </div>
+        </td></tr>`;
+    }
+    return;
   }
 
   alphaFillsTable.innerHTML = alphaFills.slice(0, 50).map(fill => {
@@ -2360,7 +3022,8 @@ function renderAlphaFills() {
     const symbol = fill.symbol || fill.asset || 'BTC';
     // Handle both field naming conventions (time_utc from API, at from WS)
     const timeStr = fill.time_utc || fill.at;
-    const time = timeStr ? new Date(timeStr).toLocaleTimeString() : '—';
+    // Format time based on current display mode
+    const timeCell = formatAlphaFillTime(timeStr);
     // Handle both field naming conventions (size_signed from API, size from WS)
     const size = Math.abs(fill.size_signed ?? fill.size ?? 0);
     // Handle both field naming conventions (price_usd from API, priceUsd/price from WS)
@@ -2372,7 +3035,7 @@ function renderAlphaFills() {
 
     return `
       <tr>
-        <td>${time}</td>
+        <td class="alpha-time-cell clickable" data-ts="${timeStr || ''}">${timeCell}</td>
         <td>
           <a href="https://hypurrscan.io/address/${fill.address}" target="_blank" rel="noopener" class="address-link">
             ${shortAddr}
@@ -2386,26 +3049,248 @@ function renderAlphaFills() {
     `;
   }).join('');
 
-  if (alphaFills.length === 0) {
-    alphaFillsTable.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted);">No activity from Alpha Pool traders yet</td></tr>';
+  // Add click handlers for time cells
+  setupAlphaTimeClickHandlers();
+}
+
+/**
+ * Format Alpha Pool fill time based on display mode
+ */
+function formatAlphaFillTime(timeStr) {
+  if (!timeStr) return '—';
+  const date = new Date(timeStr);
+  if (isNaN(date.getTime())) return '—';
+
+  if (alphaFillsTimeDisplayMode === 'relative') {
+    return fmtRelativeTime(timeStr);
+  } else {
+    // Absolute: MM/DD HH:MM:SS
+    const month = (date.getMonth() + 1).toString().padStart(2, '0');
+    const day = date.getDate().toString().padStart(2, '0');
+    const time = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    return `${month}/${day} ${time}`;
   }
 }
 
-// Alpha Pool refresh button
-if (alphaPoolRefreshBtn) {
-  alphaPoolRefreshBtn.addEventListener('click', () => {
-    alphaPoolRefreshBtn.disabled = true;
-    alphaPoolRefreshBtn.textContent = '...';
-    refreshAlphaPool().finally(() => {
-      alphaPoolRefreshBtn.disabled = false;
-      alphaPoolRefreshBtn.textContent = '↻';
-    });
+/**
+ * Setup click handlers for time cells to toggle display mode
+ */
+function setupAlphaTimeClickHandlers() {
+  const timeCells = document.querySelectorAll('.alpha-time-cell.clickable');
+  timeCells.forEach(cell => {
+    cell.addEventListener('click', toggleAlphaFillsTimeMode);
   });
+
+  // Also setup the header click
+  const header = document.querySelector('[data-testid="alpha-fills-table"] thead th:first-child');
+  if (header && !header.dataset.listenerAdded) {
+    header.dataset.listenerAdded = 'true';
+    header.addEventListener('click', toggleAlphaFillsTimeMode);
+  }
 }
+
+/**
+ * Toggle between absolute and relative time display for Alpha Pool fills
+ */
+function toggleAlphaFillsTimeMode() {
+  alphaFillsTimeDisplayMode = alphaFillsTimeDisplayMode === 'absolute' ? 'relative' : 'absolute';
+
+  // Update header text
+  const header = document.querySelector('[data-testid="alpha-fills-table"] thead th:first-child');
+  if (header) {
+    header.textContent = alphaFillsTimeDisplayMode === 'absolute' ? 'Time ⏱' : 'Time 🕐';
+    header.title = `Click to switch to ${alphaFillsTimeDisplayMode === 'absolute' ? 'relative' : 'absolute'} time`;
+  }
+
+  // Re-render fills
+  renderAlphaFills();
+}
+
+/**
+ * Update loading progress in the table (without re-rendering entire table)
+ */
+function updateLoadingProgress(status) {
+  const stepEl = document.getElementById('loading-step-text');
+  const progressEl = document.getElementById('loading-progress-text');
+
+  if (stepEl) {
+    stepEl.textContent = formatRefreshStep(status.current_step);
+  }
+  if (progressEl) {
+    progressEl.textContent = status.progress > 0 ? `${status.progress}%` : '';
+  }
+}
+
+function formatRefreshStep(step) {
+  const stepNames = {
+    'idle': 'Idle',
+    'starting': 'Starting...',
+    'fetching_leaderboard': 'Fetching leaderboard...',
+    'filtering_candidates': 'Filtering candidates...',
+    'analyzing_traders': 'Analyzing traders...',
+    'saving_traders': 'Saving traders...',
+    'backfilling_fills': 'Backfilling fills...',
+    'reconciling': 'Reconciling...',
+    'completed': 'Completed',
+    'failed': 'Failed',
+  };
+  return stepNames[step] || step;
+}
+
+/**
+ * Update the refresh status indicator in the UI
+ */
+function updateRefreshStatusUI(status) {
+  // ALWAYS track running state globally, even if DOM element is missing
+  // This is critical for showing correct empty state (loading vs button)
+  const wasRunning = isRefreshRunning;
+  isRefreshRunning = status.is_running;
+  currentRefreshStatus = status;
+
+  // Re-render table when refresh state changes AND pool is empty
+  // This must happen regardless of header status element
+  if (alphaPoolData.length === 0 && wasRunning !== isRefreshRunning) {
+    renderAlphaPoolTable();
+  }
+
+  // Update loading UI with progress (if visible in table)
+  if (alphaPoolData.length === 0 && isRefreshRunning) {
+    updateLoadingProgress(status);
+  }
+
+  // Header status indicator is optional - return if not present
+  if (!alphaPoolRefreshStatus) return;
+
+  if (status.is_running) {
+    alphaPoolRefreshStatus.style.display = 'inline-flex';
+    alphaPoolRefreshStatus.className = 'alpha-pool-refresh-status';
+
+    const textEl = alphaPoolRefreshStatus.querySelector('.refresh-text');
+    const progressEl = alphaPoolRefreshStatus.querySelector('.refresh-progress');
+
+    if (textEl) textEl.textContent = formatRefreshStep(status.current_step);
+    if (progressEl) {
+      if (status.progress > 0) {
+        progressEl.textContent = `${status.progress}%`;
+      } else {
+        progressEl.textContent = '';
+      }
+    }
+  } else if (status.current_step === 'completed') {
+    // Show completed status briefly, then hide
+    alphaPoolRefreshStatus.style.display = 'inline-flex';
+    alphaPoolRefreshStatus.className = 'alpha-pool-refresh-status completed';
+
+    const textEl = alphaPoolRefreshStatus.querySelector('.refresh-text');
+    const progressEl = alphaPoolRefreshStatus.querySelector('.refresh-progress');
+
+    if (textEl) textEl.textContent = '✓ Refreshed';
+    if (progressEl && status.elapsed_seconds) {
+      progressEl.textContent = `(${Math.round(status.elapsed_seconds)}s)`;
+    }
+
+    // Hide after 5 seconds and refresh data
+    setTimeout(() => {
+      alphaPoolRefreshStatus.style.display = 'none';
+    }, 5000);
+
+    // Refresh the Alpha Pool data to show updated traders
+    if (lastRefreshCompleted !== status.completed_at) {
+      lastRefreshCompleted = status.completed_at;
+      refreshAlphaPool();
+    }
+  } else if (status.current_step === 'failed') {
+    alphaPoolRefreshStatus.style.display = 'inline-flex';
+    alphaPoolRefreshStatus.className = 'alpha-pool-refresh-status failed';
+
+    const textEl = alphaPoolRefreshStatus.querySelector('.refresh-text');
+    const progressEl = alphaPoolRefreshStatus.querySelector('.refresh-progress');
+
+    if (textEl) textEl.textContent = '✗ Failed';
+    if (progressEl) progressEl.textContent = '';
+
+    // Hide after 10 seconds
+    setTimeout(() => {
+      alphaPoolRefreshStatus.style.display = 'none';
+    }, 10000);
+  } else {
+    // Idle state - hide
+    alphaPoolRefreshStatus.style.display = 'none';
+  }
+}
+
+/**
+ * Poll refresh status from the API
+ */
+async function pollRefreshStatus() {
+  try {
+    const res = await fetch(`${API_BASE}/alpha-pool/refresh/status`);
+    if (!res.ok) return;
+
+    const status = await res.json();
+    updateRefreshStatusUI(status);
+
+    // If running, poll more frequently; otherwise slow down
+    if (status.is_running) {
+      // Poll every 2 seconds while refresh is running
+      if (!refreshStatusPolling || refreshStatusPolling.interval !== 2000) {
+        stopRefreshStatusPolling();
+        const id = setInterval(pollRefreshStatus, 2000);
+        refreshStatusPolling = { id, interval: 2000 };
+      }
+    } else {
+      // Poll every 30 seconds when idle (to catch external refreshes)
+      if (!refreshStatusPolling || refreshStatusPolling.interval !== 30000) {
+        stopRefreshStatusPolling();
+        const id = setInterval(pollRefreshStatus, 30000);
+        refreshStatusPolling = { id, interval: 30000 };
+      }
+    }
+  } catch (err) {
+    console.error('Failed to poll refresh status:', err);
+  }
+}
+
+/**
+ * Start polling for refresh status
+ */
+function startRefreshStatusPolling() {
+  // Stop any existing polling first
+  stopRefreshStatusPolling();
+  // Start polling immediately
+  pollRefreshStatus();
+  // Then continue polling at normal interval
+  const id = setInterval(pollRefreshStatus, 2000);
+  refreshStatusPolling = { id, interval: 2000 };
+}
+
+/**
+ * Stop polling for refresh status
+ */
+function stopRefreshStatusPolling() {
+  if (refreshStatusPolling) {
+    clearInterval(refreshStatusPolling.id);
+    refreshStatusPolling = null;
+  }
+}
+
+// Expose functions to window for onclick handlers in dynamically generated HTML
+window.triggerAlphaPoolRefresh = triggerAlphaPoolRefresh;
+window.refreshAlphaPool = refreshAlphaPool;
+window.refreshAlphaFills = refreshAlphaFills;
+window.showSubscriptionPopover = showSubscriptionPopover;
+window.closeSubscriptionPopover = closeSubscriptionPopover;
+window.promoteAddress = promoteAddress;
+window.demoteAddress = demoteAddress;
 
 // Initialize Alpha Pool on page load (if tab is active)
 if (document.querySelector('.tab-btn.active[data-tab="alpha-pool"]')) {
-  setTimeout(refreshAlphaPool, 500);
+  // Check refresh status first so we can show proper loading state
+  pollRefreshStatus().then(() => {
+    setTimeout(refreshAlphaPool, 100);
+  });
+  // Start polling for refresh status updates
+  setTimeout(startRefreshStatusPolling, 2000);
 }
 
 // Refresh Alpha Pool periodically when tab is active
@@ -2415,6 +3300,548 @@ setInterval(() => {
     refreshAlphaPool();
   }
 }, 60000); // Every minute
+
+// Poll refresh status when Alpha Pool tab becomes active
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    if (btn.getAttribute('data-tab') === 'alpha-pool') {
+      pollRefreshStatus();
+    }
+  });
+});
+
+// =====================
+// Decision Logging & Stats
+// =====================
+
+// State
+let decisionLogs = [];
+let decisionLogsOffset = 0;
+let decisionLogsLoading = false;
+let decisionFilter = 'all'; // 'all', 'signal', 'skip'
+const DECISIONS_LIMIT = 20;
+
+// DOM Elements
+const decisionListEl = document.getElementById('decision-list');
+const decisionLoadMoreEl = document.getElementById('decision-load-more');
+const decisionLoadMoreBtn = document.getElementById('decision-load-more-btn');
+const decisionFilterBtns = document.querySelectorAll('.decision-filter .filter-btn');
+
+// Stats elements
+const statSignalsValue = document.getElementById('stat-signals-value');
+const statWinRateValue = document.getElementById('stat-win-rate-value');
+const statAvgRValue = document.getElementById('stat-avg-r-value');
+const statTotalRValue = document.getElementById('stat-total-r-value');
+const statSkippedValue = document.getElementById('stat-skipped-value');
+const statSkipRateValue = document.getElementById('stat-skip-rate-value');
+
+/**
+ * Fetch decision stats from hl-decide
+ */
+async function fetchDecisionStats() {
+  try {
+    const res = await fetch(`${API_BASE}/decisions/stats?days=7`);
+    if (!res.ok) throw new Error('Failed to fetch decision stats');
+    const data = await res.json();
+    renderDecisionStats(data);
+  } catch (err) {
+    console.error('Failed to fetch decision stats:', err);
+  }
+}
+
+/**
+ * Render decision stats to the stats bar
+ */
+function renderDecisionStats(stats) {
+  if (statSignalsValue) {
+    statSignalsValue.textContent = stats.signals || 0;
+  }
+  if (statWinRateValue) {
+    const winRate = stats.win_rate || 0;
+    statWinRateValue.textContent = `${winRate}%`;
+    statWinRateValue.classList.toggle('positive', winRate >= 50);
+    statWinRateValue.classList.toggle('negative', winRate < 50 && winRate > 0);
+  }
+  if (statAvgRValue) {
+    const avgR = stats.avg_result_r || 0;
+    statAvgRValue.textContent = avgR >= 0 ? `+${avgR.toFixed(2)}R` : `${avgR.toFixed(2)}R`;
+    statAvgRValue.classList.toggle('positive', avgR > 0);
+    statAvgRValue.classList.toggle('negative', avgR < 0);
+  }
+  if (statTotalRValue) {
+    const totalR = stats.total_r || 0;
+    statTotalRValue.textContent = totalR >= 0 ? `+${totalR.toFixed(1)}R` : `${totalR.toFixed(1)}R`;
+    statTotalRValue.classList.toggle('positive', totalR > 0);
+    statTotalRValue.classList.toggle('negative', totalR < 0);
+  }
+  if (statSkippedValue) {
+    statSkippedValue.textContent = stats.skipped || 0;
+  }
+  if (statSkipRateValue) {
+    statSkipRateValue.textContent = `${stats.skip_rate || 0}%`;
+  }
+}
+
+/**
+ * Fetch decision logs from hl-decide
+ */
+async function fetchDecisionLogs(reset = false) {
+  if (decisionLogsLoading) return;
+  decisionLogsLoading = true;
+
+  if (reset) {
+    decisionLogsOffset = 0;
+    decisionLogs = [];
+  }
+
+  try {
+    const typeParam = decisionFilter !== 'all' ? `&decision_type=${decisionFilter}` : '';
+    const res = await fetch(`${API_BASE}/decisions?limit=${DECISIONS_LIMIT}&offset=${decisionLogsOffset}${typeParam}`);
+    if (!res.ok) throw new Error('Failed to fetch decision logs');
+    const data = await res.json();
+
+    if (reset) {
+      decisionLogs = data.items || [];
+    } else {
+      decisionLogs = [...decisionLogs, ...(data.items || [])];
+    }
+    decisionLogsOffset += data.items?.length || 0;
+
+    renderDecisionLogs();
+
+    // Show/hide load more button
+    if (decisionLoadMoreEl) {
+      decisionLoadMoreEl.style.display = (data.items?.length || 0) >= DECISIONS_LIMIT ? 'block' : 'none';
+    }
+  } catch (err) {
+    console.error('Failed to fetch decision logs:', err);
+  } finally {
+    decisionLogsLoading = false;
+  }
+}
+
+/**
+ * Format a date for display
+ */
+function formatDecisionTime(isoString) {
+  const date = new Date(isoString);
+  const now = new Date();
+  const diffMs = now - date;
+  const diffMins = Math.floor(diffMs / 60000);
+  const diffHours = Math.floor(diffMs / 3600000);
+
+  if (diffMins < 1) return 'Just now';
+  if (diffMins < 60) return `${diffMins}m ago`;
+  if (diffHours < 24) return `${diffHours}h ago`;
+
+  return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+/**
+ * Render decision logs to the UI
+ */
+function renderDecisionLogs() {
+  if (!decisionListEl) return;
+
+  if (decisionLogs.length === 0) {
+    decisionListEl.innerHTML = `
+      <div class="decision-empty">
+        <p>No decision logs yet.</p>
+        <p>Decisions will appear when the consensus detector evaluates potential signals.</p>
+      </div>
+    `;
+    return;
+  }
+
+  decisionListEl.innerHTML = decisionLogs.map(decision => {
+    const typeClass = decision.decision_type || 'skip';
+    const direction = decision.direction || 'none';
+    const dirClass = direction === 'long' ? 'long' : direction === 'short' ? 'short' : '';
+
+    // Format gate results for expandable section
+    const gatesHtml = (decision.gates || []).map(gate => {
+      const statusClass = gate.passed ? 'passed' : 'failed';
+      const statusIcon = gate.passed ? '✓' : '✗';
+      const valueStr = typeof gate.value === 'number' ?
+        (gate.name === 'supermajority' ? `${(gate.value * 100).toFixed(0)}%` :
+         gate.name === 'effective_k' ? gate.value.toFixed(1) :
+         gate.name === 'ev_gate' ? `${gate.value.toFixed(2)}R` :
+         gate.name === 'freshness' ? `${gate.value.toFixed(0)}s` :
+         gate.name === 'price_band' ? `${gate.value.toFixed(2)}R` :
+         gate.value.toFixed(2)) : String(gate.value);
+      const threshStr = typeof gate.threshold === 'number' ?
+        (gate.name === 'supermajority' ? `${(gate.threshold * 100).toFixed(0)}%` :
+         gate.name === 'effective_k' ? gate.threshold.toFixed(1) :
+         gate.name === 'ev_gate' ? `${gate.threshold.toFixed(2)}R` :
+         gate.name === 'freshness' ? `${gate.threshold.toFixed(0)}s` :
+         gate.name === 'price_band' ? `${gate.threshold.toFixed(2)}R` :
+         gate.threshold.toFixed(2)) : String(gate.threshold);
+
+      return `
+        <div class="gate-item">
+          <span class="gate-status ${statusClass}">${statusIcon}</span>
+          <span class="gate-name">${gate.name}</span>
+          <span class="gate-value">${valueStr} / ${threshStr}</span>
+        </div>
+      `;
+    }).join('');
+
+    return `
+      <div class="decision-card type-${typeClass}" data-decision-id="${decision.id}">
+        <div class="decision-header">
+          <div class="decision-meta">
+            <span class="decision-type-badge ${typeClass}">${typeClass.replace('_', ' ')}</span>
+            <span class="decision-symbol">${decision.symbol}</span>
+            <span class="decision-direction ${dirClass}">${direction.toUpperCase()}</span>
+          </div>
+          <span class="decision-time">${formatDecisionTime(decision.created_at)}</span>
+        </div>
+        <div class="decision-reasoning">${decision.reasoning || 'No reasoning available.'}</div>
+        <div class="decision-metrics">
+          <div class="decision-metric">
+            <span class="metric-label">Traders:</span>
+            <span class="metric-value">${decision.trader_count || 0}</span>
+          </div>
+          <div class="decision-metric">
+            <span class="metric-label">Agreement:</span>
+            <span class="metric-value">${decision.agreement_pct ? (decision.agreement_pct * 100).toFixed(0) + '%' : '—'}</span>
+          </div>
+          <div class="decision-metric">
+            <span class="metric-label">EffK:</span>
+            <span class="metric-value">${decision.effective_k ? decision.effective_k.toFixed(1) : '—'}</span>
+          </div>
+          ${decision.ev_estimate ? `
+          <div class="decision-metric">
+            <span class="metric-label">EV:</span>
+            <span class="metric-value">${decision.ev_estimate.toFixed(2)}R</span>
+          </div>
+          ` : ''}
+          ${decision.outcome_r_multiple !== null && decision.outcome_r_multiple !== undefined ? `
+          <div class="decision-metric">
+            <span class="metric-label">Result:</span>
+            <span class="metric-value ${decision.outcome_r_multiple > 0 ? 'positive' : 'negative'}">${decision.outcome_r_multiple > 0 ? '+' : ''}${decision.outcome_r_multiple.toFixed(2)}R</span>
+          </div>
+          ` : ''}
+        </div>
+        <div class="decision-gates">
+          <div class="gate-list">
+            ${gatesHtml}
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  // Add click handlers for expanding cards
+  decisionListEl.querySelectorAll('.decision-card').forEach(card => {
+    card.addEventListener('click', () => {
+      card.classList.toggle('expanded');
+    });
+  });
+}
+
+// Event listeners for decision log
+if (decisionFilterBtns) {
+  decisionFilterBtns.forEach(btn => {
+    btn.addEventListener('click', () => {
+      decisionFilterBtns.forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      decisionFilter = btn.getAttribute('data-filter');
+      fetchDecisionLogs(true);
+    });
+  });
+}
+
+if (decisionLoadMoreBtn) {
+  decisionLoadMoreBtn.addEventListener('click', () => {
+    fetchDecisionLogs(false);
+  });
+}
+
+// Initial load
+fetchDecisionStats();
+fetchDecisionLogs(true);
+
+// Refresh periodically
+setInterval(fetchDecisionStats, 60000);
+setInterval(() => fetchDecisionLogs(true), 60000);
+
+// =====================
+// Portfolio Overview & Auto-Trade
+// =====================
+
+// Portfolio state
+let portfolioData = null;
+let executionConfig = null;
+let livePositions = [];
+
+// DOM elements for overview
+const equityValueEl = document.getElementById('equity-value');
+const unrealizedPnlEl = document.getElementById('unrealized-pnl');
+const positionCountEl = document.getElementById('position-count');
+const exposurePctEl = document.getElementById('exposure-pct');
+const portfolioStatusEl = document.getElementById('portfolio-status');
+const positionsTbody = document.getElementById('positions-tbody');
+const positionsCountBadge = document.getElementById('positions-count-badge');
+const toggleStatusEl = document.getElementById('toggle-status');
+const autoTradeToggleEl = document.getElementById('autotrade-toggle');
+const maxLeverageEl = document.getElementById('max-leverage');
+const maxPositionEl = document.getElementById('max-position');
+const maxExposureEl = document.getElementById('max-exposure');
+
+/**
+ * Format currency value with appropriate precision
+ */
+function formatCurrency(value, showSign = false) {
+  if (value == null || !Number.isFinite(value)) return '—';
+  const sign = showSign && value >= 0 ? '+' : '';
+  return sign + '$' + Math.abs(value).toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  });
+}
+
+/**
+ * Format percentage value
+ */
+function formatPercent(value) {
+  if (value == null || !Number.isFinite(value)) return '—';
+  return (value * 100).toFixed(1) + '%';
+}
+
+/**
+ * Fetch portfolio summary from API
+ */
+async function fetchPortfolio() {
+  try {
+    const res = await fetch(`${API_BASE}/portfolio`);
+    if (!res.ok) {
+      console.warn('Portfolio fetch failed:', res.status);
+      return;
+    }
+    portfolioData = await res.json();
+    renderPortfolioOverview();
+  } catch (err) {
+    console.error('Portfolio fetch error:', err);
+  }
+}
+
+/**
+ * Fetch execution config (auto-trade settings)
+ */
+async function fetchExecutionConfig() {
+  try {
+    const res = await fetch(`${API_BASE}/execution/config`);
+    if (!res.ok) {
+      console.warn('Execution config fetch failed:', res.status);
+      return;
+    }
+    executionConfig = await res.json();
+    renderAutoTradeStatus();
+  } catch (err) {
+    console.error('Execution config fetch error:', err);
+  }
+}
+
+/**
+ * Toggle auto-trade enabled state
+ */
+async function toggleAutoTrade() {
+  if (!executionConfig) return;
+
+  const newEnabled = !executionConfig.enabled;
+
+  try {
+    const res = await fetch(`${API_BASE}/execution/config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: newEnabled })
+    });
+
+    if (res.ok) {
+      executionConfig = await res.json();
+      renderAutoTradeStatus();
+    } else {
+      alert('Failed to update auto-trade settings');
+    }
+  } catch (err) {
+    console.error('Toggle auto-trade error:', err);
+    alert('Failed to update auto-trade settings');
+  }
+}
+
+/**
+ * Render portfolio overview card
+ */
+function renderPortfolioOverview() {
+  if (!portfolioData) return;
+
+  const positions = portfolioData.positions || [];
+  // Get exposure from first exchange (Hyperliquid only for now)
+  const exchange = portfolioData.exchanges?.[0] || {};
+
+  // Update equity value
+  if (equityValueEl) {
+    const equity = portfolioData.total_equity || 0;
+    equityValueEl.textContent = formatCurrency(equity);
+  }
+
+  // Update unrealized P&L
+  if (unrealizedPnlEl) {
+    const pnl = portfolioData.total_unrealized_pnl || 0;
+    unrealizedPnlEl.textContent = formatCurrency(pnl, true);
+    unrealizedPnlEl.className = 'detail-value ' + (pnl >= 0 ? 'positive' : 'negative');
+  }
+
+  // Update position count
+  if (positionCountEl) {
+    positionCountEl.textContent = positions.length;
+  }
+
+  // Update exposure percentage
+  if (exposurePctEl) {
+    // API returns exposure as percentage (e.g., 25.5 for 25.5%)
+    const exposurePct = exchange.total_exposure_pct || 0;
+    exposurePctEl.textContent = exposurePct.toFixed(1) + '%';
+    // Add warning class if exposure is high (>50%)
+    exposurePctEl.className = 'detail-value' + (exposurePct > 50 ? ' warning' : '');
+  }
+
+  // Update portfolio status footer
+  if (portfolioStatusEl) {
+    if (!portfolioData.configured) {
+      portfolioStatusEl.innerHTML = `<span class="status-text">${portfolioData.message || 'Not configured'}</span>`;
+    } else if (portfolioData.error) {
+      portfolioStatusEl.innerHTML = `<span class="status-text error">${portfolioData.error}</span>`;
+    } else if (portfolioData.total_equity && portfolioData.total_equity > 0) {
+      portfolioStatusEl.innerHTML = `<span class="status-text connected">Connected to Hyperliquid</span>`;
+    } else {
+      portfolioStatusEl.innerHTML = `<span class="status-text">Connected (no balance)</span>`;
+    }
+  }
+
+  // Update positions count badge
+  if (positionsCountBadge) {
+    positionsCountBadge.textContent = positions.length;
+  }
+
+  // Render positions table
+  renderLivePositions(positions);
+}
+
+/**
+ * Render live positions table
+ */
+function renderLivePositions(positions) {
+  if (!positionsTbody) return;
+
+  if (!positions || positions.length === 0) {
+    positionsTbody.innerHTML = `
+      <tr class="empty-row">
+        <td colspan="6">No open positions</td>
+      </tr>
+    `;
+    return;
+  }
+
+  positionsTbody.innerHTML = positions.map(pos => {
+    const symbol = pos.symbol || '—';
+    const side = (pos.side || '').toLowerCase();
+    const sideClass = side === 'long' ? 'positive' : side === 'short' ? 'negative' : '';
+    const size = Math.abs(pos.size || 0);
+    const entryPrice = pos.entry_price || 0;
+    const markPrice = pos.mark_price || pos.entry_price || 0;
+    const pnl = pos.unrealized_pnl || 0;
+    const pnlClass = pnl >= 0 ? 'positive' : 'negative';
+    const leverage = pos.leverage || 1;
+
+    // Calculate P&L percentage if we have entry price
+    let pnlPct = '';
+    if (entryPrice > 0 && pos.unrealized_pnl != null) {
+      const pctValue = (pnl / (size * entryPrice)) * 100 * leverage;
+      pnlPct = ` (${pctValue >= 0 ? '+' : ''}${pctValue.toFixed(1)}%)`;
+    }
+
+    return `
+      <tr>
+        <td class="symbol-cell">${symbol}</td>
+        <td class="side-cell ${sideClass}">${side.toUpperCase()}</td>
+        <td class="size-cell">${size.toFixed(4)}</td>
+        <td class="price-cell">$${Number(entryPrice).toLocaleString()}</td>
+        <td class="mark-cell">$${Number(markPrice).toLocaleString()}</td>
+        <td class="pnl-cell ${pnlClass}">${formatCurrency(pnl, true)}${pnlPct}</td>
+      </tr>
+    `;
+  }).join('');
+}
+
+/**
+ * Render auto-trade status card
+ */
+function renderAutoTradeStatus() {
+  if (!executionConfig || !executionConfig.configured) {
+    // Show placeholder state
+    if (toggleStatusEl) toggleStatusEl.textContent = '—';
+    return;
+  }
+
+  const enabled = executionConfig.enabled;
+  const hl = executionConfig.hyperliquid || {};
+
+  // Update main toggle status
+  if (toggleStatusEl) {
+    toggleStatusEl.textContent = enabled ? 'ON' : 'OFF';
+    toggleStatusEl.className = 'toggle-status ' + (enabled ? 'on' : 'off');
+  }
+
+  // Update parent toggle element class for styling
+  if (autoTradeToggleEl) {
+    autoTradeToggleEl.className = 'autotrade-toggle ' + (enabled ? 'on' : 'off');
+  }
+
+  // Update max leverage (API returns raw value)
+  if (maxLeverageEl) {
+    const leverage = hl.max_leverage || 3;
+    maxLeverageEl.textContent = `${leverage}x`;
+  }
+
+  // Update max position (API returns percentage value)
+  if (maxPositionEl) {
+    const maxPos = hl.max_position_pct || 2;
+    maxPositionEl.textContent = `${maxPos.toFixed(0)}%`;
+  }
+
+  // Update max exposure (API returns percentage value)
+  if (maxExposureEl) {
+    const maxExp = hl.max_exposure_pct || 10;
+    maxExposureEl.textContent = `${maxExp.toFixed(0)}%`;
+  }
+}
+
+/**
+ * Initialize overview section
+ */
+function initOverview() {
+  // Set up toggle listener (the toggle is a clickable span, not an input)
+  if (autoTradeToggleEl) {
+    autoTradeToggleEl.addEventListener('click', toggleAutoTrade);
+  }
+
+  // Initial fetches
+  fetchPortfolio();
+  fetchExecutionConfig();
+
+  // Periodic refresh
+  setInterval(fetchPortfolio, 30000); // Every 30 seconds
+  setInterval(fetchExecutionConfig, 60000); // Every minute
+}
+
+// Initialize on DOMContentLoaded (runs after main init)
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initOverview);
+} else {
+  initOverview();
+}
 
 // =====================
 // Tab Restoration (must be after Alpha Pool is defined)

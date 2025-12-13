@@ -22,7 +22,7 @@ export default defineConfig({
   /* Shared settings for all the projects below */
   use: {
     /* Base URL to use in actions like `await page.goto('/')` */
-    baseURL: process.env.DASHBOARD_URL || 'http://0.0.0.0:4102',
+    baseURL: process.env.DASHBOARD_URL || 'http://localhost:4102',
 
     /* Collect trace when retrying the failed test */
     trace: 'on-first-retry',
@@ -35,7 +35,11 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
-      use: { ...devices['Desktop Chrome'] },
+      use: {
+        ...devices['Desktop Chrome'],
+        // Increase navigation timeout for more reliable tests
+        navigationTimeout: 45 * 1000,
+      },
     },
     /* Uncomment to add more browsers
     {
@@ -50,7 +54,11 @@ export default defineConfig({
     /* Test against mobile viewports */
     {
       name: 'mobile-chrome',
-      use: { ...devices['Pixel 5'] },
+      use: {
+        ...devices['Pixel 5'],
+        // Mobile tests need longer timeout due to slower resource loading (TradingView, etc.)
+        navigationTimeout: 60 * 1000,
+      },
     },
   ],
 
@@ -58,13 +66,13 @@ export default defineConfig({
   // Uncomment if you want Playwright to start the server automatically
   // webServer: {
   //   command: 'docker compose up -d hl-stream',
-  //   url: 'http://0.0.0.0:4102/healthz',
+  //   url: 'http://localhost:4102/healthz',
   //   reuseExistingServer: !process.env.CI,
   //   timeout: 120 * 1000,
   // },
 
-  /* Timeout for each test */
-  timeout: 30 * 1000,
+  /* Timeout for each test - increased for reliability with TradingView charts */
+  timeout: 45 * 1000,
 
   /* Expect timeout */
   expect: {

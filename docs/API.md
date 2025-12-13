@@ -129,6 +129,48 @@ Real-time feeds and dashboard.
 | `/dashboard` | GET | No | Web dashboard UI |
 | `/dashboard/static/*` | GET | No | Static assets |
 
+### Dashboard API - Alpha Pool
+
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/dashboard/api/alpha-pool` | GET | No | Get Alpha Pool traders with NIG params (proxied to hl-sage) |
+| `/dashboard/api/alpha-pool/fills` | GET | No | Get fills for Alpha Pool addresses only |
+| `/dashboard/api/alpha-pool/last-activity` | GET | No | Get most recent fill timestamp per Alpha Pool trader |
+| `/dashboard/api/alpha-pool/holdings` | GET | No | Get current positions for Alpha Pool traders |
+| `/dashboard/api/alpha-pool/status` | GET | No | NIG model statistics (proxied to hl-sage) |
+| `/dashboard/api/alpha-pool/refresh` | POST | No | Refresh pool from leaderboard (proxied to hl-sage) |
+| `/dashboard/api/alpha-pool/refresh/status` | GET | No | Get refresh progress status |
+
+**GET `/dashboard/api/alpha-pool/last-activity` Response:**
+```json
+{
+  "lastActivity": {
+    "0x1234...": "2025-12-08T14:26:00.000Z",
+    "0x5678...": "2025-12-08T12:15:30.000Z"
+  }
+}
+```
+
+### Dashboard API - Legacy
+
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/dashboard/api/legacy/fills` | GET | No | Initial fills load for Legacy addresses |
+| `/dashboard/api/legacy/fills/backfill` | GET | No | Paginated backfill for "Load More" |
+| `/dashboard/api/legacy/fills/fetch-history` | POST | No | Fetch from Hyperliquid API |
+| `/dashboard/api/legacy/fills/oldest` | GET | No | Get oldest fill timestamp |
+| `/dashboard/api/legacy/fills/validate` | GET | No | Position chain validation |
+| `/dashboard/api/legacy/fills/repair` | POST | No | Repair data for specific address |
+
+### Dashboard API - Shared
+
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/dashboard/api/summary` | GET | No | Leaderboard summary |
+| `/dashboard/api/prices` | GET | No | Real-time BTC/ETH prices |
+| `/dashboard/api/consensus/signals` | GET | No | Consensus signals |
+| `/dashboard/api/pinned-accounts` | GET | No | User's pinned accounts |
+
 ### Watchlist
 
 | Endpoint | Method | Auth | Description |

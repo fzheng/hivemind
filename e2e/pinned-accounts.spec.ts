@@ -1,9 +1,11 @@
 import { test, expect } from '@playwright/test';
+import { setupMocks } from './fixtures/setup-mocks';
 
 /**
  * E2E Tests for Pinned Accounts feature
  *
- * IMPORTANT: These tests are READ-ONLY by default. They verify UI elements exist
+ * IMPORTANT: These tests use mocked API responses to avoid hitting the real
+ * Hyperliquid API which has rate limits. They verify UI elements exist
  * and have correct styling, but do NOT perform any actions that modify the database
  * (like pinning/unpinning accounts).
  *
@@ -16,6 +18,7 @@ const TEST_ADDRESS = '0x1234567890123456789012345678901234567890';
 
 test.describe('Pinned Accounts - UI Elements', () => {
   test.beforeEach(async ({ page }) => {
+    await setupMocks(page);
     await page.goto('/dashboard');
     // Switch to Legacy Leaderboard tab where pinned accounts UI exists
     const legacyTab = page.locator('[data-testid="tab-legacy-leaderboard"]');
@@ -59,6 +62,7 @@ test.describe('Pinned Accounts - UI Elements', () => {
 
 test.describe('Pinned Accounts - Pin Icon Styling (Read-Only)', () => {
   test.beforeEach(async ({ page }) => {
+    await setupMocks(page);
     await page.goto('/dashboard');
     // Switch to Legacy Leaderboard tab
     const legacyTab = page.locator('[data-testid="tab-legacy-leaderboard"]');
@@ -128,6 +132,7 @@ test.describe('Pinned Accounts - Pin Icon Styling (Read-Only)', () => {
 
 test.describe('Pinned Accounts - Visual Differentiation (Read-Only)', () => {
   test.beforeEach(async ({ page }) => {
+    await setupMocks(page);
     await page.goto('/dashboard');
     // Switch to Legacy Leaderboard tab
     const legacyTab = page.locator('[data-testid="tab-legacy-leaderboard"]');
@@ -152,6 +157,7 @@ test.describe('Pinned Accounts - Visual Differentiation (Read-Only)', () => {
 
 test.describe('Pinned Accounts - Custom Address Input Validation (Mocked)', () => {
   test.beforeEach(async ({ page }) => {
+    await setupMocks(page);
     // Intercept ALL pin-related API calls to prevent database changes
     await page.route('**/admin/addresses/**', async (route) => {
       const method = route.request().method();
@@ -210,6 +216,7 @@ test.describe('Pinned Accounts - Pin/Unpin Interactions (Mocked API)', () => {
   test('clicking pin icon should trigger API call (mocked)', async ({ page }) => {
     let apiCallMade = false;
 
+    await setupMocks(page);
     // IMPORTANT: Set up ALL route interceptions BEFORE navigation to ensure no real API calls
     // Intercept pin-related API calls
     await page.route('**/dashboard/api/pinned-accounts/**', async (route) => {
@@ -318,6 +325,7 @@ test.describe('Pinned Accounts - Pin/Unpin Interactions (Mocked API)', () => {
 
 test.describe('Pinned Accounts - Limit Enforcement', () => {
   test('should show max custom limit indicator', async ({ page }) => {
+    await setupMocks(page);
     await page.goto('/dashboard');
     // Switch to Legacy Leaderboard tab
     const legacyTab = page.locator('[data-testid="tab-legacy-leaderboard"]');
@@ -332,6 +340,7 @@ test.describe('Pinned Accounts - Limit Enforcement', () => {
 
 test.describe('Pinned Accounts - Persistence (Read-Only)', () => {
   test('pinned accounts should persist after page reload', async ({ page }) => {
+    await setupMocks(page);
     await page.goto('/dashboard');
     // Switch to Legacy Leaderboard tab
     const legacyTab = page.locator('[data-testid="tab-legacy-leaderboard"]');
@@ -345,6 +354,8 @@ test.describe('Pinned Accounts - Persistence (Read-Only)', () => {
     // Count pinned items before reload (read-only observation)
     const pinnedBefore = await page.locator('.pin-icon.pinned-leaderboard, .pin-icon.pinned-custom').count();
 
+    // Re-setup mocks before reload
+    await setupMocks(page);
     // Reload page
     await page.reload();
     // Switch to Legacy Leaderboard tab again

@@ -83,6 +83,7 @@ services:
       OWNER_TOKEN: ${OWNER_TOKEN:-dev-owner}
       NATS_URL: ${NATS_URL:-nats://nats:4222}
       SCOUT_URL: ${SCOUT_URL:-http://hl-scout:8080}
+      SAGE_URL: ${SAGE_URL:-http://hl-sage:8080}
       DATABASE_URL: ${DATABASE_URL:-postgresql://hlbot:hlbotpassword@postgres:5432/hlbot}
       SERVICE_NAME: hl-stream
     depends_on:
@@ -91,6 +92,8 @@ services:
       nats:
         condition: service_started
       hl-scout:
+        condition: service_started
+      hl-sage:
         condition: service_started
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8080/healthz || exit 1"]
@@ -112,7 +115,17 @@ services:
       OWNER_TOKEN: ${OWNER_TOKEN:-dev-owner}
       NATS_URL: ${NATS_URL:-nats://nats:4222}
       DATABASE_URL: ${DATABASE_URL:-postgresql://hlbot:hlbotpassword@postgres:5432/hlbot}
+      DECIDE_URL: ${DECIDE_URL:-http://hl-decide:8080}
       SERVICE_NAME: hl-sage
+      # Phase 3f: FDR qualification thresholds (lowered for testing)
+      SNAPSHOT_MIN_EPISODES: ${SNAPSHOT_MIN_EPISODES:-5}
+      SNAPSHOT_FDR_ALPHA: ${SNAPSHOT_FDR_ALPHA:-0.10}
+      SNAPSHOT_MIN_AVG_R_NET: ${SNAPSHOT_MIN_AVG_R_NET:-0.0}
+      ROUND_TRIP_COST_BPS: ${ROUND_TRIP_COST_BPS:-30}
+      # Death/censor thresholds
+      DEATH_DRAWDOWN_PCT: ${DEATH_DRAWDOWN_PCT:-0.80}
+      DEATH_ACCOUNT_FLOOR: ${DEATH_ACCOUNT_FLOOR:-10000}
+      CENSOR_INACTIVE_DAYS: ${CENSOR_INACTIVE_DAYS:-30}
     depends_on:
       postgres:
         condition: service_healthy

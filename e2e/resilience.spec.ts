@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { setupMocks } from './fixtures/setup-mocks';
 
 /**
  * E2E Tests for Dashboard Resilience and Error Handling
@@ -11,7 +12,8 @@ import { test, expect } from '@playwright/test';
 
 test.describe('Dashboard - API Error Handling', () => {
   test('should handle leaderboard API 500 error gracefully', async ({ page }) => {
-    // Mock leaderboard API to return 500
+    await setupMocks(page);
+    // Override: Mock leaderboard API to return 500
     await page.route('**/dashboard/leaderboard**', async (route) => {
       await route.fulfill({
         status: 500,
@@ -36,7 +38,8 @@ test.describe('Dashboard - API Error Handling', () => {
   });
 
   test('should handle fills API 500 error gracefully', async ({ page, isMobile }) => {
-    // Mock fills API to return 500
+    await setupMocks(page);
+    // Override: Mock fills API to return 500
     await page.route('**/dashboard/fills**', async (route) => {
       await route.fulfill({
         status: 500,
@@ -61,7 +64,8 @@ test.describe('Dashboard - API Error Handling', () => {
   });
 
   test('should handle price API 502 error gracefully', async ({ page }) => {
-    // Mock price API to return 502
+    await setupMocks(page);
+    // Override: Mock price API to return 502
     await page.route('**/dashboard/price**', async (route) => {
       await route.fulfill({
         status: 502,
@@ -81,7 +85,8 @@ test.describe('Dashboard - API Error Handling', () => {
   });
 
   test('should handle network timeout gracefully', async ({ page }) => {
-    // Mock API with long delay to simulate timeout
+    await setupMocks(page);
+    // Override: Mock API with long delay to simulate timeout
     await page.route('**/dashboard/leaderboard**', async (route) => {
       await new Promise(resolve => setTimeout(resolve, 100));
       await route.abort('timedout');
@@ -96,7 +101,8 @@ test.describe('Dashboard - API Error Handling', () => {
 
 test.describe('Dashboard - Empty Data States', () => {
   test('should handle empty leaderboard gracefully', async ({ page }) => {
-    // Mock summary API (which populates the leaderboard table) to return empty stats
+    await setupMocks(page);
+    // Override: Mock summary API (which populates the leaderboard table) to return empty stats
     await page.route('**/dashboard/api/summary**', async (route) => {
       await route.fulfill({
         status: 200,
@@ -129,7 +135,8 @@ test.describe('Dashboard - Empty Data States', () => {
   });
 
   test('should handle empty fills gracefully', async ({ page }) => {
-    // Mock fills API to return empty array
+    await setupMocks(page);
+    // Override: Mock fills API to return empty array
     await page.route('**/dashboard/api/fills**', async (route) => {
       await route.fulfill({
         status: 200,
@@ -158,7 +165,8 @@ test.describe('Dashboard - Empty Data States', () => {
   });
 
   test('should handle null price gracefully', async ({ page }) => {
-    // Mock price API to return null
+    await setupMocks(page);
+    // Override: Mock price API to return null
     await page.route('**/dashboard/price**', async (route) => {
       await route.fulfill({
         status: 200,
@@ -177,6 +185,7 @@ test.describe('Dashboard - Empty Data States', () => {
 
 test.describe('Dashboard - Pin API Error Handling (Mocked)', () => {
   test('should handle pin API 401 unauthorized', async ({ page }) => {
+    await setupMocks(page);
     await page.route('**/admin/addresses/**', async (route) => {
       if (route.request().method() === 'POST') {
         await route.fulfill({
@@ -203,7 +212,8 @@ test.describe('Dashboard - Pin API Error Handling (Mocked)', () => {
   });
 
   test('should handle add custom account API 400 bad request', async ({ page }) => {
-    // Mock the summary API to return 0 custom accounts (so button is enabled)
+    await setupMocks(page);
+    // Override: Mock the summary API to return 0 custom accounts (so button is enabled)
     await page.route('**/dashboard/api/summary**', async (route) => {
       await route.fulfill({
         status: 200,
@@ -260,6 +270,7 @@ test.describe('Dashboard - Pin API Error Handling (Mocked)', () => {
   });
 
   test('should handle add custom account API 429 rate limit', async ({ page }) => {
+    await setupMocks(page);
     await page.route('**/admin/addresses/**', async (route) => {
       if (route.request().method() === 'POST') {
         await route.fulfill({
@@ -281,6 +292,7 @@ test.describe('Dashboard - Pin API Error Handling (Mocked)', () => {
 
 test.describe('Dashboard - WebSocket Error States', () => {
   test('should handle WebSocket connection failure', async ({ page, isMobile }) => {
+    await setupMocks(page);
     // Block WebSocket connections
     await page.route('**/ws', async (route) => {
       await route.abort('connectionrefused');
@@ -331,9 +343,10 @@ test.describe('Dashboard - Mixed Error Scenarios', () => {
   });
 
   test('should recover when API starts working after initial failure', async ({ page }) => {
+    await setupMocks(page);
     let callCount = 0;
 
-    // First call fails, subsequent calls succeed
+    // Override: First call fails, subsequent calls succeed
     await page.route('**/dashboard/leaderboard**', async (route) => {
       callCount++;
       if (callCount === 1) {

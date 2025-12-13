@@ -40,8 +40,10 @@ import {
   publishJson,
   FillEventSchema,
   getBackfillFills,
+  getLastActivityPerAddress,
   getOldestFillTime,
   fetchUserFills,
+  fetchPerpPositions,
   insertTradeIfNew,
   getCurrentPrices,
   onPriceChange,
@@ -49,7 +51,9 @@ import {
   refreshPriceFeed,
   validatePositionChain,
   clearTradesForAddress,
-  insertPriceSnapshot
+  insertPriceSnapshot,
+  SubscriptionManager,
+  isValidEthereumAddress
 } from '@hl/ts-lib';
 
 const OWNER_TOKEN = getOwnerToken();
@@ -103,16 +107,40 @@ const swaggerDoc: OpenAPIV3.Document = {
 const queue = new EventQueue(5000);
 /** Connected WebSocket clients */
 const clients = new Set<{ ws: WebSocket; lastSeq: number; alive: boolean }>();
-/** Currently tracked addresses */
-let watchlist: string[] = [];
 /** URL of hl-scout service for API proxying */
 const scoutUrl = process.env.SCOUT_URL || 'http://hl-scout:8080';
+/** URL of hl-sage service for Alpha Pool data */
+const sageUrl = process.env.SAGE_URL || 'http://hl-sage:8080';
 /** Directory containing dashboard static files */
 const dashboardDir = path.resolve(__dirname, '..', 'public');
 /** NATS subject for fill events */
 const fillsSubject = 'c.fills.v1';
 /** Realtime tracker for Hyperliquid WebSocket subscriptions */
 let tracker: RealtimeTracker | null = null;
+
+/**
+ * Centralized subscription manager for address tracking.
+ * Handles deduplication across multiple sources (legacy, alpha-pool, etc.)
+ */
+const subscriptionManager = new SubscriptionManager({
+  onChanged: async () => {
+    // Trigger tracker refresh when subscriptions change
+    if (tracker) {
+      logger.info('subscription_manager_changed', {
+        totalAddresses: subscriptionManager.getAllAddresses().length
+      });
+      await tracker.refresh();
+    }
+  }
+});
+
+/**
+ * Get the current watchlist (all subscribed addresses).
+ * This is a convenience function for backward compatibility.
+ */
+function getWatchlist(): string[] {
+  return subscriptionManager.getAllAddresses();
+}
 
 /**
  * Express middleware for owner-only endpoints.
@@ -125,12 +153,36 @@ function ownerOnly(req: Request, res: Response, next: NextFunction) {
 }
 
 /**
- * Fetches the list of addresses to track from hl-scout.
- * Combines top-ranked system accounts with user's custom accounts.
+ * Fetches pinned accounts from hl-scout.
+ * These are registered with SubscriptionManager under the 'pinned' source (highest priority).
  *
  * @returns Array of normalized Ethereum addresses
  */
-async function fetchWatchlist(): Promise<string[]> {
+async function fetchPinnedAddresses(): Promise<string[]> {
+  try {
+    const pinnedRes = await fetch(`${scoutUrl}/pinned-accounts`, {
+      headers: { 'x-owner-key': OWNER_TOKEN }
+    });
+    if (pinnedRes.ok) {
+      const pinnedData = await pinnedRes.json();
+      if (Array.isArray(pinnedData?.accounts) && pinnedData.accounts.length) {
+        return pinnedData.accounts.map((acc: any) => normalizeAddress(acc.address));
+      }
+    }
+  } catch (err) {
+    logger.warn('pinned_accounts_fetch_failed', { err: err instanceof Error ? err.message : err });
+  }
+  return [];
+}
+
+/**
+ * Fetches legacy addresses from hl-scout (leaderboard auto-selected accounts).
+ * These are registered with SubscriptionManager under the 'legacy' source.
+ * Note: Pinned accounts are registered separately with higher priority.
+ *
+ * @returns Array of normalized Ethereum addresses
+ */
+async function fetchLegacyAddresses(): Promise<string[]> {
   const addresses: string[] = [];
 
   // Fetch top-ranked system accounts from leaderboard
@@ -149,28 +201,6 @@ async function fetchWatchlist(): Promise<string[]> {
     logger.warn('selected_watchlist_failed', { err: err instanceof Error ? err.message : err });
   }
 
-  // Also fetch pinned accounts and add them to the watchlist
-  try {
-    const pinnedRes = await fetch(`${scoutUrl}/pinned-accounts`, {
-      headers: { 'x-owner-key': OWNER_TOKEN }
-    });
-    if (pinnedRes.ok) {
-      const pinnedData = await pinnedRes.json();
-      if (Array.isArray(pinnedData?.accounts) && pinnedData.accounts.length) {
-        const pinnedAddresses = pinnedData.accounts.map((acc: any) => normalizeAddress(acc.address));
-        // Add pinned addresses that aren't already in the list
-        for (const addr of pinnedAddresses) {
-          if (!addresses.includes(addr)) {
-            addresses.push(addr);
-          }
-        }
-        logger.info('pinned_accounts_added_to_watchlist', { count: pinnedAddresses.length });
-      }
-    }
-  } catch (err) {
-    logger.warn('pinned_accounts_watchlist_failed', { err: err instanceof Error ? err.message : err });
-  }
-
   if (addresses.length) return addresses;
 
   // Fallback to addresses endpoint
@@ -185,8 +215,38 @@ async function fetchWatchlist(): Promise<string[]> {
   } catch (err) {
     logger.warn('addresses_watchlist_failed', { err: err instanceof Error ? err.message : err });
   }
-  if (watchlist.length) return watchlist;
-  return [];
+
+  // Return current legacy addresses if fetch failed
+  return subscriptionManager.getAddressesForSource('legacy');
+}
+
+/**
+ * Refreshes the watchlist and updates SubscriptionManager.
+ * Registers pinned accounts (highest priority) and legacy addresses separately.
+ * This is called periodically and after manual refresh requests.
+ *
+ * @returns Array of all subscribed addresses (pinned + legacy + alpha-pool + others)
+ */
+async function refreshWatchlist(): Promise<string[]> {
+  // Fetch pinned and legacy addresses in parallel
+  const [pinnedAddresses, legacyAddresses] = await Promise.all([
+    fetchPinnedAddresses(),
+    fetchLegacyAddresses()
+  ]);
+
+  // Register pinned accounts with highest priority (priority 0)
+  await subscriptionManager.replaceForSource('pinned', pinnedAddresses);
+
+  // Register legacy leaderboard addresses (priority 1)
+  await subscriptionManager.replaceForSource('legacy', legacyAddresses);
+
+  logger.info('watchlist_refreshed', {
+    pinned: pinnedAddresses.length,
+    legacy: legacyAddresses.length,
+    total: subscriptionManager.getAllAddresses().length
+  });
+
+  return subscriptionManager.getAllAddresses();
 }
 
 /**
@@ -387,10 +447,10 @@ async function main() {
   const nats = await connectNats(natsUrl);
   await ensureStream(nats.jsm, 'HL_C', [fillsSubject]);
 
-  watchlist = await fetchWatchlist();
-  logger.info('watchlist_loaded', { count: watchlist.length });
+  const initialAddresses = await refreshWatchlist();
+  logger.info('watchlist_loaded', { count: initialAddresses.length });
 
-  tracker = new RealtimeTracker(async () => watchlist, queue, {
+  tracker = new RealtimeTracker(async () => getWatchlist(), queue, {
     onTrade: ({ event }) => {
       publishFillFromEvent(nats.js, event).catch((err) =>
         logger.error('fill_publish_failed', { err: err?.message })
@@ -399,12 +459,12 @@ async function main() {
   });
 
   // Start tracker and await position priming to ensure holdings are available immediately
-  logger.info('starting_realtime_tracker', { watchlist: watchlist.length });
+  logger.info('starting_realtime_tracker', { watchlist: initialAddresses.length });
   await tracker.start({ awaitPositions: true });
-  logger.info('realtime_tracker_ready', { watchlist: watchlist.length });
+  logger.info('realtime_tracker_ready', { watchlist: initialAddresses.length });
 
   // Start the price feed for real-time BTC/ETH prices
-  startPriceFeed(async () => watchlist).catch((err) =>
+  startPriceFeed(async () => getWatchlist()).catch((err) =>
     logger.warn('price_feed_start_failed', { err: err?.message })
   );
 
@@ -419,27 +479,342 @@ async function main() {
     });
   }
 
-  app.get('/healthz', (_req, res) => res.json({ status: 'ok', watchlist: watchlist.length }));
+  app.get('/healthz', (_req, res) => res.json({ status: 'ok', watchlist: getWatchlist().length }));
   app.get('/metrics', metricsHandler(metrics));
-  app.get('/watchlist', (_req, res) => res.json({ addresses: watchlist }));
+  app.get('/watchlist', (_req, res) => res.json({ addresses: getWatchlist() }));
   app.get('/positions/status', (_req, res) => res.json({
     positionsReady: tracker?.positionsReady ?? false,
-    watchlistCount: watchlist.length
+    watchlistCount: getWatchlist().length
   }));
 
   app.post('/watchlist/refresh', ownerOnly, async (_req, res) => {
-    watchlist = await fetchWatchlist();
+    await refreshWatchlist();
     await tracker?.refresh();
-    logger.info('watchlist_refreshed', { count: watchlist.length });
-    res.json({ ok: true, count: watchlist.length });
+    const count = getWatchlist().length;
+    logger.info('watchlist_refreshed', { count });
+    res.json({ ok: true, count });
   });
+
+  // =====================
+  // SUBSCRIPTION MANAGEMENT API
+  // =====================
+  // Centralized subscription endpoints for registering addresses from any source.
+  // Used by hl-sage to register Alpha Pool addresses for real-time tracking.
+
+  /**
+   * Register addresses from a source.
+   * POST /subscriptions/register
+   * Body: { source: string, addresses: string[] }
+   */
+  app.post('/subscriptions/register', ownerOnly, async (req, res) => {
+    try {
+      const { source, addresses } = req.body;
+
+      if (!source || typeof source !== 'string') {
+        return res.status(400).json({ error: 'source is required and must be a string' });
+      }
+      if (!Array.isArray(addresses)) {
+        return res.status(400).json({ error: 'addresses must be an array' });
+      }
+
+      // Validate addresses
+      const validAddresses: string[] = [];
+      for (const addr of addresses) {
+        if (typeof addr === 'string' && isValidEthereumAddress(addr)) {
+          validAddresses.push(addr);
+        }
+      }
+
+      const added = await subscriptionManager.register(source, validAddresses);
+
+      logger.info('subscriptions_registered', {
+        source,
+        requested: addresses.length,
+        valid: validAddresses.length,
+        newlyAdded: added.length,
+        total: subscriptionManager.getAllAddresses().length
+      });
+
+      res.json({
+        success: true,
+        source,
+        registered: validAddresses.length,
+        newlyAdded: added.length,
+        totalAddresses: subscriptionManager.getAllAddresses().length
+      });
+    } catch (err: any) {
+      logger.error('subscriptions_register_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to register addresses' });
+    }
+  });
+
+  /**
+   * Unregister addresses from a source.
+   * DELETE /subscriptions/unregister
+   * Body: { source: string, addresses: string[] }
+   */
+  app.delete('/subscriptions/unregister', ownerOnly, async (req, res) => {
+    try {
+      const { source, addresses } = req.body;
+
+      if (!source || typeof source !== 'string') {
+        return res.status(400).json({ error: 'source is required and must be a string' });
+      }
+      if (!Array.isArray(addresses)) {
+        return res.status(400).json({ error: 'addresses must be an array' });
+      }
+
+      const removed = await subscriptionManager.unregister(source, addresses);
+
+      logger.info('subscriptions_unregistered', {
+        source,
+        requested: addresses.length,
+        removed: removed.length,
+        total: subscriptionManager.getAllAddresses().length
+      });
+
+      res.json({
+        success: true,
+        source,
+        unregistered: addresses.length,
+        removed: removed.length,
+        totalAddresses: subscriptionManager.getAllAddresses().length
+      });
+    } catch (err: any) {
+      logger.error('subscriptions_unregister_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to unregister addresses' });
+    }
+  });
+
+  /**
+   * Replace all addresses for a source (atomic operation).
+   * POST /subscriptions/replace
+   * Body: { source: string, addresses: string[] }
+   */
+  app.post('/subscriptions/replace', ownerOnly, async (req, res) => {
+    try {
+      const { source, addresses } = req.body;
+
+      if (!source || typeof source !== 'string') {
+        return res.status(400).json({ error: 'source is required and must be a string' });
+      }
+      if (!Array.isArray(addresses)) {
+        return res.status(400).json({ error: 'addresses must be an array' });
+      }
+
+      // Validate addresses
+      const validAddresses: string[] = [];
+      for (const addr of addresses) {
+        if (typeof addr === 'string' && isValidEthereumAddress(addr)) {
+          validAddresses.push(addr);
+        }
+      }
+
+      const beforeCount = subscriptionManager.getAddressesForSource(source).length;
+      await subscriptionManager.replaceForSource(source, validAddresses);
+      const afterCount = subscriptionManager.getAddressesForSource(source).length;
+
+      logger.info('subscriptions_replaced', {
+        source,
+        before: beforeCount,
+        after: afterCount,
+        total: subscriptionManager.getAllAddresses().length
+      });
+
+      res.json({
+        success: true,
+        source,
+        count: afterCount,
+        totalAddresses: subscriptionManager.getAllAddresses().length
+      });
+    } catch (err: any) {
+      logger.error('subscriptions_replace_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to replace addresses' });
+    }
+  });
+
+  /**
+   * Get subscription status and statistics.
+   * GET /subscriptions/status
+   */
+  app.get('/subscriptions/status', (_req, res) => {
+    const status = subscriptionManager.getStatus();
+    res.json(status);
+  });
+
+  /**
+   * Get addresses registered by a specific source.
+   * GET /subscriptions/addresses/:source
+   */
+  app.get('/subscriptions/addresses/:source', (req, res) => {
+    const source = req.params.source;
+    const addresses = subscriptionManager.getAddressesForSource(source);
+    res.json({
+      source,
+      addresses,
+      count: addresses.length
+    });
+  });
+
+  /**
+   * Get all sources that registered a specific address.
+   * GET /subscriptions/sources/:address
+   */
+  app.get('/subscriptions/sources/:address', (req, res) => {
+    const address = req.params.address;
+    const sources = subscriptionManager.getSourcesForAddress(address);
+    res.json({
+      address: normalizeAddress(address),
+      sources,
+      isSubscribed: sources.length > 0
+    });
+  });
+
+  /**
+   * Get subscription method for an address.
+   * GET /subscriptions/method/:address
+   */
+  app.get('/subscriptions/method/:address', (req, res) => {
+    const address = req.params.address;
+    const method = subscriptionManager.getMethod(address);
+    const info = subscriptionManager.getAddressInfo(address);
+    res.json({
+      address: normalizeAddress(address),
+      method,
+      sources: info ? Array.from(info.sources.keys()) : [],
+      subscribedAt: info?.subscribedAt ?? null
+    });
+  });
+
+  /**
+   * Get subscription methods for all addresses (for UI).
+   * GET /subscriptions/methods
+   */
+  app.get('/subscriptions/methods', (_req, res) => {
+    const methods: Record<string, { method: string; sources: string[] }> = {};
+    for (const addr of subscriptionManager.getAllAddresses()) {
+      const info = subscriptionManager.getAddressInfo(addr);
+      if (info) {
+        methods[addr] = {
+          method: info.method,
+          sources: Array.from(info.sources.keys())
+        };
+      }
+    }
+    res.json(methods);
+  });
+
+  /**
+   * Demote an address from WebSocket to polling (free a slot).
+   * POST /subscriptions/demote
+   * Body: { address: string }
+   */
+  app.post('/subscriptions/demote', ownerOnly, (req, res) => {
+    try {
+      const { address } = req.body;
+
+      if (!address || typeof address !== 'string') {
+        return res.status(400).json({ error: 'address is required' });
+      }
+
+      if (!isValidEthereumAddress(address)) {
+        return res.status(400).json({ error: 'Invalid Ethereum address' });
+      }
+
+      const info = subscriptionManager.getAddressInfo(address);
+      if (!info) {
+        return res.status(404).json({ error: 'Address not found in subscriptions' });
+      }
+
+      if (info.sources.has('pinned')) {
+        return res.status(400).json({ error: 'Cannot demote pinned address. Unpin first.' });
+      }
+
+      const success = subscriptionManager.demoteToPolling(address);
+
+      if (success) {
+        logger.info('subscription_demoted', {
+          address: normalizeAddress(address),
+          newMethod: 'polling'
+        });
+        res.json({
+          success: true,
+          address: normalizeAddress(address),
+          method: 'polling'
+        });
+      } else {
+        res.status(400).json({ error: 'Failed to demote address' });
+      }
+    } catch (err: any) {
+      logger.error('subscription_demote_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to demote address' });
+    }
+  });
+
+  /**
+   * Promote an address from polling to WebSocket (use an available slot).
+   * POST /subscriptions/promote
+   * Body: { address: string }
+   */
+  app.post('/subscriptions/promote', ownerOnly, (req, res) => {
+    try {
+      const { address } = req.body;
+
+      if (!address || typeof address !== 'string') {
+        return res.status(400).json({ error: 'address is required' });
+      }
+
+      if (!isValidEthereumAddress(address)) {
+        return res.status(400).json({ error: 'Invalid Ethereum address' });
+      }
+
+      const info = subscriptionManager.getAddressInfo(address);
+      if (!info) {
+        return res.status(404).json({ error: 'Address not found in subscriptions' });
+      }
+
+      const status = subscriptionManager.getStatus();
+      const available = status.maxWebSocketSlots - status.addressesByMethod.websocket;
+
+      if (available <= 0) {
+        return res.status(400).json({
+          error: 'No WebSocket slots available. Demote another address first.',
+          slotsUsed: status.addressesByMethod.websocket,
+          maxSlots: status.maxWebSocketSlots
+        });
+      }
+
+      const success = subscriptionManager.promoteToWebsocket(address);
+
+      if (success) {
+        logger.info('subscription_promoted', {
+          address: normalizeAddress(address),
+          newMethod: 'websocket'
+        });
+        res.json({
+          success: true,
+          address: normalizeAddress(address),
+          method: 'websocket'
+        });
+      } else {
+        res.status(400).json({ error: 'Failed to promote address' });
+      }
+    } catch (err: any) {
+      logger.error('subscription_promote_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to promote address' });
+    }
+  });
+
   app.get('/dashboard/api/summary', (req, res) => proxyScout('/dashboard/summary', req, res));
+  // Deprecated: returns fills for ALL tracked addresses (use /legacy/fills for leaderboard-only)
   app.get('/dashboard/api/fills', (req, res) => proxyScout('/dashboard/fills', req, res));
+  // Legacy leaderboard fills - returns fills ONLY for leaderboard addresses + pinned accounts
+  app.get('/dashboard/api/legacy/fills', (req, res) => proxyScout('/dashboard/legacy/fills', req, res));
   app.get('/dashboard/api/decisions', (req, res) => proxyScout('/dashboard/decisions', req, res));
   app.get('/dashboard/api/price', (req, res) => proxyScout('/dashboard/price', req, res));
   app.get('/dashboard/api/positions-status', (_req, res) => res.json({
     positionsReady: tracker?.positionsReady ?? false,
-    watchlistCount: watchlist.length
+    watchlistCount: getWatchlist().length
   }));
 
   // Real-time prices endpoint
@@ -487,6 +862,20 @@ async function main() {
       });
       const body = await response.text();
       const type = response.headers.get('content-type') || 'application/json';
+
+      // After custom account is added successfully, refresh watchlist and prime positions
+      // This ensures holdings are available immediately instead of waiting for next refresh cycle
+      if (response.ok && tracker) {
+        try {
+          await refreshWatchlist();
+          await tracker.refresh({ awaitPositions: true });
+          logger.info('watchlist_synced_after_custom_pinned', { count: getWatchlist().length });
+        } catch (syncErr: any) {
+          logger.warn('post_custom_pinned_sync_failed', { err: syncErr?.message });
+          // Don't fail the request, the account was added successfully
+        }
+      }
+
       res.status(response.status).setHeader('Content-Type', type).send(body);
     } catch (err: any) {
       logger.error('add_custom_pinned_proxy_failed', { err: err?.message });
@@ -561,10 +950,10 @@ async function main() {
       // This ensures holdings are populated before the dashboard queries them
       if (response.ok && tracker) {
         try {
-          watchlist = await fetchWatchlist();
+          await refreshWatchlist();
           await tracker.refresh({ awaitPositions: true });
           await tracker.forceRefreshAllPositions();
-          logger.info('watchlist_and_positions_synced_after_refresh', { count: watchlist.length });
+          logger.info('watchlist_and_positions_synced_after_refresh', { count: getWatchlist().length });
         } catch (syncErr: any) {
           logger.warn('post_refresh_sync_failed', { err: syncErr?.message });
           // Don't fail the request, the leaderboard refresh itself succeeded
@@ -589,7 +978,10 @@ async function main() {
       if (idx >= 0) {
         target.search = req.originalUrl.slice(idx);
       }
-      const response = await fetch(target, { headers: { 'x-owner-key': OWNER_TOKEN } });
+      const response = await fetch(target, {
+        method: req.method,
+        headers: { 'x-owner-key': OWNER_TOKEN },
+      });
       const body = await response.text();
       const type = response.headers.get('content-type') || 'application/json';
       res.status(response.status).setHeader('Content-Type', type).send(body);
@@ -605,10 +997,253 @@ async function main() {
   app.post('/dashboard/api/bandit/sample', (req, res) => proxySage('/bandit/sample', req, res));
   app.post('/dashboard/api/bandit/decay', (req, res) => proxySage('/bandit/decay', req, res));
 
+  // Subscription methods for UI (shows websocket vs polling per address)
+  app.get('/dashboard/api/subscriptions/methods', (_req, res) => {
+    const methods: Record<string, { method: string; sources: string[] }> = {};
+    for (const addr of subscriptionManager.getAllAddresses()) {
+      const info = subscriptionManager.getAddressInfo(addr);
+      if (info) {
+        methods[addr] = {
+          method: info.method,
+          sources: Array.from(info.sources.keys())
+        };
+      }
+    }
+    res.json(methods);
+  });
+
+  app.get('/dashboard/api/subscriptions/status', (_req, res) => {
+    const status = subscriptionManager.getStatus();
+    res.json(status);
+  });
+
+  /**
+   * Demote an address from WebSocket to polling (dashboard API).
+   * POST /dashboard/api/subscriptions/demote
+   * Note: No auth required - this is a user-facing dashboard operation
+   */
+  app.post('/dashboard/api/subscriptions/demote', (req, res) => {
+    try {
+      const { address } = req.body;
+
+      if (!address || typeof address !== 'string') {
+        return res.status(400).json({ error: 'address is required' });
+      }
+
+      if (!isValidEthereumAddress(address)) {
+        return res.status(400).json({ error: 'Invalid Ethereum address' });
+      }
+
+      const info = subscriptionManager.getAddressInfo(address);
+      if (!info) {
+        return res.status(404).json({ error: 'Address not found in subscriptions' });
+      }
+
+      if (info.sources.has('pinned')) {
+        return res.status(400).json({ error: 'Cannot demote pinned address. Unpin first.' });
+      }
+
+      const success = subscriptionManager.demoteToPolling(address);
+
+      if (success) {
+        logger.info('subscription_demoted', {
+          address: normalizeAddress(address),
+          newMethod: 'polling'
+        });
+        res.json({
+          success: true,
+          address: normalizeAddress(address),
+          method: 'polling'
+        });
+      } else {
+        res.status(400).json({ error: 'Failed to demote address' });
+      }
+    } catch (err: any) {
+      logger.error('subscription_demote_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to demote address' });
+    }
+  });
+
+  /**
+   * Promote an address from polling to WebSocket (dashboard API).
+   * POST /dashboard/api/subscriptions/promote
+   * Note: No auth required - this is a user-facing dashboard operation
+   */
+  app.post('/dashboard/api/subscriptions/promote', (req, res) => {
+    try {
+      const { address } = req.body;
+
+      if (!address || typeof address !== 'string') {
+        return res.status(400).json({ error: 'address is required' });
+      }
+
+      if (!isValidEthereumAddress(address)) {
+        return res.status(400).json({ error: 'Invalid Ethereum address' });
+      }
+
+      const info = subscriptionManager.getAddressInfo(address);
+      if (!info) {
+        return res.status(404).json({ error: 'Address not found in subscriptions' });
+      }
+
+      const status = subscriptionManager.getStatus();
+      const available = status.maxWebSocketSlots - status.addressesByMethod.websocket;
+
+      if (available <= 0) {
+        return res.status(400).json({
+          error: 'No WebSocket slots available. Demote another address first.',
+          slotsUsed: status.addressesByMethod.websocket,
+          maxSlots: status.maxWebSocketSlots
+        });
+      }
+
+      const success = subscriptionManager.promoteToWebsocket(address);
+
+      if (success) {
+        logger.info('subscription_promoted', {
+          address: normalizeAddress(address),
+          newMethod: 'websocket'
+        });
+        res.json({
+          success: true,
+          address: normalizeAddress(address),
+          method: 'websocket'
+        });
+      } else {
+        res.status(400).json({ error: 'Failed to promote address' });
+      }
+    } catch (err: any) {
+      logger.error('subscription_promote_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to promote address' });
+    }
+  });
+
   // Alpha Pool API routes (NIG-based Thompson Sampling)
   app.get('/dashboard/api/alpha-pool', (req, res) => proxySage('/alpha-pool', req, res));
   app.get('/dashboard/api/alpha-pool/status', (req, res) => proxySage('/alpha-pool/status', req, res));
+  app.get('/dashboard/api/alpha-pool/refresh/status', (req, res) => proxySage('/alpha-pool/refresh/status', req, res));
+  app.post('/dashboard/api/alpha-pool/refresh', (req, res) => proxySage('/alpha-pool/refresh', req, res));
   app.post('/dashboard/api/alpha-pool/sample', (req, res) => proxySage('/alpha-pool/sample', req, res));
+
+  // Alpha Pool fills endpoint - fetches fills for Alpha Pool addresses only
+  app.get('/dashboard/api/alpha-pool/fills', async (req, res) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+    try {
+      const limit = req.query.limit ? Math.min(100, Math.max(1, parseInt(String(req.query.limit), 10))) : 50;
+      const beforeTime = req.query.before ? String(req.query.before) : null;
+
+      // Get Alpha Pool addresses from hl-sage
+      const alphaRes = await fetch(`${sageUrl}/alpha-pool/addresses?active_only=true&limit=500`);
+      if (!alphaRes.ok) {
+        return res.status(502).json({ error: 'Failed to fetch Alpha Pool addresses' });
+      }
+      const alphaData = await alphaRes.json();
+      const alphaAddresses = (alphaData?.addresses || []).map((a: any) => normalizeAddress(a.address));
+
+      if (alphaAddresses.length === 0) {
+        return res.json({ fills: [], hasMore: false, oldestTime: null });
+      }
+
+      // Fetch fills from database for Alpha Pool addresses
+      const result = await getBackfillFills({
+        beforeTime,
+        limit,
+        addresses: alphaAddresses
+      });
+
+      res.json({
+        fills: result.fills,
+        hasMore: result.hasMore,
+        oldestTime: result.oldestTime,
+        addressCount: alphaAddresses.length
+      });
+    } catch (err: any) {
+      logger.error('alpha_pool_fills_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to fetch Alpha Pool fills' });
+    }
+  });
+
+  // Alpha Pool last activity endpoint - gets most recent fill timestamp per address
+  // This avoids HFT traders dominating the regular fills endpoint
+  app.get('/dashboard/api/alpha-pool/last-activity', async (req, res) => {
+    res.set('Cache-Control', 'max-age=30'); // Cache for 30 seconds
+    try {
+      // Get Alpha Pool addresses from hl-sage
+      const alphaRes = await fetch(`${sageUrl}/alpha-pool/addresses?active_only=true&limit=500`);
+      if (!alphaRes.ok) {
+        return res.status(502).json({ error: 'Failed to fetch Alpha Pool addresses' });
+      }
+      const alphaData = await alphaRes.json();
+      const alphaAddresses = (alphaData?.addresses || []).map((a: any) => normalizeAddress(a.address));
+
+      if (alphaAddresses.length === 0) {
+        return res.json({ lastActivity: {} });
+      }
+
+      // Get last activity per address from database
+      const lastActivity = await getLastActivityPerAddress(alphaAddresses);
+
+      res.json({ lastActivity });
+    } catch (err: any) {
+      logger.error('alpha_pool_last_activity_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to fetch Alpha Pool last activity' });
+    }
+  });
+
+  // Alpha Pool holdings endpoint - fetches current positions for Alpha Pool addresses
+  app.get('/dashboard/api/alpha-pool/holdings', async (req, res) => {
+    res.set('Cache-Control', 'max-age=30'); // Cache for 30 seconds
+    try {
+      // Get Alpha Pool addresses from hl-sage
+      const alphaRes = await fetch(`${sageUrl}/alpha-pool/addresses?active_only=true&limit=500`);
+      if (!alphaRes.ok) {
+        return res.status(502).json({ error: 'Failed to fetch Alpha Pool addresses' });
+      }
+      const alphaData = await alphaRes.json();
+      const alphaAddresses: string[] = (alphaData?.addresses || []).map((a: any) => normalizeAddress(a.address));
+
+      if (alphaAddresses.length === 0) {
+        return res.json({ holdings: {} });
+      }
+
+      // Fetch positions for each address (rate limited, in parallel with concurrency limit)
+      const CONCURRENCY = 5;
+      const holdings: Record<string, any[]> = {};
+
+      for (let i = 0; i < alphaAddresses.length; i += CONCURRENCY) {
+        const batch = alphaAddresses.slice(i, i + CONCURRENCY);
+        const results = await Promise.allSettled(
+          batch.map(async (addr) => {
+            const positions = await fetchPerpPositions(addr);
+            // Only include BTC and ETH positions
+            return {
+              address: addr,
+              positions: positions.filter(p =>
+                p.symbol === 'BTC' || p.symbol === 'ETH'
+              ).map(p => ({
+                symbol: p.symbol,
+                size: p.size,
+                entryPrice: p.entryPriceUsd,
+                liquidationPrice: null, // Will be calculated client-side if needed
+                leverage: p.leverage
+              }))
+            };
+          })
+        );
+
+        for (const result of results) {
+          if (result.status === 'fulfilled' && result.value.positions.length > 0) {
+            holdings[result.value.address.toLowerCase()] = result.value.positions;
+          }
+        }
+      }
+
+      res.json({ holdings, addressCount: alphaAddresses.length });
+    } catch (err: any) {
+      logger.error('alpha_pool_holdings_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to fetch Alpha Pool holdings' });
+    }
+  });
 
   // Consensus signal API routes (hl-decide)
   const decideUrl = process.env.DECIDE_URL || 'http://hl-decide:8080';
@@ -620,7 +1255,19 @@ async function main() {
       if (idx >= 0) {
         target.search = req.originalUrl.slice(idx);
       }
-      const response = await fetch(target, { headers: { 'x-owner-key': OWNER_TOKEN } });
+
+      const fetchOptions: RequestInit = {
+        method: req.method,
+        headers: { 'x-owner-key': OWNER_TOKEN },
+      };
+
+      // Forward request body for POST/PUT/PATCH
+      if (['POST', 'PUT', 'PATCH'].includes(req.method) && req.body) {
+        fetchOptions.body = JSON.stringify(req.body);
+        (fetchOptions.headers as Record<string, string>)['Content-Type'] = 'application/json';
+      }
+
+      const response = await fetch(target, fetchOptions);
       const body = await response.text();
       const type = response.headers.get('content-type') || 'application/json';
       res.status(response.status).setHeader('Content-Type', type).send(body);
@@ -633,8 +1280,29 @@ async function main() {
   app.get('/dashboard/api/consensus/signals', (req, res) => proxyDecide('/consensus/signals', req, res));
   app.get('/dashboard/api/consensus/stats', (req, res) => proxyDecide('/consensus/stats', req, res));
 
-  // Backfill fills endpoint for infinite scroll
-  app.get('/dashboard/api/fills/backfill', async (req, res) => {
+  // Decision logging API routes (hl-decide)
+  // Lists all decisions (signals, skips, risk rejections) with human-readable reasoning
+  app.get('/dashboard/api/decisions', (req, res) => proxyDecide('/decisions', req, res));
+  app.get('/dashboard/api/decisions/stats', (req, res) => proxyDecide('/decisions/stats', req, res));
+  app.get('/dashboard/api/decisions/:id', (req, res) => proxyDecide(`/decisions/${req.params.id}`, req, res));
+
+  // Portfolio & Execution API routes (hl-decide)
+  // Account equity, positions, and auto-trade configuration
+  app.get('/dashboard/api/portfolio', (req, res) => proxyDecide('/portfolio', req, res));
+  app.get('/dashboard/api/portfolio/positions', (req, res) => proxyDecide('/portfolio/positions', req, res));
+  app.get('/dashboard/api/execution/config', (req, res) => proxyDecide('/execution/config', req, res));
+  app.post('/dashboard/api/execution/config', (req, res) => proxyDecide('/execution/config', req, res));
+  app.get('/dashboard/api/execution/logs', (req, res) => proxyDecide('/execution/logs', req, res));
+
+  // =====================
+  // LEGACY TAB ENDPOINTS
+  // =====================
+  // These endpoints are ONLY for the Legacy Leaderboard tab.
+  // They use the Legacy watchlist (hl_leaderboard_entries + pinned_accounts).
+  // Alpha Pool has separate endpoints under /alpha-pool/*
+
+  // Legacy backfill fills endpoint for infinite scroll
+  app.get('/dashboard/api/legacy/fills/backfill', async (req, res) => {
     // Prevent browser caching - each request may return different data
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
     res.set('Pragma', 'no-cache');
@@ -644,8 +1312,9 @@ async function main() {
       const beforeTime = req.query.before ? String(req.query.before) : null;
       const limit = req.query.limit ? Math.min(100, Math.max(1, parseInt(String(req.query.limit), 10))) : 30;
 
-      // Get current watchlist addresses for filtering
-      const addresses = watchlist.length > 0 ? watchlist : undefined;
+      // Get current Legacy watchlist addresses for filtering
+      const legacyAddrs = subscriptionManager.getAddressesForSource('legacy');
+      const addresses = legacyAddrs.length > 0 ? legacyAddrs : undefined;
 
       const result = await getBackfillFills({
         beforeTime,
@@ -659,43 +1328,51 @@ async function main() {
         oldestTime: result.oldestTime
       });
     } catch (err: any) {
-      logger.error('backfill_fills_failed', { err: err?.message });
-      res.status(500).json({ error: 'Failed to fetch backfill fills' });
+      logger.error('legacy_backfill_fills_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to fetch Legacy backfill fills' });
     }
   });
 
-  // Get oldest fill time for the current watchlist
-  app.get('/dashboard/api/fills/oldest', async (_req, res) => {
+  // Get oldest fill time for Legacy watchlist
+  app.get('/dashboard/api/legacy/fills/oldest', async (_req, res) => {
     try {
-      const addresses = watchlist.length > 0 ? watchlist : undefined;
+      const legacyAddrs = subscriptionManager.getAddressesForSource('legacy');
+      const addresses = legacyAddrs.length > 0 ? legacyAddrs : undefined;
       const oldestTime = await getOldestFillTime(addresses);
       res.json({ oldestTime });
     } catch (err: any) {
-      logger.error('oldest_fill_time_failed', { err: err?.message });
-      res.status(500).json({ error: 'Failed to get oldest fill time' });
+      logger.error('legacy_oldest_fill_time_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to get Legacy oldest fill time' });
     }
   });
 
-  // Fetch historical fills from Hyperliquid API and store in database
-  app.post('/dashboard/api/fills/fetch-history', async (req, res) => {
+  // Fetch historical fills from Hyperliquid API for Legacy watchlist
+  // This fetches ALL available fills from the API and inserts any missing ones
+  // to fill gaps between what's in the DB and the current time.
+  app.post('/dashboard/api/legacy/fills/fetch-history', async (req, res) => {
     try {
-      const limit = req.body?.limit ? Math.min(100, Math.max(1, parseInt(String(req.body.limit), 10))) : 50;
-      const addresses = watchlist.length > 0 ? watchlist : [];
+      // limit parameter now controls how many fills to return in response, not how many to fetch
+      const responseLimit = req.body?.limit ? Math.min(100, Math.max(1, parseInt(String(req.body.limit), 10))) : 50;
+      const addresses = subscriptionManager.getAddressesForSource('legacy');
 
       if (addresses.length === 0) {
-        return res.json({ inserted: 0, message: 'No addresses in watchlist' });
+        return res.json({ inserted: 0, message: 'No addresses in Legacy watchlist' });
       }
 
       let totalInserted = 0;
-      const results: Array<{ address: string; inserted: number }> = [];
+      const results: Array<{ address: string; inserted: number; fetched: number }> = [];
 
-      // Fetch fills for each address (limit concurrency)
+      // Fetch ALL fills for each address (not just limit)
+      // The API returns up to 2000 fills per address, newest first
+      // insertTradeIfNew handles deduplication by hash
       for (const address of addresses) {
         try {
           const fills = await fetchUserFills(address, { aggregateByTime: true, symbols: ['BTC', 'ETH'] });
           let inserted = 0;
+          const fetched = fills?.length || 0;
 
-          for (const f of (fills || []).slice(0, limit)) {
+          // Process ALL fills from API - dedup happens in insertTradeIfNew
+          for (const f of fills || []) {
             const delta = f.side === 'B' ? +f.sz : -f.sz;
             const newPos = f.startPosition + delta;
             let action = '';
@@ -721,18 +1398,18 @@ async function main() {
             if (result.inserted) inserted += 1;
           }
 
-          results.push({ address, inserted });
+          results.push({ address, inserted, fetched });
           totalInserted += inserted;
         } catch (err: any) {
-          logger.warn('fetch_history_address_failed', { address, err: err?.message });
-          results.push({ address, inserted: 0 });
+          logger.warn('legacy_fetch_history_address_failed', { address, err: err?.message });
+          results.push({ address, inserted: 0, fetched: 0 });
         }
       }
 
-      logger.info('fetch_history_complete', { totalInserted, addressCount: addresses.length });
+      logger.info('legacy_fetch_history_complete', { totalInserted, addressCount: addresses.length });
 
-      // Return the fills from DB after backfill
-      const dbFills = await getBackfillFills({ limit: 40, addresses });
+      // Return the fills from DB after backfill (limited for response size)
+      const dbFills = await getBackfillFills({ limit: responseLimit, addresses });
 
       res.json({
         inserted: totalInserted,
@@ -743,19 +1420,19 @@ async function main() {
         oldestTime: dbFills.oldestTime
       });
     } catch (err: any) {
-      logger.error('fetch_history_failed', { err: err?.message });
-      res.status(500).json({ error: 'Failed to fetch historical fills' });
+      logger.error('legacy_fetch_history_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to fetch Legacy historical fills' });
     }
   });
 
-  // Validate position chain integrity for all tracked addresses
-  app.get('/dashboard/api/fills/validate', async (req, res) => {
+  // Validate position chain integrity for Legacy watchlist addresses
+  app.get('/dashboard/api/legacy/fills/validate', async (req, res) => {
     try {
       const symbol = (req.query.symbol === 'BTC' ? 'BTC' : 'ETH') as 'BTC' | 'ETH';
-      const addresses = watchlist.length > 0 ? watchlist : [];
+      const addresses = subscriptionManager.getAddressesForSource('legacy');
 
       if (addresses.length === 0) {
-        return res.json({ valid: true, message: 'No addresses in watchlist', results: [] });
+        return res.json({ valid: true, message: 'No addresses in Legacy watchlist', results: [] });
       }
 
       const results: Array<{
@@ -779,7 +1456,7 @@ async function main() {
       }
 
       const invalidCount = results.filter(r => !r.valid).length;
-      logger.info('position_chain_validation', { symbol, addressCount: addresses.length, invalidCount });
+      logger.info('legacy_position_chain_validation', { symbol, addressCount: addresses.length, invalidCount });
 
       res.json({
         valid: allValid,
@@ -789,13 +1466,13 @@ async function main() {
         results: results.filter(r => !r.valid) // Only return invalid addresses
       });
     } catch (err: any) {
-      logger.error('validation_failed', { err: err?.message });
-      res.status(500).json({ error: 'Failed to validate position chains' });
+      logger.error('legacy_validation_failed', { err: err?.message });
+      res.status(500).json({ error: 'Failed to validate Legacy position chains' });
     }
   });
 
-  // Repair data for a specific address (clear and backfill)
-  app.post('/dashboard/api/fills/repair', async (req, res) => {
+  // Repair data for a specific address (clear and backfill) - Legacy
+  app.post('/dashboard/api/legacy/fills/repair', async (req, res) => {
     try {
       const address = req.body?.address;
       const symbol = (req.body?.symbol === 'BTC' ? 'BTC' : 'ETH') as 'BTC' | 'ETH';
@@ -870,11 +1547,11 @@ async function main() {
     }
   });
 
-  // Auto-repair all invalid addresses
+  // Auto-repair all invalid addresses (uses all subscribed addresses)
   app.post('/dashboard/api/fills/repair-all', async (req, res) => {
     try {
       const symbol = (req.body?.symbol === 'BTC' ? 'BTC' : 'ETH') as 'BTC' | 'ETH';
-      const addresses = watchlist.length > 0 ? watchlist : [];
+      const addresses = getWatchlist();
 
       if (addresses.length === 0) {
         return res.json({ repaired: 0, message: 'No addresses in watchlist' });
@@ -958,7 +1635,7 @@ async function main() {
 
   setInterval(async () => {
     try {
-      watchlist = await fetchWatchlist();
+      await refreshWatchlist();
       await tracker?.refresh();
       await refreshPriceFeed();
     } catch (err: any) {
@@ -995,7 +1672,7 @@ async function main() {
   if (AUTO_REPAIR_ENABLED) {
     setInterval(async () => {
       try {
-        const addresses = watchlist.length > 0 ? watchlist : [];
+        const addresses = getWatchlist();
         if (addresses.length === 0) return;
 
         // Validate ETH (most commonly traded)

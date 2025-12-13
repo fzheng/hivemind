@@ -36,6 +36,7 @@ import {
   getAddressPerformance,
   listRecentFills,
   listLiveFills,
+  listLiveFillsForAddresses,
   fetchLatestFillForAddress,
   listCustomAccounts,
   listPinnedAccounts,
@@ -549,6 +550,120 @@ describe('persist.ts database integration', () => {
       mockQuery.mockResolvedValueOnce({ rows: [] });
       await listLiveFills(500);
       expect(mockQuery).toHaveBeenCalledWith(expect.any(String), [200]);
+    });
+  });
+
+  describe('listLiveFillsForAddresses', () => {
+    it('should filter fills by addresses', async () => {
+      const mockRows = [
+        {
+          time_utc: '2025-01-01T00:00:00Z',
+          address: '0x1234',
+          action: 'Open Long',
+          size_signed: 0.5,
+          previous_position: 0,
+          resulting_position: 0.5,
+          price_usd: 95000,
+          closed_pnl_usd: null,
+          tx_hash: '0xhash',
+          symbol: 'BTC',
+          fee: 5.25,
+          fee_token: 'USDC',
+        },
+      ];
+      mockQuery.mockResolvedValueOnce({ rows: mockRows });
+
+      const result = await listLiveFillsForAddresses(['0x1234', '0x5678'], 25);
+
+      expect(result).toHaveLength(1);
+      expect(result[0].address).toBe('0x1234');
+      // Verify the query includes address filter
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.stringContaining('LOWER(address) IN'),
+        expect.arrayContaining([25, '0x1234', '0x5678'])
+      );
+    });
+
+    it('should normalize addresses to lowercase', async () => {
+      mockQuery.mockResolvedValueOnce({ rows: [] });
+
+      await listLiveFillsForAddresses(['0xABCD', '0xEFGH'], 10);
+
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.stringContaining('LOWER(address) IN'),
+        expect.arrayContaining([10, '0xabcd', '0xefgh'])
+      );
+    });
+
+    it('should generate correct placeholders for multiple addresses', async () => {
+      mockQuery.mockResolvedValueOnce({ rows: [] });
+
+      await listLiveFillsForAddresses(['0xa', '0xb', '0xc'], 20);
+
+      // Should have $2, $3, $4 for 3 addresses
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.stringContaining('$2, $3, $4'),
+        [20, '0xa', '0xb', '0xc']
+      );
+    });
+
+    it('should return all fills when addresses array is empty', async () => {
+      mockQuery.mockResolvedValueOnce({ rows: [] });
+
+      await listLiveFillsForAddresses([], 25);
+
+      // Should NOT contain address filter
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.not.stringContaining('LOWER(address) IN'),
+        [25]
+      );
+    });
+
+    it('should clamp limit between 1 and 200', async () => {
+      mockQuery.mockResolvedValueOnce({ rows: [] });
+      await listLiveFillsForAddresses(['0x1234'], 500);
+      expect(mockQuery).toHaveBeenCalledWith(expect.any(String), [200, '0x1234']);
+
+      mockQuery.mockResolvedValueOnce({ rows: [] });
+      await listLiveFillsForAddresses(['0x1234'], 0);
+      expect(mockQuery).toHaveBeenCalledWith(expect.any(String), [1, '0x1234']);
+    });
+
+    it('should return empty array on error', async () => {
+      mockQuery.mockRejectedValueOnce(new Error('DB error'));
+      const result = await listLiveFillsForAddresses(['0x1234']);
+      expect(result).toEqual([]);
+    });
+
+    it('should correctly filter out addresses not in the list', async () => {
+      // This tests the SQL IN clause works correctly
+      const mockRows = [
+        { time_utc: '2025-01-01T00:00:00Z', address: '0x1111', action: 'Open Long', size_signed: 1, previous_position: 0, resulting_position: 1, price_usd: 95000, closed_pnl_usd: null, tx_hash: '0x1', symbol: 'BTC', fee: 1, fee_token: 'USDC' },
+        { time_utc: '2025-01-02T00:00:00Z', address: '0x2222', action: 'Close Long', size_signed: -1, previous_position: 1, resulting_position: 0, price_usd: 96000, closed_pnl_usd: 100, tx_hash: '0x2', symbol: 'BTC', fee: 1, fee_token: 'USDC' },
+      ];
+      mockQuery.mockResolvedValueOnce({ rows: mockRows });
+
+      const result = await listLiveFillsForAddresses(['0x1111', '0x2222'], 50);
+
+      // Should return both addresses that are in the filter
+      expect(result).toHaveLength(2);
+      expect(result.map(r => r.address)).toEqual(['0x1111', '0x2222']);
+    });
+
+    it('should handle large number of addresses', async () => {
+      mockQuery.mockResolvedValueOnce({ rows: [] });
+
+      // Generate 50 addresses
+      const addresses = Array.from({ length: 50 }, (_, i) => `0x${i.toString(16).padStart(40, '0')}`);
+
+      await listLiveFillsForAddresses(addresses, 25);
+
+      // Should generate placeholders $2 through $51
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.stringContaining('$2'),
+        expect.arrayContaining([25])
+      );
+      expect(mockQuery.mock.calls[0][1].length).toBe(51); // limit + 50 addresses
     });
   });
 

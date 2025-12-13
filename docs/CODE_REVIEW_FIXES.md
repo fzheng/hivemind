@@ -4,7 +4,7 @@ This document summarizes all fixes applied to address the code review findings.
 
 ## Summary
 
-**Total Issues Fixed: 24**
+**Total Issues Fixed: 28**
 - Critical: 3
 - High-Priority: 4
 - Performance: 4
@@ -12,6 +12,7 @@ This document summarizes all fixes applied to address the code review findings.
 - Code Quality: 5
 - Data Integrity: 1
 - Features: 2
+- December 2025 Bug Fixes: 4
 
 ---
 
@@ -288,6 +289,38 @@ docker compose up --build
 
 ---
 
+## 9. December 2025 Bug Fixes
+
+### ✅ Position Priming Await Fix
+**File**: `packages/ts-lib/src/realtime.ts`
+**Issue**: Custom account positions showed "No BTC/ETH position" with ~1 minute delay after adding
+**Root Cause**: `performPrime()` called `upsertCurrentPosition()` fire-and-forget (not awaited)
+**Fix**: Collect all `upsertCurrentPosition()` promises and await `Promise.all()` at end of function
+**Impact**: Positions appear immediately when adding custom accounts in Legacy Leaderboard
+
+### ✅ Legacy Tab Stale Data Fix
+**File**: `services/hl-stream/public/dashboard.js`
+**Issue**: Legacy Leaderboard tab showed stale fills data (from days ago) after tab switch
+**Root Cause**: `switchTab()` didn't clear cache or refresh data for legacy-leaderboard tab
+**Fix**: Added cache clearing (`fillsCache = []`, `aggregatedGroups = []`) and `refreshFills()` call
+**Impact**: Legacy tab always shows fresh data when activated
+
+### ✅ Alpha Pool Auto-Refresh State Fix
+**File**: `services/hl-sage/app/main.py`
+**Issue**: Auto-refresh on first startup didn't set `is_running=true`, causing UI to show wrong state
+**Root Cause**: `auto_refresh_alpha_pool_if_empty()` called `_do_refresh_alpha_pool()` directly
+**Fix**: Changed to call `_background_refresh_task()` which properly sets refresh state
+**Impact**: Dashboard shows correct loading progress during auto-refresh
+
+### ✅ Alpha Pool Loading State Fix
+**File**: `services/hl-stream/public/dashboard.js`
+**Issue**: Brief flash of generic "Loading..." message before refresh progress UI appeared
+**Root Cause**: `refreshAlphaPool()` showed loading without checking if refresh was running
+**Fix**: Added `&& !isRefreshRunning` condition to only show generic loading when no refresh active
+**Impact**: Smoother UI transitions during refresh
+
+---
+
 ## Future Recommendations
 
 1. **Leaderboard API**: Investigate if batch stat queries are available
@@ -303,7 +336,7 @@ docker compose up --build
 ### TypeScript
 - `packages/ts-lib/src/persist.ts` (SQL injection, error logging, types, position chain validation)
 - `packages/ts-lib/src/postgres.ts` (pool singleton warning)
-- `packages/ts-lib/src/realtime.ts` (promise error handling)
+- `packages/ts-lib/src/realtime.ts` (promise error handling, position priming await fix)
 - `packages/ts-lib/src/index.ts` (export validation)
 - `packages/ts-lib/src/validation.ts` (NEW)
 - `packages/ts-lib/src/migrate.ts` (NEW - auto migrations)
@@ -311,9 +344,10 @@ docker compose up --build
 - `services/hl-scout/src/index.ts` (input validation, pinned accounts, migrations)
 - `services/hl-scout/src/leaderboard.ts` (transactions)
 - `services/hl-stream/src/index.ts` (WebSocket fixes, auto-repair endpoints)
+- `services/hl-stream/public/dashboard.js` (tab switching data refresh, loading states)
 
 ### Python
-- `services/hl-sage/app/main.py` (memory limits, error handling)
+- `services/hl-sage/app/main.py` (memory limits, error handling, auto-refresh state fix)
 - `services/hl-decide/app/main.py` (memory limits, error handling)
 
 ### SQL
@@ -323,10 +357,14 @@ docker compose up --build
 ### Documentation
 - `CODE_REVIEW_FIXES.md` (this file)
 
+### Tests (December 2025)
+- `tests/position-priming.test.ts` (NEW - 14 tests for position priming and tab switching fixes)
+- `e2e/tab-switching.spec.ts` (NEW - E2E tests for tab switching and data refresh)
+
 ---
 
-**Total Lines Changed**: ~700
-**New Files**: 4
-**New Test Files**: 1 (`tests/position-chain.test.ts`)
-**Review Date**: 2025-11-18 (updated 2025-12-01)
+**Total Lines Changed**: ~900
+**New Files**: 6
+**New Test Files**: 3 (`tests/position-chain.test.ts`, `tests/position-priming.test.ts`, `e2e/tab-switching.spec.ts`)
+**Review Date**: 2025-11-18 (updated 2025-12-06)
 **Reviewed By**: Claude Code

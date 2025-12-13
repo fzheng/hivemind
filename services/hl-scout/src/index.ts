@@ -46,6 +46,7 @@ import {
   listRecentDecisions,
   fetchLatestFillForAddress,
   listLiveFills,
+  listLiveFillsForAddresses,
   validateEthereumAddress,
   validateAddressArray,
   sanitizeNickname,
@@ -660,6 +661,7 @@ async function main() {
     });
   });
 
+  // Legacy fills endpoint - returns fills for ALL tracked addresses (deprecated)
   app.get('/dashboard/fills', async (req, res) => {
     const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 25));
     // Fetch one extra to check if there are more
@@ -667,6 +669,53 @@ async function main() {
     const hasMore = fills.length > limit;
     const trimmedFills = fills.slice(0, limit);
     res.json({ fills: trimmedFills, hasMore });
+  });
+
+  // Legacy leaderboard fills - returns fills ONLY for leaderboard addresses + pinned accounts
+  // Uses getEntries() to match the /leaderboard endpoint (top 12 by rank)
+  // NOT getSelected() which has special filtering logic for btcEthAnalysis->qualified
+  app.get('/dashboard/legacy/fills', async (req, res) => {
+    const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 25));
+    const period = Number(req.query.period) || DEFAULT_LEADERBOARD_PERIOD;
+
+    try {
+      // Get top N leaderboard entries by rank (same as /leaderboard endpoint)
+      const selectLimit = Number(process.env.LEADERBOARD_SELECT_COUNT ?? 12);
+      const entries = leaderboardService
+        ? await leaderboardService.getEntries(period, selectLimit)
+        : [];
+
+      // Get pinned accounts
+      const pinned = await listPinnedAccounts();
+      const pinnedAddresses = pinned.map(p => p.address.toLowerCase());
+
+      // Combine and deduplicate
+      const allAddresses = [...new Set([
+        ...entries.map((e: { address: string }) => e.address.toLowerCase()),
+        ...pinnedAddresses
+      ])];
+
+      logger.debug('legacy_fills_filter', {
+        selectLimit,
+        entriesCount: entries.length,
+        pinnedCount: pinned.length,
+        totalAddresses: allAddresses.length
+      });
+
+      if (allAddresses.length === 0) {
+        return res.json({ fills: [], hasMore: false });
+      }
+
+      // Fetch fills only for these addresses
+      const fills = await listLiveFillsForAddresses(allAddresses, limit + 1);
+      const hasMore = fills.length > limit;
+      const trimmedFills = fills.slice(0, limit);
+      return res.json({ fills: trimmedFills, hasMore });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error('legacy_fills_failed', { err: message });
+      return res.status(500).json({ error: 'Failed to fetch legacy fills' });
+    }
   });
 
   app.get('/dashboard/decisions', async (req, res) => {

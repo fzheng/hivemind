@@ -21,8 +21,9 @@ Position Lifecycle:
 import asyncio
 import json
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 from uuid import uuid4
 from collections import OrderedDict
 
@@ -32,14 +33,54 @@ from fastapi import FastAPI
 from prometheus_client import Counter, Histogram, generate_latest, CollectorRegistry, CONTENT_TYPE_LATEST
 from starlette.responses import Response
 
+from pydantic import BaseModel
+
 from contracts.py.models import FillEvent, ScoreEvent
 from .consensus import ConsensusDetector, Fill, ConsensusSignal
+from .episode import EpisodeTracker, EpisodeFill, Episode, EpisodeBuilderConfig
+from .atr import get_atr_provider, init_atr_provider, ATRProvider
+from .correlation import (
+    get_correlation_provider,
+    init_correlation_provider,
+    CorrelationProvider,
+    run_daily_correlation_job,
+)
+from .decision_logger import (
+    log_decision,
+    get_decisions,
+    get_decision,
+    get_decision_stats,
+    GateResult,
+)
+from .portfolio import (
+    get_portfolio_summary,
+    get_execution_config,
+    update_execution_config,
+    get_execution_logs,
+)
+
+
+class ExecutionConfigUpdate(BaseModel):
+    """Request body for updating execution config."""
+    enabled: Optional[bool] = None
+    hl_enabled: Optional[bool] = None
+    hl_address: Optional[str] = None
+    hl_max_leverage: Optional[int] = None
+    hl_max_position_pct: Optional[float] = None
+    hl_max_exposure_pct: Optional[float] = None
 
 SERVICE_NAME = "hl-decide"
 NATS_URL = os.getenv("NATS_URL", "nats://0.0.0.0:4222")
 DB_URL = os.getenv("DATABASE_URL", "postgresql://hlbot:hlbotpassword@0.0.0.0:5432/hlbot")
 MAX_SCORES = int(os.getenv("MAX_SCORES", "500"))
 MAX_FILLS = int(os.getenv("MAX_FILLS", "500"))
+
+# Daily reconciliation settings
+RECONCILE_INTERVAL_HOURS = int(os.getenv("RECONCILE_INTERVAL_HOURS", "6"))  # Run every 6 hours
+RECONCILE_ON_STARTUP = os.getenv("RECONCILE_ON_STARTUP", "true").lower() == "true"
+
+# Correlation refresh settings
+CORR_REFRESH_INTERVAL_HOURS = int(os.getenv("CORR_REFRESH_INTERVAL_HOURS", "24"))  # Daily by default
 
 # R-multiple calculation: assumed stop loss fraction (1% = 0.01)
 ASSUMED_STOP_FRACTION = float(os.getenv("ASSUMED_STOP_FRACTION", "0.01"))
@@ -50,12 +91,124 @@ NIG_PRIOR_KAPPA = 1.0
 NIG_PRIOR_ALPHA = 3.0
 NIG_PRIOR_BETA = 1.0
 
-app = FastAPI(title="hl-decide", version="0.3.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup/shutdown events."""
+    # Startup
+    try:
+        # Connect to database first
+        app.state.db = await asyncpg.create_pool(DB_URL)
+
+        # Ensure episode_fill_ids table exists for deduplication
+        async with app.state.db.acquire() as conn:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS episode_fill_ids (
+                    fill_id TEXT PRIMARY KEY,
+                    processed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                )
+                """
+            )
+        print("[hl-decide] episode_fill_ids table ready for deduplication")
+
+        # Initialize ATR provider for dynamic stop distances
+        app.state.atr_provider = init_atr_provider(app.state.db)
+        print("[hl-decide] ATR provider initialized")
+
+        # Initialize correlation provider and hydrate consensus detector
+        app.state.corr_provider = init_correlation_provider(app.state.db)
+        corr_count = await app.state.corr_provider.load()
+        if corr_count > 0:
+            hydrated = app.state.corr_provider.hydrate_detector(consensus_detector)
+            update_correlation_metrics(app.state.corr_provider)
+            print(f"[hl-decide] Loaded {corr_count} correlations, hydrated detector with {hydrated} pairs")
+        else:
+            # No correlations found - try to compute them on first startup
+            print("[hl-decide] No correlations found, computing initial correlations...")
+            try:
+                summary = await run_daily_correlation_job(app.state.db)
+                total_pairs = summary.get("btc_pairs", 0) + summary.get("eth_pairs", 0)
+                if total_pairs > 0:
+                    corr_count = await app.state.corr_provider.load()
+                    hydrated = app.state.corr_provider.hydrate_detector(consensus_detector)
+                    update_correlation_metrics(app.state.corr_provider)
+                    print(f"[hl-decide] Computed {total_pairs} correlations, hydrated detector with {hydrated} pairs")
+                else:
+                    print("[hl-decide] No correlations computed (insufficient data, using default ρ=0.3)")
+            except Exception as corr_error:
+                print(f"[hl-decide] Correlation computation failed (using default ρ=0.3): {corr_error}")
+
+        # Restore state from database
+        score_count, fill_count = await restore_state()
+        print(f"[hl-decide] Restored {score_count} scores and {fill_count} fills from database")
+
+        # Bootstrap episodes from historical fills (hl_events table)
+        # This processes fills that were loaded via backfill, not real-time NATS
+        bootstrap_count = await bootstrap_from_historical_fills()
+
+        # Count open positions
+        async with app.state.db.acquire() as conn:
+            open_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM position_signals WHERE status = 'open'"
+            )
+            print(f"[hl-decide] {open_count} open positions being tracked")
+
+        # Load initial ATR data for consensus detector
+        await update_atr_for_consensus()
+
+        # Connect to NATS
+        app.state.nc = await nats.connect(NATS_URL)
+        app.state.js = app.state.nc.jetstream()
+        await ensure_stream(app.state.js, "HL_D", ["d.signals.v1", "d.outcomes.v1"])
+        await app.state.nc.subscribe("b.scores.v1", cb=handle_score)
+        await app.state.nc.subscribe("c.fills.v1", cb=handle_fill)
+
+        # Start periodic background tasks
+        app.state.reconcile_task = asyncio.create_task(periodic_reconciliation_task())
+        app.state.corr_refresh_task = asyncio.create_task(periodic_correlation_refresh_task())
+        print(f"[hl-decide] Periodic reconciliation scheduled every {RECONCILE_INTERVAL_HOURS} hours")
+        print(f"[hl-decide] Correlation refresh scheduled every {CORR_REFRESH_INTERVAL_HOURS} hours")
+
+        print("[hl-decide] Started with position-based tracking, ATR stops, and correlation matrix")
+    except Exception as e:
+        print(f"[hl-decide] Fatal startup error: {e}")
+        raise
+
+    yield  # Application runs here
+
+    # Shutdown
+    # Cancel periodic background tasks
+    for task_name in ["reconcile_task", "corr_refresh_task"]:
+        if hasattr(app.state, task_name):
+            task = getattr(app.state, task_name)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    if hasattr(app.state, "nc"):
+        await app.state.nc.drain()
+    if hasattr(app.state, "db"):
+        await app.state.db.close()
+
+
+app = FastAPI(title="hl-decide", version="0.3.0", lifespan=lifespan)
 scores: OrderedDict[str, ScoreEvent] = OrderedDict()
 fills: OrderedDict[str, FillEvent] = OrderedDict()
 
 # Consensus detector for Alpha Pool signal generation
 consensus_detector = ConsensusDetector()
+
+# Episode tracker for position lifecycle management
+episode_config = EpisodeBuilderConfig(
+    default_stop_fraction=ASSUMED_STOP_FRACTION,
+    r_min=-2.0,
+    r_max=2.0,
+    timeout_hours=168.0,
+)
+episode_tracker = EpisodeTracker(config=episode_config)
 
 registry = CollectorRegistry()
 position_open_counter = Counter("decide_positions_opened_total", "Positions opened", registry=registry)
@@ -68,6 +221,241 @@ position_pnl_histogram = Histogram(
     registry=registry,
     buckets=(-2, -1, -0.5, 0, 0.5, 1, 2, 5),
 )
+
+# Data quality observability metrics
+from prometheus_client import Gauge
+
+# ATR metrics - track staleness and fallback usage
+atr_stale_counter = Counter(
+    "decide_atr_stale_total",
+    "Times ATR data was stale",
+    labelnames=["asset"],
+    registry=registry,
+)
+atr_fallback_counter = Counter(
+    "decide_atr_fallback_total",
+    "Times ATR used fallback (hardcoded or realized_vol)",
+    labelnames=["asset", "source"],
+    registry=registry,
+)
+atr_age_gauge = Gauge(
+    "decide_atr_age_seconds",
+    "Current age of ATR data in seconds",
+    labelnames=["asset"],
+    registry=registry,
+)
+atr_blocked_counter = Counter(
+    "decide_atr_blocked_total",
+    "Times gating was blocked due to stale ATR (strict mode)",
+    labelnames=["asset"],
+    registry=registry,
+)
+
+# Correlation metrics - track staleness and default usage
+corr_stale_gauge = Gauge(
+    "decide_correlation_stale",
+    "Whether correlation data is stale (1=stale, 0=fresh)",
+    registry=registry,
+)
+corr_age_gauge = Gauge(
+    "decide_correlation_age_days",
+    "Age of correlation data in days",
+    registry=registry,
+)
+corr_decay_gauge = Gauge(
+    "decide_correlation_decay_factor",
+    "Current decay factor applied to correlations (1=no decay, 0=full decay)",
+    registry=registry,
+)
+corr_default_used_counter = Counter(
+    "decide_correlation_default_used_total",
+    "Times default correlation was used (no stored data)",
+    registry=registry,
+)
+corr_pairs_loaded_gauge = Gauge(
+    "decide_correlation_pairs_loaded",
+    "Number of correlation pairs currently loaded",
+    registry=registry,
+)
+corr_coverage_gauge = Gauge(
+    "decide_correlation_coverage_pct",
+    "Percentage of pool trader pairs with actual correlation data (0-100)",
+    registry=registry,
+)
+corr_pool_size_gauge = Gauge(
+    "decide_correlation_pool_size",
+    "Number of traders in the correlation pool",
+    registry=registry,
+)
+
+# Effective-K metrics - track when default ρ is used
+effk_default_fallback_counter = Counter(
+    "decide_effk_default_fallback_total",
+    "Times effK calculation used default ρ for a pair",
+    registry=registry,
+)
+effk_value_histogram = Histogram(
+    "decide_effk_value",
+    "Effective-K values in consensus checks",
+    registry=registry,
+    buckets=(1, 2, 3, 5, 7, 10, 15, 20, 50),
+)
+
+# Weight distribution metrics
+weight_histogram = Histogram(
+    "decide_vote_weight",
+    "Vote weight values in consensus",
+    registry=registry,
+    buckets=(0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9, 1.0),
+)
+weight_max_gauge = Gauge(
+    "decide_vote_weight_max",
+    "Maximum vote weight in recent consensus check",
+    registry=registry,
+)
+weight_gini_gauge = Gauge(
+    "decide_vote_weight_gini",
+    "Gini coefficient of vote weights (0=equal, 1=concentrated)",
+    registry=registry,
+)
+weight_saturation_counter = Counter(
+    "decide_vote_weight_saturated_total",
+    "Votes where weight hit the cap (saturation)",
+    labelnames=["asset"],
+    registry=registry,
+)
+weight_saturation_pct_gauge = Gauge(
+    "decide_vote_weight_saturation_pct",
+    "Percentage of weights at or near cap in recent consensus check",
+    registry=registry,
+)
+
+# Risk limit metrics
+signal_risk_rejected_counter = Counter(
+    "decide_signal_risk_rejected_total",
+    "Signals rejected by risk limits",
+    labelnames=["reason"],
+    registry=registry,
+)
+signal_generated_counter = Counter(
+    "decide_signal_generated_total",
+    "Signals that passed all gates including risk limits",
+    labelnames=["symbol", "direction"],
+    registry=registry,
+)
+
+
+def calculate_gini(weights: list[float]) -> float:
+    """
+    Calculate Gini coefficient for a list of weights.
+
+    Gini = 0 means perfect equality (all weights equal)
+    Gini = 1 means perfect inequality (one weight = 1, rest = 0)
+
+    Args:
+        weights: List of weight values
+
+    Returns:
+        Gini coefficient between 0 and 1
+    """
+    if not weights or len(weights) < 2:
+        return 0.0
+
+    sorted_weights = sorted(weights)
+    n = len(sorted_weights)
+    total = sum(sorted_weights)
+
+    if total == 0:
+        return 0.0
+
+    # Calculate using the formula: G = (2 * sum(i * x_i) - (n + 1) * sum(x_i)) / (n * sum(x_i))
+    cumulative = sum((i + 1) * w for i, w in enumerate(sorted_weights))
+    gini = (2 * cumulative - (n + 1) * total) / (n * total)
+
+    return max(0.0, min(1.0, gini))
+
+
+def update_weight_metrics(weights: list[float], asset: str = "unknown") -> None:
+    """
+    Update weight distribution metrics from a consensus check.
+
+    Args:
+        weights: List of vote weights from consensus check
+        asset: Asset symbol for saturation tracking (BTC/ETH)
+    """
+    if not weights:
+        return
+
+    # Import weight cap from consensus module
+    from .consensus import VOTE_WEIGHT_MAX
+
+    # Record each weight in histogram
+    for w in weights:
+        weight_histogram.observe(w)
+
+    # Update max weight gauge
+    weight_max_gauge.set(max(weights))
+
+    # Update Gini coefficient gauge
+    gini = calculate_gini(weights)
+    weight_gini_gauge.set(gini)
+
+    # Track saturation (weights at or near cap)
+    # Consider "near cap" as >= 95% of max weight
+    saturation_threshold = VOTE_WEIGHT_MAX * 0.95
+    saturated_count = sum(1 for w in weights if w >= saturation_threshold)
+
+    if saturated_count > 0:
+        weight_saturation_counter.labels(asset=asset).inc(saturated_count)
+
+    saturation_pct = (saturated_count / len(weights)) * 100 if weights else 0
+    weight_saturation_pct_gauge.set(saturation_pct)
+
+
+def update_correlation_metrics(provider, pool_addresses: list[str] | None = None) -> None:
+    """
+    Update correlation observability metrics from the provider.
+
+    Args:
+        provider: CorrelationProvider instance
+        pool_addresses: Optional list of addresses in the current pool (for coverage calc)
+    """
+    # Update staleness gauge
+    corr_stale_gauge.set(1.0 if provider.is_stale else 0.0)
+
+    # Update age gauge
+    age = provider.age_days if provider._loaded_date else -1
+    if age != float('inf'):
+        corr_age_gauge.set(age)
+
+    # Update decay factor
+    corr_decay_gauge.set(provider._decay_factor())
+
+    # Update pairs loaded
+    corr_pairs_loaded_gauge.set(len(provider.correlations))
+
+    # Calculate coverage if pool addresses provided
+    if pool_addresses:
+        corr_pool_size_gauge.set(len(pool_addresses))
+
+        # Count how many pairs have actual correlation data
+        n = len(pool_addresses)
+        total_pairs = n * (n - 1) // 2  # n choose 2
+
+        if total_pairs > 0:
+            pairs_with_data = 0
+            addrs_lower = [a.lower() for a in pool_addresses]
+            for i, a in enumerate(addrs_lower):
+                for j in range(i + 1, len(addrs_lower)):
+                    b = addrs_lower[j]
+                    key = tuple(sorted([a, b]))
+                    if key in provider.correlations:
+                        pairs_with_data += 1
+
+            coverage_pct = (pairs_with_data / total_pairs) * 100
+            corr_coverage_gauge.set(coverage_pct)
+        else:
+            corr_coverage_gauge.set(0.0)
 
 
 async def ensure_stream(js, name: str, subjects):
@@ -348,6 +736,238 @@ async def handle_fill_for_positions(fill: FillEvent) -> None:
         print(f"[hl-decide] Error handling fill for positions: {e}")
 
 
+async def handle_fill_via_episodes(fill: Union[FillEvent, EpisodeFill]) -> Optional[Episode]:
+    """
+    Process a fill through the episode tracker for proper position lifecycle management.
+
+    This is the new episode-based approach that:
+    1. Tracks ALL fills (not just Open New / Close All)
+    2. Builds complete position episodes with VWAP entry/exit
+    3. Calculates R-multiples when positions close
+    4. Updates NIG posteriors from episode outcomes
+
+    Accepts both FillEvent (from real-time NATS) and EpisodeFill (from reconciliation).
+
+    Args:
+        fill: The incoming fill event (FillEvent or EpisodeFill)
+
+    Returns:
+        Closed Episode if position closed, None otherwise
+    """
+    try:
+        # Convert to EpisodeFill if needed
+        if isinstance(fill, EpisodeFill):
+            episode_fill = fill
+        else:
+            episode_fill = EpisodeFill(
+                fill_id=fill.fill_id,
+                address=fill.address,
+                asset=fill.asset,
+                side=fill.side,
+                size=float(fill.size or 0),
+                price=float(fill.price) if hasattr(fill, 'price') and fill.price else 0.0,
+                ts=fill.ts if isinstance(fill.ts, datetime) else datetime.fromisoformat(str(fill.ts).replace('Z', '+00:00')),
+                realized_pnl=float(fill.realized_pnl) if fill.realized_pnl else None,
+                fees=0.0,  # Could extract from meta if available
+            )
+
+        # Track this fill to prevent double processing during reconciliation
+        # This is important for deduplication when real-time and reconciliation overlap
+        async with app.state.db.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO episode_fill_ids (fill_id) VALUES ($1) ON CONFLICT DO NOTHING
+                """,
+                episode_fill.fill_id,
+            )
+
+        # Process through episode tracker
+        closed_episode = episode_tracker.process_fill(episode_fill)
+
+        if closed_episode:
+            # Episode closed - persist and update NIG
+            await persist_closed_episode(closed_episode)
+            return closed_episode
+
+        # Check if we just opened a new episode
+        open_episode = episode_tracker.get_open_episode(episode_fill.address, episode_fill.asset)
+        if open_episode and len(open_episode.entry_fills) == 1:
+            # New position opened
+            await persist_open_episode(open_episode)
+            position_open_counter.inc()
+            print(f"[hl-decide] Episode opened: {episode_fill.address[:10]}... {open_episode.direction} {episode_fill.asset}")
+
+        return None
+
+    except Exception as e:
+        print(f"[hl-decide] Error handling fill via episodes: {e}")
+        return None
+
+
+async def persist_open_episode(episode: Episode) -> None:
+    """Persist a newly opened episode to the database."""
+    try:
+        async with app.state.db.acquire() as conn:
+            signal_id = str(uuid4())
+
+            # Insert position signal
+            await conn.execute(
+                """
+                INSERT INTO position_signals (
+                    id, address, asset, direction,
+                    entry_fill_id, entry_price, entry_size, entry_ts,
+                    entry_px_vwap, stop_bps_used, entry_notional_usd, risk_usd,
+                    entry_fill_count, status
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'open')
+                ON CONFLICT (entry_fill_id) DO NOTHING
+                """,
+                signal_id,
+                episode.address,
+                episode.asset,
+                episode.direction,
+                episode.entry_fills[0].fill_id if episode.entry_fills else '',
+                episode.entry_vwap,
+                episode.entry_size,
+                episode.entry_ts,
+                episode.entry_vwap,
+                episode.stop_bps,
+                episode.entry_notional,
+                episode.risk_amount,
+                len(episode.entry_fills),
+            )
+
+            # Insert all entry fills
+            for fill in episode.entry_fills:
+                await conn.execute(
+                    """
+                    INSERT INTO episode_fills (episode_id, fill_id, fill_type, side, size, price, ts, fees)
+                    VALUES ($1, $2, 'entry', $3, $4, $5, $6, $7)
+                    ON CONFLICT (episode_id, fill_id) DO NOTHING
+                    """,
+                    signal_id,
+                    fill.fill_id,
+                    fill.side,
+                    fill.size,
+                    fill.price,
+                    fill.ts,
+                    fill.fees,
+                )
+
+            # Update positions_opened count
+            await conn.execute(
+                """
+                INSERT INTO trader_performance (address, positions_opened)
+                VALUES ($1, 1)
+                ON CONFLICT (address) DO UPDATE SET
+                    positions_opened = trader_performance.positions_opened + 1,
+                    updated_at = NOW()
+                """,
+                episode.address,
+            )
+
+    except Exception as e:
+        print(f"[hl-decide] Failed to persist open episode: {e}")
+
+
+async def persist_closed_episode(episode: Episode) -> None:
+    """
+    Persist a closed episode and update trader NIG posteriors.
+
+    This is where the R-multiple from the episode flows into the
+    Bayesian learning system.
+    """
+    try:
+        async with app.state.db.acquire() as conn:
+            # Find the open position signal to update
+            open_signal = await conn.fetchrow(
+                """
+                SELECT id FROM position_signals
+                WHERE address = $1 AND asset = $2 AND direction = $3 AND status = 'open'
+                ORDER BY entry_ts DESC
+                LIMIT 1
+                """,
+                episode.address,
+                episode.asset,
+                episode.direction,
+            )
+
+            if not open_signal:
+                print(f"[hl-decide] No open signal found for closed episode {episode.id}")
+                return
+
+            signal_id = open_signal['id']
+
+            # Calculate hold time
+            hold_secs = None
+            if episode.entry_ts and episode.exit_ts:
+                hold_secs = int((episode.exit_ts - episode.entry_ts).total_seconds())
+
+            # Update the position signal with exit info
+            await conn.execute(
+                """
+                UPDATE position_signals SET
+                    exit_fill_id = $1,
+                    exit_price = $2,
+                    exit_ts = $3,
+                    exit_px_vwap = $4,
+                    realized_pnl = $5,
+                    realized_pnl_usd = $5,
+                    result_r = $6,
+                    r_clamped = $6,
+                    r_unclamped = $7,
+                    hold_secs = $8,
+                    exit_fill_count = $9,
+                    status = 'closed',
+                    closed_reason = $10,
+                    updated_at = NOW()
+                WHERE id = $11
+                """,
+                episode.exit_fills[-1].fill_id if episode.exit_fills else None,
+                episode.exit_vwap,
+                episode.exit_ts,
+                episode.exit_vwap,
+                episode.realized_pnl,
+                episode.result_r,
+                episode.result_r_unclamped,
+                hold_secs,
+                len(episode.exit_fills),
+                episode.closed_reason,
+                signal_id,
+            )
+
+            # Insert all exit fills
+            for fill in episode.exit_fills:
+                await conn.execute(
+                    """
+                    INSERT INTO episode_fills (episode_id, fill_id, fill_type, side, size, price, ts, realized_pnl, fees)
+                    VALUES ($1, $2, 'exit', $3, $4, $5, $6, $7, $8)
+                    ON CONFLICT (episode_id, fill_id) DO NOTHING
+                    """,
+                    signal_id,
+                    fill.fill_id,
+                    fill.side,
+                    fill.size,
+                    fill.price,
+                    fill.ts,
+                    fill.realized_pnl,
+                    fill.fees,
+                )
+
+            # Update NIG posterior with episode R-multiple
+            if episode.result_r is not None:
+                await update_trader_performance(conn, episode.address, episode.result_r)
+                position_close_counter.inc()
+                position_pnl_histogram.observe(episode.result_r)
+
+                print(f"[hl-decide] Episode closed: {episode.address[:10]}... {episode.direction} {episode.asset} "
+                      f"R={episode.result_r:.2f} (unclamped={episode.result_r_unclamped:.2f}) "
+                      f"hold={hold_secs}s")
+
+    except Exception as e:
+        print(f"[hl-decide] Failed to persist closed episode: {e}")
+
+
 async def persist_score(address: str, score: ScoreEvent) -> None:
     """Persist score to database for recovery."""
     try:
@@ -406,6 +1026,51 @@ async def persist_fill(address: str, fill: FillEvent) -> None:
             )
     except Exception as e:
         print(f"[hl-decide] Failed to persist fill for {address}: {e}")
+
+
+async def update_atr_for_consensus() -> None:
+    """
+    Update ATR-based stop fractions for consensus detection.
+
+    Called on startup and periodically to refresh volatility data.
+    Updates both the consensus detector and episode tracker with
+    current ATR-based stop distances.
+    """
+    try:
+        atr_provider = get_atr_provider()
+
+        for symbol in ["BTC", "ETH"]:
+            atr_data = await atr_provider.get_atr(symbol)
+            stop_fraction = atr_provider.get_stop_fraction(atr_data)
+
+            # Update ATR observability metrics
+            atr_age_gauge.labels(asset=symbol).set(atr_data.age_seconds)
+
+            if atr_data.is_stale:
+                atr_stale_counter.labels(asset=symbol).inc()
+
+            if atr_data.source in ("fallback_hardcoded", "realized_vol"):
+                atr_fallback_counter.labels(asset=symbol, source=atr_data.source).inc()
+
+            # Check if gating should be blocked (strict mode)
+            should_block, block_reason = atr_provider.should_block_gate(atr_data)
+            if should_block:
+                atr_blocked_counter.labels(asset=symbol).inc()
+                print(f"[hl-decide] ATR BLOCKED for {symbol}: {block_reason}")
+
+            # Update consensus detector
+            consensus_detector.set_stop_fraction(symbol, stop_fraction)
+
+            # Update episode tracker config
+            # Note: Episode tracker uses a shared config, so update default_stop_fraction
+            # This affects new episodes; existing ones keep their original stop
+            episode_config.default_stop_fraction = stop_fraction
+
+            print(f"[hl-decide] {symbol} ATR stop: {stop_fraction*100:.2f}% (source: {atr_data.source}, age: {atr_data.age_seconds:.0f}s)")
+
+    except Exception as e:
+        print(f"[hl-decide] Failed to update ATR for consensus: {e}")
+        # Keep using default 1% stops on error
 
 
 async def restore_state() -> tuple[int, int]:
@@ -469,6 +1134,231 @@ async def restore_state() -> tuple[int, int]:
     return score_count, fill_count
 
 
+async def reconcile_historical_fills(force: bool = False) -> dict:
+    """
+    Reconcile episodes from historical fills in hl_events table.
+    This processes fills that were loaded via backfill or missed during downtime.
+
+    Safe to run multiple times - uses episode_fill_ids table to prevent double-booking.
+
+    Args:
+        force: If True, reprocess all fills even if already processed
+
+    Returns:
+        dict with counts: {"found": N, "new": N, "skipped": N, "errors": N}
+    """
+    result = {"found": 0, "new": 0, "skipped": 0, "errors": 0}
+    try:
+        async with app.state.db.acquire() as conn:
+            # Ensure tracking table exists for processed fill IDs
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS episode_fill_ids (
+                    fill_id TEXT PRIMARY KEY,
+                    processed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                )
+                """
+            )
+
+            # Get historical fills from hl_events (trades from backfill)
+            # Filter to Alpha Pool addresses and BTC/ETH only
+            # Exclude already processed fill IDs unless force=True
+            if force:
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        e.address,
+                        e.payload->>'symbol' as asset,
+                        e.payload->>'action' as action,
+                        e.payload->>'size' as size,
+                        e.payload->>'priceUsd' as price,
+                        e.payload->>'fee' as fee,
+                        e.payload->>'at' as ts,
+                        e.payload->>'hash' as hash
+                    FROM hl_events e
+                    INNER JOIN alpha_pool_addresses a ON lower(e.address) = lower(a.address)
+                    WHERE e.type = 'trade'
+                      AND e.payload->>'symbol' IN ('BTC', 'ETH')
+                      AND e.payload->>'at' IS NOT NULL
+                    ORDER BY (e.payload->>'at')::timestamp ASC
+                    LIMIT 10000
+                    """
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        e.address,
+                        e.payload->>'symbol' as asset,
+                        e.payload->>'action' as action,
+                        e.payload->>'size' as size,
+                        e.payload->>'priceUsd' as price,
+                        e.payload->>'fee' as fee,
+                        e.payload->>'at' as ts,
+                        e.payload->>'hash' as hash
+                    FROM hl_events e
+                    INNER JOIN alpha_pool_addresses a ON lower(e.address) = lower(a.address)
+                    LEFT JOIN episode_fill_ids efi ON e.payload->>'hash' = efi.fill_id
+                    WHERE e.type = 'trade'
+                      AND e.payload->>'symbol' IN ('BTC', 'ETH')
+                      AND e.payload->>'at' IS NOT NULL
+                      AND efi.fill_id IS NULL
+                    ORDER BY (e.payload->>'at')::timestamp ASC
+                    LIMIT 10000
+                    """
+                )
+
+            result["found"] = len(rows)
+            print(f"[hl-decide] Reconciliation found {len(rows)} fills to process")
+
+            for row in rows:
+                try:
+                    fill_id = row["hash"]
+                    if not fill_id:
+                        result["skipped"] += 1
+                        continue
+
+                    # Parse action to determine side
+                    action = row["action"] or ""
+                    action_lower = action.lower()
+
+                    # Determine side from action
+                    if "long" in action_lower:
+                        if "close" in action_lower:
+                            side = "sell"  # Closing long = sell
+                        else:
+                            side = "buy"  # Open/Increase long = buy
+                    elif "short" in action_lower:
+                        if "close" in action_lower:
+                            side = "buy"  # Closing short = buy
+                        else:
+                            side = "sell"  # Open/Increase short = sell
+                    else:
+                        result["skipped"] += 1
+                        continue  # Skip if we can't determine side
+
+                    # Parse timestamp
+                    ts_str = row["ts"]
+                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+
+                    # Create episode fill
+                    fill = EpisodeFill(
+                        fill_id=fill_id,
+                        address=row["address"].lower(),
+                        asset=row["asset"],
+                        side=side,
+                        size=abs(float(row["size"] or 0)),
+                        price=float(row["price"] or 0),
+                        ts=ts,
+                        fees=float(row["fee"] or 0),
+                    )
+
+                    # Process through episode tracker (this updates NIG on close)
+                    episode = await handle_fill_via_episodes(fill)
+
+                    # Mark fill as processed to prevent double-booking
+                    await conn.execute(
+                        "INSERT INTO episode_fill_ids (fill_id) VALUES ($1) ON CONFLICT DO NOTHING",
+                        fill_id,
+                    )
+
+                    result["new"] += 1
+                except Exception as fill_err:
+                    result["errors"] += 1
+                    continue
+
+        print(f"[hl-decide] Reconciliation complete: {result}")
+
+    except Exception as e:
+        print(f"[hl-decide] Reconciliation failed: {e}")
+        result["errors"] += 1
+
+    return result
+
+
+# Alias for backward compatibility
+async def bootstrap_from_historical_fills() -> int:
+    """Bootstrap episodes from historical fills. Alias for reconcile_historical_fills."""
+    result = await reconcile_historical_fills(force=False)
+    return result.get("new", 0)
+
+
+async def periodic_reconciliation_task():
+    """
+    Background task that periodically reconciles historical fills.
+
+    This catches any fills that were missed due to:
+    - Service downtime
+    - Hyperliquid API rate limits during real-time processing
+    - Network issues
+
+    Runs every RECONCILE_INTERVAL_HOURS (default 6 hours).
+    """
+    interval_seconds = RECONCILE_INTERVAL_HOURS * 3600
+
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+
+            print(f"[hl-decide] Starting periodic reconciliation (every {RECONCILE_INTERVAL_HOURS}h)...")
+            result = await reconcile_historical_fills(force=False)
+
+            if result["new"] > 0:
+                print(f"[hl-decide] Periodic reconciliation: found {result['new']} new fills to process")
+            else:
+                print(f"[hl-decide] Periodic reconciliation: no new fills found")
+
+        except asyncio.CancelledError:
+            print("[hl-decide] Periodic reconciliation task cancelled")
+            break
+        except Exception as e:
+            print(f"[hl-decide] Periodic reconciliation error: {e}")
+            # Continue running despite errors
+            await asyncio.sleep(60)  # Wait 1 minute before retrying
+
+
+async def periodic_correlation_refresh_task():
+    """
+    Background task that periodically refreshes trader correlations.
+
+    Runs daily (configurable via CORR_REFRESH_INTERVAL_HOURS) to keep
+    the correlation matrix up-to-date with recent trading patterns.
+
+    The correlation decay mechanism ensures stale data is gradually
+    blended toward the default ρ=0.3, but refreshing keeps data fresh.
+    """
+    interval_seconds = CORR_REFRESH_INTERVAL_HOURS * 3600
+
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+
+            print(f"[hl-decide] Starting correlation refresh (every {CORR_REFRESH_INTERVAL_HOURS}h)...")
+            summary = await run_daily_correlation_job(app.state.db)
+            total_pairs = summary.get("btc_pairs", 0) + summary.get("eth_pairs", 0)
+
+            if total_pairs > 0:
+                # Reload and hydrate detector with fresh correlations
+                corr_provider = get_correlation_provider()
+                await corr_provider.load()
+                hydrated = corr_provider.hydrate_detector(consensus_detector)
+
+                # Update correlation observability metrics
+                update_correlation_metrics(corr_provider)
+
+                print(f"[hl-decide] Correlation refresh: computed {total_pairs} pairs, hydrated {hydrated}")
+            else:
+                print("[hl-decide] Correlation refresh: no pairs computed (insufficient data)")
+
+        except asyncio.CancelledError:
+            print("[hl-decide] Correlation refresh task cancelled")
+            break
+        except Exception as e:
+            print(f"[hl-decide] Correlation refresh error: {e}")
+            # Continue running despite errors
+            await asyncio.sleep(300)  # Wait 5 minutes before retrying
+
+
 def enforce_limits():
     """Enforce memory limits on scores and fills using LRU eviction."""
     while len(scores) > MAX_SCORES:
@@ -492,8 +1382,8 @@ async def handle_fill(msg):
     Handle incoming fill events from hl-stream.
 
     Processes fills for:
-    1. Position tracking (open/close detection for R-multiple calculation)
-    2. Consensus detection (Alpha Pool signal generation)
+    1. Episode tracking (position lifecycle with VWAP and R-multiple calculation)
+    2. Consensus detection (episode-based votes for Alpha Pool signals)
     """
     data = FillEvent.model_validate_json(msg.data.decode())
 
@@ -505,19 +1395,436 @@ async def handle_fill(msg):
     enforce_limits()
     fill_counter.inc()
 
-    # Process for position tracking (this is where the magic happens)
-    await handle_fill_for_positions(data)
+    # Process for episode tracking (new approach - tracks ALL fills)
+    closed_episode = await handle_fill_via_episodes(data)
 
-    # Process for consensus detection
-    await process_fill_for_consensus(data)
+    # Process for consensus detection using episode-based votes
+    await process_fill_for_consensus_via_episodes(data, closed_episode)
+
+
+async def process_fill_for_consensus_via_episodes(data: FillEvent, closed_episode: Optional[Episode]) -> None:
+    """
+    Process a fill for consensus detection using episode-based votes.
+
+    Key innovation: One vote per trader derived from their current episode state,
+    not from individual fills. This means:
+    - A trader with an open position = 1 vote in that direction
+    - Multiple fills to the same position = still 1 vote
+    - Position close = vote removed
+
+    Args:
+        data: FillEvent from hl-stream
+        closed_episode: Episode that just closed (if any), for NIG update
+    """
+    try:
+        # Update current price in detector
+        price = float(data.price) if hasattr(data, 'price') and data.price else 0.0
+        if price > 0:
+            consensus_detector.set_current_price(data.asset, price)
+
+        # Get all current open episodes for this asset
+        open_episodes = [
+            ep for ep in episode_tracker.get_all_open_episodes()
+            if ep.asset.upper() == data.asset.upper()
+        ]
+
+        # Convert episodes to consensus fills (one per trader)
+        # This is the key change: we derive votes from episodes, not raw fills
+        episode_fills = []
+        for ep in open_episodes:
+            episode_fill = Fill(
+                fill_id=f"episode-{ep.id}",
+                address=ep.address,
+                asset=ep.asset,
+                side='buy' if ep.direction == 'long' else 'sell',
+                size=ep.entry_size,
+                price=ep.entry_vwap,
+                ts=ep.entry_ts or datetime.now(timezone.utc),
+            )
+            episode_fills.append(episode_fill)
+
+        # Check for consensus based on episode positions
+        if len(episode_fills) >= 3:  # Minimum traders for consensus
+            signal = await check_episode_consensus(data.asset, episode_fills)
+            if signal:
+                await handle_consensus_signal(signal)
+
+    except Exception as e:
+        print(f"[hl-decide] Episode consensus processing error: {e}")
+
+
+async def check_episode_consensus(asset: str, episode_fills: list) -> Optional[ConsensusSignal]:
+    """
+    Check for consensus among episode-based votes.
+
+    This replaces the fill-by-fill consensus checking with episode-based checking.
+    Each episode represents one trader's current position = one vote.
+
+    Uses centralized functions from consensus.py to avoid logic drift:
+    - calculate_vote_weight() for vote weighting (log/equity modes)
+    - ConsensusDetector.passes_latency_and_price_gates() for ATR-based R-unit drift check
+
+    Now logs all decisions (signal, skip, risk_reject) for auditability.
+
+    Args:
+        asset: The asset to check consensus for
+        episode_fills: List of Fill objects derived from open episodes
+
+    Returns:
+        ConsensusSignal if consensus detected, None otherwise
+    """
+    from .consensus import (
+        passes_consensus_gates, calculate_ev, calculate_vote_weight,
+        ConsensusWindow, Vote,
+        CONSENSUS_MIN_TRADERS, CONSENSUS_MIN_AGREEING, CONSENSUS_MIN_PCT,
+        CONSENSUS_MIN_EFFECTIVE_K, CONSENSUS_EV_MIN_R, CONSENSUS_BASE_WINDOW_S,
+        CONSENSUS_MAX_STALENESS_FACTOR, CONSENSUS_MAX_PRICE_DRIFT_R,
+    )
+    import statistics
+
+    # Track gate results for decision logging
+    gate_results: list[GateResult] = []
+
+    # Gate 0: Minimum traders check
+    min_traders_passed = len(episode_fills) >= CONSENSUS_MIN_TRADERS
+    gate_results.append(GateResult(
+        name="min_traders",
+        passed=min_traders_passed,
+        value=float(len(episode_fills)),
+        threshold=float(CONSENSUS_MIN_TRADERS),
+    ))
+
+    if not min_traders_passed:
+        # Not enough traders - log skip decision
+        await log_decision(
+            db=app.state.db,
+            symbol=asset,
+            direction="none",
+            decision_type="skip",
+            trader_count=len(episode_fills),
+            agreement_pct=0.0,
+            effective_k=0.0,
+            gates=gate_results,
+            price=consensus_detector.get_current_mid(asset),
+        )
+        return None
+
+    # One vote per trader (already deduplicated by episode)
+    # Use centralized calculate_vote_weight() for proper log/equity weighting
+    votes: list[Vote] = []
+    for fill in episode_fills:
+        direction = 'long' if fill.side.lower() in ('buy', 'long') else 'short'
+        notional = fill.size * fill.price
+
+        # Use centralized weight calculation (respects VOTE_WEIGHT_MODE: log/equity/linear)
+        weight = calculate_vote_weight(notional, equity=None)
+
+        votes.append(Vote(
+            address=fill.address.lower(),
+            direction=direction,
+            weight=weight,
+            price=fill.price,
+            ts=fill.ts,
+            notional=notional,
+            equity=None,
+        ))
+
+    directions = [v.direction for v in votes]
+
+    # Calculate agreement for logging
+    long_count = sum(1 for d in directions if d == "long")
+    short_count = len(directions) - long_count
+    majority_count = max(long_count, short_count)
+    agreement_pct = majority_count / len(directions) if directions else 0.0
+    majority_dir = "long" if long_count >= short_count else "short"
+
+    # Gate 1: Dispersion (supermajority)
+    passes, _ = passes_consensus_gates(
+        directions,
+        min_agreeing=CONSENSUS_MIN_AGREEING,
+        min_pct=CONSENSUS_MIN_PCT,
+    )
+    gate_results.append(GateResult(
+        name="supermajority",
+        passed=passes,
+        value=agreement_pct,
+        threshold=CONSENSUS_MIN_PCT,
+    ))
+
+    if not passes:
+        await log_decision(
+            db=app.state.db,
+            symbol=asset,
+            direction=majority_dir,
+            decision_type="skip",
+            trader_count=len(votes),
+            agreement_pct=agreement_pct,
+            effective_k=0.0,
+            gates=gate_results,
+            price=consensus_detector.get_current_mid(asset),
+        )
+        return None
+
+    # Get agreeing votes
+    agreeing_votes = [v for v in votes if v.direction == majority_dir]
+
+    # Gate 2: Effective-K (correlation-adjusted)
+    weights = {v.address: v.weight for v in agreeing_votes}
+    eff_k = consensus_detector.eff_k_from_corr(
+        weights,
+        fallback_counter_callback=lambda: effk_default_fallback_counter.inc(),
+    )
+
+    # Record effK and weight metrics for observability
+    effk_value_histogram.observe(eff_k)
+    update_weight_metrics(list(weights.values()), asset=asset)
+
+    effk_passed = eff_k >= CONSENSUS_MIN_EFFECTIVE_K
+    gate_results.append(GateResult(
+        name="effective_k",
+        passed=effk_passed,
+        value=eff_k,
+        threshold=CONSENSUS_MIN_EFFECTIVE_K,
+    ))
+
+    if not effk_passed:
+        await log_decision(
+            db=app.state.db,
+            symbol=asset,
+            direction=majority_dir,
+            decision_type="skip",
+            trader_count=len(votes),
+            agreement_pct=agreement_pct,
+            effective_k=eff_k,
+            gates=gate_results,
+            price=consensus_detector.get_current_mid(asset),
+        )
+        return None
+
+    # Calculate entry price (median of agreeing voters)
+    median_entry = statistics.median(v.price for v in agreeing_votes)
+    mid_price = consensus_detector.get_current_mid(asset)
+
+    # Stop price using ATR-based dynamic stop (or fallback to 1%)
+    stop_fraction = consensus_detector.get_stop_fraction(asset)
+    stop_distance = median_entry * stop_fraction
+    if majority_dir == 'long':
+        stop_price = median_entry - stop_distance
+    else:
+        stop_price = median_entry + stop_distance
+
+    # Gate 3a: ATR validity check
+    is_atr_valid, atr_reason = consensus_detector.is_atr_valid_for_gating(asset)
+    gate_results.append(GateResult(
+        name="atr_validity",
+        passed=is_atr_valid,
+        value=1.0 if is_atr_valid else 0.0,
+        threshold=1.0,
+        detail=atr_reason,
+    ))
+
+    if not is_atr_valid:
+        await log_decision(
+            db=app.state.db,
+            symbol=asset,
+            direction=majority_dir,
+            decision_type="skip",
+            trader_count=len(votes),
+            agreement_pct=agreement_pct,
+            effective_k=eff_k,
+            gates=gate_results,
+            price=mid_price,
+        )
+        return None
+
+    # Gate 3b: Latency check
+    oldest_ts = min(v.ts for v in agreeing_votes)
+    now = datetime.now(timezone.utc)
+    staleness_s = (now - oldest_ts).total_seconds()
+    max_staleness = CONSENSUS_BASE_WINDOW_S * CONSENSUS_MAX_STALENESS_FACTOR
+    latency_passed = staleness_s <= max_staleness
+
+    gate_results.append(GateResult(
+        name="freshness",
+        passed=latency_passed,
+        value=staleness_s,
+        threshold=max_staleness,
+    ))
+
+    if not latency_passed:
+        await log_decision(
+            db=app.state.db,
+            symbol=asset,
+            direction=majority_dir,
+            decision_type="skip",
+            trader_count=len(votes),
+            agreement_pct=agreement_pct,
+            effective_k=eff_k,
+            gates=gate_results,
+            price=mid_price,
+        )
+        return None
+
+    # Gate 3c: Price band check (ATR-based R-units)
+    if median_entry > 0 and mid_price > 0:
+        bps_deviation = abs(mid_price - median_entry) / median_entry * 10000
+        stop_bps = stop_fraction * 10000
+        deviation_r = bps_deviation / stop_bps if stop_bps > 0 else 0
+        price_band_passed = deviation_r <= CONSENSUS_MAX_PRICE_DRIFT_R
+    else:
+        deviation_r = 0
+        price_band_passed = False
+
+    gate_results.append(GateResult(
+        name="price_band",
+        passed=price_band_passed,
+        value=deviation_r,
+        threshold=CONSENSUS_MAX_PRICE_DRIFT_R,
+    ))
+
+    if not price_band_passed:
+        await log_decision(
+            db=app.state.db,
+            symbol=asset,
+            direction=majority_dir,
+            decision_type="skip",
+            trader_count=len(votes),
+            agreement_pct=agreement_pct,
+            effective_k=eff_k,
+            gates=gate_results,
+            price=mid_price,
+        )
+        return None
+
+    # Gate 4: EV after costs
+    p_win = consensus_detector.calibrated_p_win(agreeing_votes, eff_k)
+    ev_result = calculate_ev(
+        p_win=p_win,
+        entry_px=median_entry,
+        stop_px=stop_price,
+    )
+
+    ev_passed = ev_result["ev_net_r"] >= CONSENSUS_EV_MIN_R
+    gate_results.append(GateResult(
+        name="ev_gate",
+        passed=ev_passed,
+        value=ev_result["ev_net_r"],
+        threshold=CONSENSUS_EV_MIN_R,
+    ))
+
+    if not ev_passed:
+        await log_decision(
+            db=app.state.db,
+            symbol=asset,
+            direction=majority_dir,
+            decision_type="skip",
+            trader_count=len(votes),
+            agreement_pct=agreement_pct,
+            effective_k=eff_k,
+            gates=gate_results,
+            price=mid_price,
+            confidence=p_win,
+            ev=ev_result["ev_net_r"],
+        )
+        return None
+
+    # All consensus gates passed! Create signal
+    latency_ms = int((now - oldest_ts).total_seconds() * 1000)
+    mid_delta_bps = abs(mid_price - median_entry) / median_entry * 10000 if median_entry > 0 else 0
+
+    # Calculate dispersion
+    signed_weights = [(1 if v.direction == 'long' else -1) * v.weight for v in votes]
+    dispersion = statistics.stdev(signed_weights) if len(signed_weights) > 1 else 0.0
+
+    signal = ConsensusSignal(
+        id=str(uuid4()),
+        symbol=asset,
+        direction=majority_dir,
+        entry_price=median_entry,
+        stop_price=stop_price,
+        n_traders=len(votes),
+        n_agreeing=len(agreeing_votes),
+        eff_k=eff_k,
+        dispersion=dispersion,
+        p_win=p_win,
+        ev_gross_r=ev_result["ev_gross_r"],
+        ev_cost_r=ev_result["ev_cost_r"],
+        ev_net_r=ev_result["ev_net_r"],
+        latency_ms=latency_ms,
+        median_voter_price=median_entry,
+        mid_delta_bps=mid_delta_bps,
+        created_at=now,
+        trigger_addresses=[v.address for v in agreeing_votes],
+    )
+
+    # Gate 5: Risk limits fail-safe
+    from .consensus import check_risk_limits
+    passes_risk, risk_reason = check_risk_limits(signal)
+
+    gate_results.append(GateResult(
+        name="risk_limits",
+        passed=passes_risk,
+        value=p_win if not passes_risk else 1.0,
+        threshold=1.0,
+        detail=risk_reason if not passes_risk else "",
+    ))
+
+    if not passes_risk:
+        signal_risk_rejected_counter.labels(reason=risk_reason.split()[0]).inc()
+        print(f"[consensus] Signal rejected by risk limits: {risk_reason}")
+
+        # Log as risk_reject
+        await log_decision(
+            db=app.state.db,
+            symbol=asset,
+            direction=majority_dir,
+            decision_type="risk_reject",
+            trader_count=len(votes),
+            agreement_pct=agreement_pct,
+            effective_k=eff_k,
+            gates=gate_results,
+            risk_checks=[{"name": "risk_limits", "passed": False, "reason": risk_reason}],
+            price=mid_price,
+            confidence=p_win,
+            ev=ev_result["ev_net_r"],
+        )
+        return None
+
+    # All gates passed including risk limits - log as signal
+    signal_generated_counter.labels(symbol=asset, direction=majority_dir).inc()
+
+    decision_id = await log_decision(
+        db=app.state.db,
+        symbol=asset,
+        direction=majority_dir,
+        decision_type="signal",
+        trader_count=len(votes),
+        agreement_pct=agreement_pct,
+        effective_k=eff_k,
+        gates=gate_results,
+        price=mid_price,
+        confidence=p_win,
+        ev=ev_result["ev_net_r"],
+    )
+
+    # Attempt execution if auto-trading is enabled
+    from .executor import maybe_execute_signal
+    await maybe_execute_signal(
+        db=app.state.db,
+        decision_id=decision_id,
+        symbol=asset,
+        direction=majority_dir,
+    )
+
+    return signal
 
 
 async def process_fill_for_consensus(data: FillEvent) -> None:
     """
-    Process a fill through the consensus detector.
+    DEPRECATED: Legacy fill-by-fill consensus detection.
 
-    Converts FillEvent to Fill dataclass and checks for consensus.
-    If consensus is detected, publishes signal to NATS and persists to DB.
+    This is kept for backwards compatibility but is no longer called.
+    Use process_fill_for_consensus_via_episodes instead.
 
     Args:
         data: FillEvent from hl-stream
@@ -633,44 +1940,6 @@ async def handle_consensus_signal(signal: ConsensusSignal) -> None:
         print(f"[hl-decide] Failed to handle consensus signal: {e}")
 
 
-@app.on_event("startup")
-async def startup():
-    try:
-        # Connect to database first
-        app.state.db = await asyncpg.create_pool(DB_URL)
-
-        # Restore state from database
-        score_count, fill_count = await restore_state()
-        print(f"[hl-decide] Restored {score_count} scores and {fill_count} fills from database")
-
-        # Count open positions
-        async with app.state.db.acquire() as conn:
-            open_count = await conn.fetchval(
-                "SELECT COUNT(*) FROM position_signals WHERE status = 'open'"
-            )
-            print(f"[hl-decide] {open_count} open positions being tracked")
-
-        # Connect to NATS
-        app.state.nc = await nats.connect(NATS_URL)
-        app.state.js = app.state.nc.jetstream()
-        await ensure_stream(app.state.js, "HL_D", ["d.signals.v1", "d.outcomes.v1"])
-        await app.state.nc.subscribe("b.scores.v1", cb=handle_score)
-        await app.state.nc.subscribe("c.fills.v1", cb=handle_fill)
-
-        print("[hl-decide] Started with position-based tracking")
-    except Exception as e:
-        print(f"[hl-decide] Fatal startup error: {e}")
-        raise
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    if hasattr(app.state, "nc"):
-        await app.state.nc.drain()
-    if hasattr(app.state, "db"):
-        await app.state.db.close()
-
-
 @app.get("/healthz")
 async def health():
     """Health check endpoint."""
@@ -689,10 +1958,110 @@ async def health():
         return {"status": "ok", "scores": len(scores), "fills": len(fills)}
 
 
+@app.get("/data-health")
+async def data_health():
+    """
+    Data freshness and health status endpoint.
+    Returns warnings for stale data that could affect signal quality.
+    Used for observability dashboards and alerting.
+    """
+    from datetime import datetime, timezone
+
+    warnings = []
+    status = "healthy"
+
+    # ATR staleness check
+    atr_health = {"btc": {"status": "unknown"}, "eth": {"status": "unknown"}}
+    if hasattr(app.state, "atr_provider"):
+        provider = app.state.atr_provider
+        for asset in ["BTC", "ETH"]:
+            atr_data = provider.get_atr(asset)
+            if atr_data:
+                age_seconds = atr_data.get("age_seconds", 0)
+                source = atr_data.get("source", "unknown")
+                atr_health[asset.lower()] = {
+                    "status": "stale" if age_seconds > ATR_MAX_STALENESS else "fresh",
+                    "age_seconds": age_seconds,
+                    "source": source,
+                    "value": atr_data.get("atr"),
+                }
+                if age_seconds > ATR_MAX_STALENESS:
+                    warnings.append(f"ATR for {asset} is stale ({age_seconds}s old, max {ATR_MAX_STALENESS}s)")
+                    status = "degraded"
+            else:
+                atr_health[asset.lower()] = {"status": "missing"}
+                warnings.append(f"No ATR data available for {asset}")
+                status = "degraded"
+
+    # Correlation health check
+    corr_health = {"status": "unknown", "coverage_pct": 0, "pairs_loaded": 0}
+    if hasattr(app.state, "corr_provider"):
+        provider = app.state.corr_provider
+        pairs_loaded = len(provider.correlations) if hasattr(provider, "correlations") else 0
+        pool_size = getattr(provider, "pool_size", 0)
+
+        # Calculate coverage
+        expected_pairs = pool_size * (pool_size - 1) // 2 if pool_size > 1 else 0
+        coverage_pct = (pairs_loaded / expected_pairs * 100) if expected_pairs > 0 else 0
+
+        corr_health = {
+            "status": "healthy" if coverage_pct >= 50 else ("degraded" if coverage_pct > 0 else "missing"),
+            "coverage_pct": round(coverage_pct, 1),
+            "pairs_loaded": pairs_loaded,
+            "pool_size": pool_size,
+            "expected_pairs": expected_pairs,
+        }
+
+        if coverage_pct < 50:
+            warnings.append(f"Correlation coverage low ({coverage_pct:.1f}%, using default ρ=0.3 for missing pairs)")
+            if status == "healthy":
+                status = "degraded"
+
+    # Weight concentration check (from recent consensus)
+    weight_health = {"gini": None, "saturation_pct": None}
+    try:
+        # Get last Gini from metrics if available
+        gini_value = weight_gini_gauge._value.get() if weight_gini_gauge._value else None
+        sat_pct = weight_saturation_pct_gauge._value.get() if weight_saturation_pct_gauge._value else None
+        weight_health = {
+            "gini": round(gini_value, 3) if gini_value is not None else None,
+            "saturation_pct": round(sat_pct, 1) if sat_pct is not None else None,
+        }
+        if gini_value is not None and gini_value > 0.8:
+            warnings.append(f"Vote weight concentration high (Gini={gini_value:.2f})")
+            if status == "healthy":
+                status = "degraded"
+    except Exception:
+        pass
+
+    return {
+        "status": status,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "atr": atr_health,
+        "correlation": corr_health,
+        "weight_distribution": weight_health,
+        "warnings": warnings,
+        "warning_count": len(warnings),
+    }
+
+
 @app.get("/metrics")
 async def metrics():
     """Prometheus metrics endpoint."""
     return Response(content=generate_latest(registry), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.post("/reconcile")
+async def reconcile_fills(force: bool = False):
+    """
+    Manually trigger reconciliation of historical fills.
+    Safe to run multiple times - tracks processed fill IDs to prevent double-booking.
+
+    Args:
+        force: If True, reprocess all fills even if already processed
+    """
+    result = await reconcile_historical_fills(force=force)
+    return result
 
 
 @app.get("/positions/open")
@@ -856,3 +2225,269 @@ async def get_consensus_stats():
             }
     except Exception as e:
         return {"error": str(e)}
+
+
+@app.post("/correlation/compute")
+async def compute_correlations():
+    """
+    Trigger daily correlation computation job.
+
+    This computes pairwise correlations between Alpha Pool traders
+    based on their position posture (direction) in 5-minute buckets.
+    Results are stored in trader_corr table.
+    """
+    try:
+        summary = await run_daily_correlation_job(app.state.db)
+
+        # Reload correlations into provider and hydrate detector
+        corr_provider = get_correlation_provider()
+        corr_count = await corr_provider.load()
+        hydrated = corr_provider.hydrate_detector(consensus_detector)
+
+        return {
+            "status": "ok",
+            "date": summary["date"],
+            "btc_pairs": summary["btc_pairs"],
+            "eth_pairs": summary["eth_pairs"],
+            "pruned": summary["pruned"],
+            "loaded": corr_count,
+            "hydrated": hydrated,
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.get("/correlation/status")
+async def get_correlation_status():
+    """
+    Get correlation matrix status.
+
+    Returns counts of loaded correlations and sample pairs.
+    """
+    try:
+        corr_provider = get_correlation_provider()
+
+        async with app.state.db.acquire() as conn:
+            # Get latest date with correlations
+            latest_row = await conn.fetchrow(
+                """
+                SELECT as_of_date, COUNT(*) as pair_count
+                FROM trader_corr
+                GROUP BY as_of_date
+                ORDER BY as_of_date DESC
+                LIMIT 1
+                """
+            )
+
+            # Get sample pairs
+            sample_rows = await conn.fetch(
+                """
+                SELECT addr_a, addr_b, rho, n_buckets
+                FROM trader_corr
+                WHERE as_of_date = (SELECT MAX(as_of_date) FROM trader_corr)
+                ORDER BY rho DESC
+                LIMIT 10
+                """
+            )
+
+        return {
+            "loaded_pairs": len(corr_provider.correlations),
+            "latest_date": latest_row["as_of_date"].isoformat() if latest_row else None,
+            "db_pair_count": latest_row["pair_count"] if latest_row else 0,
+            "detector_pairs": len(consensus_detector.correlation_matrix),
+            "sample_highest_correlations": [
+                {
+                    "addr_a": row["addr_a"][:10] + "...",
+                    "addr_b": row["addr_b"][:10] + "...",
+                    "rho": round(float(row["rho"]), 3),
+                    "n_buckets": row["n_buckets"],
+                }
+                for row in sample_rows
+            ],
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# =====================
+# Decision Logging API
+# =====================
+
+
+@app.get("/decisions")
+async def list_decisions(
+    symbol: Optional[str] = None,
+    decision_type: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    """
+    List decision logs with optional filters.
+
+    Args:
+        symbol: Filter by symbol (BTC, ETH)
+        decision_type: Filter by type (signal, skip, risk_reject)
+        limit: Max results (default 50)
+        offset: Pagination offset
+
+    Returns:
+        Paginated list of decisions with reasoning
+    """
+    return await get_decisions(
+        db=app.state.db,
+        symbol=symbol,
+        decision_type=decision_type,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@app.get("/decisions/stats")
+async def decision_stats(days: int = 7):
+    """
+    Get aggregate statistics for decisions.
+
+    Args:
+        days: Number of days to look back (default 7)
+
+    Returns:
+        Aggregate stats including signal count, skip rate, win rate
+    """
+    return await get_decision_stats(db=app.state.db, days=days)
+
+
+@app.get("/decisions/{decision_id}")
+async def get_decision_by_id(decision_id: str):
+    """
+    Get full details for a single decision.
+
+    Args:
+        decision_id: The decision log UUID
+
+    Returns:
+        Full decision details including gates, reasoning, and outcome
+    """
+    result = await get_decision(db=app.state.db, decision_id=decision_id)
+    if result is None:
+        return {"error": "Decision not found"}
+    return result
+
+
+# =====================
+# Portfolio & Execution API
+# =====================
+
+
+@app.get("/portfolio")
+async def portfolio_summary(address: Optional[str] = None):
+    """
+    Get portfolio summary including account value and positions.
+
+    Currently supports Hyperliquid only. Multi-exchange in Phase 4.
+
+    Args:
+        address: Optional Hyperliquid address (falls back to config)
+
+    Returns:
+        Portfolio summary with equity, positions, and P&L
+    """
+    return await get_portfolio_summary(db=app.state.db, address=address)
+
+
+@app.get("/portfolio/positions")
+async def list_positions():
+    """
+    Get live positions from database.
+
+    Returns cached positions from last portfolio sync.
+    """
+    try:
+        async with app.state.db.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT exchange, symbol, side, size, entry_price, mark_price,
+                       liquidation_price, unrealized_pnl, margin_used, leverage,
+                       opened_at, updated_at
+                FROM live_positions
+                ORDER BY updated_at DESC
+                """
+            )
+            return {
+                "count": len(rows),
+                "positions": [
+                    {
+                        "exchange": row["exchange"],
+                        "symbol": row["symbol"],
+                        "side": row["side"],
+                        "size": float(row["size"]),
+                        "entry_price": float(row["entry_price"]),
+                        "mark_price": float(row["mark_price"]) if row["mark_price"] else None,
+                        "liquidation_price": float(row["liquidation_price"]) if row["liquidation_price"] else None,
+                        "unrealized_pnl": float(row["unrealized_pnl"]) if row["unrealized_pnl"] else None,
+                        "margin_used": float(row["margin_used"]) if row["margin_used"] else None,
+                        "leverage": row["leverage"],
+                        "opened_at": row["opened_at"].isoformat() if row["opened_at"] else None,
+                        "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+                    }
+                    for row in rows
+                ],
+            }
+    except Exception as e:
+        return {"error": str(e), "count": 0, "positions": []}
+
+
+@app.get("/execution/config")
+async def execution_config():
+    """
+    Get current execution configuration.
+
+    Returns auto-trade settings and risk limits.
+    """
+    return await get_execution_config(db=app.state.db)
+
+
+@app.post("/execution/config")
+async def update_config(config: ExecutionConfigUpdate):
+    """
+    Update execution configuration.
+
+    Requires owner authentication.
+
+    Args:
+        config: ExecutionConfigUpdate JSON body containing any of:
+            - enabled: Master enable/disable for auto-trading
+            - hl_enabled: Enable Hyperliquid auto-trading
+            - hl_address: Hyperliquid wallet address
+            - hl_max_leverage: Maximum leverage (1-10)
+            - hl_max_position_pct: Max position size as % of equity (0-100)
+            - hl_max_exposure_pct: Max total exposure as % of equity (0-100)
+
+    Returns:
+        Updated config
+    """
+    return await update_execution_config(
+        db=app.state.db,
+        enabled=config.enabled,
+        hl_enabled=config.hl_enabled,
+        hl_address=config.hl_address,
+        hl_max_leverage=config.hl_max_leverage,
+        hl_max_position_pct=config.hl_max_position_pct,
+        hl_max_exposure_pct=config.hl_max_exposure_pct,
+    )
+
+
+@app.get("/execution/logs")
+async def execution_logs(limit: int = 50, offset: int = 0):
+    """
+    Get recent execution logs.
+
+    Shows all trade execution attempts with results.
+
+    Args:
+        limit: Max results (default 50)
+        offset: Pagination offset
+
+    Returns:
+        Paginated execution logs
+    """
+    return await get_execution_logs(db=app.state.db, limit=limit, offset=offset)

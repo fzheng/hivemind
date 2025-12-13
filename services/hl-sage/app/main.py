@@ -33,7 +33,9 @@ To populate the Alpha Pool:
 """
 
 import os
+import json
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Any, Optional
 from collections import OrderedDict
@@ -58,16 +60,82 @@ from .bandit import (
     BANDIT_SELECT_K,
     BANDIT_POOL_SIZE,
 )
+from .snapshot import (
+    create_daily_snapshot,
+    get_snapshot_summary,
+    load_universe_at_date,
+    SELECTION_VERSION,
+)
+from .walkforward import (
+    run_walk_forward_replay,
+    replay_single_period,
+    format_replay_summary,
+    REPLAY_EVALUATION_DAYS,
+)
 
 SERVICE_NAME = "hl-sage"
 OWNER_TOKEN = os.getenv("OWNER_TOKEN", "dev-owner")
 NATS_URL = os.getenv("NATS_URL", "nats://0.0.0.0:4222")
+HL_STREAM_URL = os.getenv("HL_STREAM_URL", "http://hl-stream:8080")
 DB_URL = os.getenv("DATABASE_URL", "postgresql://hlbot:hlbotpassword@0.0.0.0:5432/hlbot")
 MAX_TRACKED_ADDRESSES = int(os.getenv("MAX_TRACKED_ADDRESSES", "1000"))
 MAX_SCORES = int(os.getenv("MAX_SCORES", "500"))
 STALE_THRESHOLD_HOURS = int(os.getenv("STALE_THRESHOLD_HOURS", "24"))
 
-app = FastAPI(title="hl-sage", version="0.1.0")
+# Daily snapshot configuration
+SNAPSHOT_ENABLED = os.getenv("SNAPSHOT_ENABLED", "true").lower() == "true"
+SNAPSHOT_HOUR_UTC = int(os.getenv("SNAPSHOT_HOUR_UTC", "0"))  # Default: midnight UTC
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup/shutdown events."""
+    # Startup
+    try:
+        # Connect to database first
+        app.state.db = await asyncpg.create_pool(DB_URL)
+
+        # Restore tracked addresses from database
+        restored = await restore_tracked_addresses()
+        print(f"[hl-sage] Restored {restored} tracked addresses from database")
+
+        # Connect to NATS
+        app.state.nc = await nats.connect(NATS_URL)
+        app.state.js = app.state.nc.jetstream()
+        await ensure_stream(app.state.js, "HL_B", ["b.scores.v1"])
+        await app.state.nc.subscribe("a.candidates.v1", cb=handle_candidate)
+        await app.state.nc.subscribe("c.fills.v1", cb=handle_fill)
+
+        # Auto-refresh Alpha Pool if empty on startup
+        if ALPHA_POOL_AUTO_REFRESH:
+            asyncio.create_task(auto_refresh_alpha_pool_if_empty())
+
+        # Start periodic fill sync for Alpha Pool addresses
+        asyncio.create_task(periodic_alpha_pool_fill_sync())
+
+        # Start subscription sync to register Alpha Pool addresses with hl-stream
+        asyncio.create_task(sync_alpha_pool_subscriptions())
+
+        # Start periodic Alpha Pool refresh (every ALPHA_POOL_REFRESH_HOURS)
+        asyncio.create_task(periodic_alpha_pool_refresh())
+
+        # Start daily snapshot job (Phase 3f: Shadow Ledger)
+        if SNAPSHOT_ENABLED:
+            asyncio.create_task(periodic_daily_snapshot())
+    except Exception as e:
+        print(f"[hl-sage] Fatal startup error: {e}")
+        raise
+
+    yield  # Application runs here
+
+    # Shutdown
+    if hasattr(app.state, "nc"):
+        await app.state.nc.drain()
+    if hasattr(app.state, "db"):
+        await app.state.db.close()
+
+
+app = FastAPI(title="hl-sage", version="0.1.0", lifespan=lifespan)
 
 # Use OrderedDict for LRU behavior
 scores: OrderedDict[str, ScoreEvent] = OrderedDict()
@@ -245,22 +313,48 @@ async def handle_fill(msg):
     # Fetch NIG posterior for this trader (if available)
     nig_params = await get_trader_nig_params(addr_lower)
 
-    # Use NIG posterior mean as score if available, else fall back to leaderboard weight
+    # Thompson Sampling: sample from NIG posterior instead of using mean
+    # This enables explore/exploit tradeoff - uncertain traders (low κ) get
+    # wider samples, sometimes ranking higher than proven performers.
     if nig_params and nig_params.get("nig_m") is not None:
-        # NIG-based score: posterior mean * direction
-        nig_score = nig_params["nig_m"] * side_multiplier
+        # Create TraderPosteriorNIG for sampling
+        from .bandit import TraderPosteriorNIG
+
+        posterior = TraderPosteriorNIG(
+            address=addr_lower,
+            m=nig_params["nig_m"],
+            kappa=nig_params["nig_kappa"],
+            alpha=nig_params["nig_alpha"],
+            beta=nig_params["nig_beta"],
+            total_signals=nig_params["total_signals"],
+            total_pnl_r=nig_params.get("total_pnl_r", 0.0),
+        )
+
+        # Thompson sample from posterior (explore/exploit)
+        sampled_mu = posterior.sample()
+
+        # Apply direction to sampled value
+        nig_score = sampled_mu * side_multiplier
         # Clamp to [-1, 1] range
         base_score = max(-1.0, min(1.0, nig_score))
-        score_source = "nig"
+        score_source = "thompson"
+
+        # Derive weight from NIG confidence: κ/(κ+10)
+        # This gives weight ~0.09 for κ=1 (new trader), ~0.5 for κ=10, ~0.91 for κ=100
+        nig_weight = nig_params["nig_kappa"] / (nig_params["nig_kappa"] + 10.0)
     else:
         # Legacy: leaderboard weight * direction
         base_score = max(-1.0, min(1.0, state["weight"] * side_multiplier))
         score_source = "leaderboard"
+        nig_weight = None
+
+    # Use NIG-derived weight when available, else legacy weight
+    score_weight = nig_weight if nig_weight is not None else state["weight"]
 
     event = ScoreEvent(
         address=data.address,
         score=base_score,
-        weight=state["weight"],
+        weight=score_weight,
         rank=state["rank"],
         window_s=60,
         ts=datetime.now(timezone.utc),
@@ -271,6 +365,8 @@ async def handle_fill(msg):
             "fill": data.model_dump(),
             # Include NIG params for hl-decide consensus detection
             "nig": nig_params if nig_params else None,
+            # Include sampled value for debugging/audit
+            "thompson_sample": sampled_mu if score_source == "thompson" else None,
         },
     )
 
@@ -294,7 +390,7 @@ async def get_trader_nig_params(address: str) -> Optional[Dict[str, Any]]:
         address: Trader's Ethereum address (lowercase)
 
     Returns:
-        Dict with nig_m, nig_kappa, nig_alpha, nig_beta, total_signals, avg_r
+        Dict with nig_m, nig_kappa, nig_alpha, nig_beta, total_signals, avg_r, total_pnl_r
         or None if trader has no posterior data
     """
     try:
@@ -302,7 +398,7 @@ async def get_trader_nig_params(address: str) -> Optional[Dict[str, Any]]:
             row = await conn.fetchrow(
                 """
                 SELECT nig_m, nig_kappa, nig_alpha, nig_beta,
-                       total_signals, avg_r
+                       total_signals, avg_r, total_pnl_r
                 FROM trader_performance
                 WHERE address = $1
                 """,
@@ -316,6 +412,7 @@ async def get_trader_nig_params(address: str) -> Optional[Dict[str, Any]]:
                     "nig_beta": float(row["nig_beta"]),
                     "total_signals": int(row["total_signals"] or 0),
                     "avg_r": float(row["avg_r"] or 0),
+                    "total_pnl_r": float(row["total_pnl_r"] or 0),
                 }
     except Exception as e:
         print(f"[hl-sage] Failed to fetch NIG params for {address}: {e}")
@@ -323,36 +420,18 @@ async def get_trader_nig_params(address: str) -> Optional[Dict[str, Any]]:
 
 
 ALPHA_POOL_AUTO_REFRESH = os.getenv("ALPHA_POOL_AUTO_REFRESH", "true").lower() == "true"
-
-
-@app.on_event("startup")
-async def startup_event():
-    try:
-        # Connect to database first
-        app.state.db = await asyncpg.create_pool(DB_URL)
-
-        # Restore tracked addresses from database
-        restored = await restore_tracked_addresses()
-        print(f"[hl-sage] Restored {restored} tracked addresses from database")
-
-        # Connect to NATS
-        app.state.nc = await nats.connect(NATS_URL)
-        app.state.js = app.state.nc.jetstream()
-        await ensure_stream(app.state.js, "HL_B", ["b.scores.v1"])
-        await app.state.nc.subscribe("a.candidates.v1", cb=handle_candidate)
-        await app.state.nc.subscribe("c.fills.v1", cb=handle_fill)
-
-        # Auto-refresh Alpha Pool if empty on startup
-        if ALPHA_POOL_AUTO_REFRESH:
-            asyncio.create_task(auto_refresh_alpha_pool_if_empty())
-    except Exception as e:
-        print(f"[hl-sage] Fatal startup error: {e}")
-        raise
+ALPHA_POOL_AUTO_INIT = os.getenv("ALPHA_POOL_AUTO_INIT", "true").lower() == "true"
+ALPHA_POOL_AUTO_INIT_DELAY_MS = int(os.getenv("ALPHA_POOL_AUTO_INIT_DELAY_MS", "500"))
 
 
 async def auto_refresh_alpha_pool_if_empty():
     """
-    Auto-refresh Alpha Pool on startup ONLY if it has NEVER been refreshed.
+    Auto-initialize Alpha Pool on startup if it has NEVER been refreshed.
+
+    This is the main fresh-install initialization flow:
+    1. Detects if this is a fresh database (no records in alpha_pool_addresses)
+    2. Refreshes the pool from Hyperliquid leaderboard (auto-backfills new addresses)
+    3. Creates an initial snapshot for FDR qualification
 
     Checks if alpha_pool_addresses table has ANY records (active or not).
     If completely empty, this is a fresh database and we bootstrap the pool.
@@ -361,6 +440,9 @@ async def auto_refresh_alpha_pool_if_empty():
     or a scheduled job.
 
     Runs as a background task to not block service startup.
+
+    IMPORTANT: Uses _background_refresh_task() to properly set is_running=true
+    so the dashboard can detect the refresh is in progress.
     """
     try:
         # Wait a bit for database to be fully ready
@@ -373,46 +455,327 @@ async def auto_refresh_alpha_pool_if_empty():
             )
 
         if total_count == 0:
-            print(f"[hl-sage] Alpha Pool has never been refreshed, auto-refreshing (first-time setup)...")
-            traders = await fetch_leaderboard_from_api(limit=ALPHA_POOL_DEFAULT_SIZE)
-            if traders:
-                async with app.state.db.acquire() as conn:
-                    for trader in traders:
-                        await conn.execute(
-                            """
-                            INSERT INTO alpha_pool_addresses (address, nickname, account_value, pnl_30d, roi_30d, win_rate, last_refreshed, is_active)
-                            VALUES ($1, $2, $3, $4, $5, $6, NOW(), true)
-                            ON CONFLICT (address) DO UPDATE SET
-                                nickname = COALESCE(EXCLUDED.nickname, alpha_pool_addresses.nickname),
-                                account_value = EXCLUDED.account_value,
-                                pnl_30d = EXCLUDED.pnl_30d,
-                                roi_30d = EXCLUDED.roi_30d,
-                                win_rate = EXCLUDED.win_rate,
-                                last_refreshed = NOW(),
-                                is_active = true
-                            """,
-                            trader["address"],
-                            trader.get("display_name"),
-                            trader["account_value"],
-                            trader["pnl"],
-                            trader.get("roi", 0.0),
-                            trader["win_rate"],
-                        )
-                print(f"[hl-sage] Alpha Pool auto-refreshed with {len(traders)} traders")
-            else:
-                print(f"[hl-sage] Alpha Pool auto-refresh failed - no traders fetched")
+            print(f"[hl-sage] Fresh install detected: Alpha Pool is empty")
+            print(f"[hl-sage] Starting automatic initialization...")
+
+            # Step 1: Refresh Alpha Pool from leaderboard (includes auto-backfill)
+            print(f"[hl-sage] [1/2] Refreshing Alpha Pool from leaderboard...")
+            await _background_refresh_task(limit=ALPHA_POOL_DEFAULT_SIZE)
+
+            # Step 2: Create initial snapshot for FDR qualification
+            if ALPHA_POOL_AUTO_INIT:
+                print(f"[hl-sage] [2/2] Creating initial snapshot for FDR qualification...")
+                try:
+                    snapshot_result = await create_daily_snapshot(app.state.db)
+                    fdr_count = snapshot_result.get("fdr_qualified", 0)
+                    total = snapshot_result.get("total_traders", 0)
+                    print(f"[hl-sage] Initial snapshot created: {fdr_count}/{total} traders FDR-qualified")
+                except Exception as snapshot_err:
+                    print(f"[hl-sage] Initial snapshot failed: {snapshot_err}")
+
+            print(f"[hl-sage] Automatic initialization complete!")
         else:
-            print(f"[hl-sage] Alpha Pool has {total_count} records (previously refreshed), skipping auto-refresh")
+            print(f"[hl-sage] Alpha Pool has {total_count} records (previously refreshed), skipping auto-init")
     except Exception as e:
-        print(f"[hl-sage] Alpha Pool auto-refresh failed: {e}")
+        await _refresh_state.fail(str(e))
+        print(f"[hl-sage] Alpha Pool auto-init failed: {e}")
 
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    if hasattr(app.state, "nc"):
-        await app.state.nc.drain()
-    if hasattr(app.state, "db"):
-        await app.state.db.close()
+# Interval for periodic Alpha Pool fill sync (in seconds)
+ALPHA_POOL_FILL_SYNC_INTERVAL = int(os.getenv("ALPHA_POOL_FILL_SYNC_INTERVAL", "300"))  # 5 minutes default
+
+
+async def get_polling_addresses() -> list[str]:
+    """
+    Get addresses that need polling (not on WebSocket).
+
+    Fetches subscription methods from hl-stream and returns only addresses
+    that are using 'polling' or 'none' method (not real-time WebSocket).
+    """
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{HL_STREAM_URL}/subscriptions/methods")
+            if response.status_code == 200:
+                methods = response.json()
+                # Return addresses that are NOT on WebSocket
+                polling_addrs = [
+                    addr for addr, info in methods.items()
+                    if info.get("method") != "websocket"
+                ]
+                return polling_addrs
+    except Exception as e:
+        print(f"[hl-sage] Could not fetch subscription methods: {e}")
+
+    # If we can't get subscription info, return empty list to avoid redundant polling
+    return []
+
+
+async def periodic_alpha_pool_fill_sync():
+    """
+    Periodically sync fills for Alpha Pool addresses that are NOT on WebSocket.
+
+    Only polls fills for addresses using 'polling' method - addresses that
+    are subscribed via WebSocket receive real-time fills and don't need polling.
+
+    Runs every ALPHA_POOL_FILL_SYNC_INTERVAL seconds (default: 5 minutes).
+    """
+    # Wait for startup to complete
+    await asyncio.sleep(30)
+    print(f"[hl-sage] Starting periodic Alpha Pool fill sync (interval: {ALPHA_POOL_FILL_SYNC_INTERVAL}s)")
+
+    while True:
+        try:
+            # Get active Alpha Pool addresses
+            async with app.state.db.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT address FROM alpha_pool_addresses
+                    WHERE is_active = true
+                    ORDER BY last_refreshed DESC
+                    LIMIT 50
+                    """
+                )
+
+            if not rows:
+                await asyncio.sleep(ALPHA_POOL_FILL_SYNC_INTERVAL)
+                continue
+
+            all_addresses = set(row["address"].lower() for row in rows)
+
+            # Only poll addresses that are NOT on WebSocket
+            polling_addrs = await get_polling_addresses()
+            polling_set = set(addr.lower() for addr in polling_addrs)
+
+            # Filter to Alpha Pool addresses that need polling
+            addresses_to_poll = [
+                row["address"] for row in rows
+                if row["address"].lower() in polling_set
+            ]
+
+            # If all addresses are on WebSocket, skip polling
+            if not addresses_to_poll:
+                websocket_count = len(all_addresses) - len(addresses_to_poll)
+                print(f"[hl-sage] All {websocket_count} Alpha Pool addresses on WebSocket, skipping poll")
+                await asyncio.sleep(ALPHA_POOL_FILL_SYNC_INTERVAL)
+                continue
+
+            websocket_count = len(all_addresses) - len(addresses_to_poll)
+            print(f"[hl-sage] Polling fills for {len(addresses_to_poll)} addresses ({websocket_count} on WebSocket)...")
+
+            # Backfill recent fills for polling-only addresses
+            results = await backfill_historical_fills_for_addresses(app.state.db, addresses_to_poll)
+            total_inserted = sum(results.values())
+
+            if total_inserted > 0:
+                print(f"[hl-sage] Fill sync complete: {total_inserted} new fills inserted")
+            else:
+                print(f"[hl-sage] Fill sync complete: no new fills")
+
+        except Exception as e:
+            print(f"[hl-sage] Fill sync error: {e}")
+
+        await asyncio.sleep(ALPHA_POOL_FILL_SYNC_INTERVAL)
+
+
+# Interval for syncing Alpha Pool addresses to hl-stream subscription manager (in seconds)
+ALPHA_POOL_SUBSCRIPTION_SYNC_INTERVAL = int(os.getenv("ALPHA_POOL_SUBSCRIPTION_SYNC_INTERVAL", "60"))  # 1 minute default
+
+
+async def sync_alpha_pool_subscriptions():
+    """
+    Sync selected Alpha Pool addresses to hl-stream for real-time WebSocket tracking.
+
+    This registers the top-K selected Alpha Pool addresses with hl-stream's
+    centralized subscription manager, enabling real-time fill detection
+    instead of relying on periodic backfill.
+
+    Runs every ALPHA_POOL_SUBSCRIPTION_SYNC_INTERVAL seconds (default: 60s).
+
+    The sync only includes addresses that are:
+    1. Active in alpha_pool_addresses
+    2. Selected by the NIG Thompson Sampling (top-K)
+    """
+    # Wait for startup to complete
+    await asyncio.sleep(15)
+    print(f"[hl-sage] Starting Alpha Pool subscription sync (interval: {ALPHA_POOL_SUBSCRIPTION_SYNC_INTERVAL}s)")
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        while True:
+            try:
+                # Get selected Alpha Pool addresses (top-K by posterior mean)
+                async with app.state.db.acquire() as conn:
+                    # First check if we have any trader_performance data
+                    has_performance = await conn.fetchval(
+                        "SELECT COUNT(*) FROM trader_performance"
+                    )
+
+                    if has_performance > 0:
+                        # Get addresses with NIG posteriors, sorted by posterior mean
+                        rows = await conn.fetch(
+                            """
+                            SELECT a.address
+                            FROM alpha_pool_addresses a
+                            LEFT JOIN trader_performance tp ON LOWER(a.address) = LOWER(tp.address)
+                            WHERE a.is_active = true
+                            ORDER BY COALESCE(tp.nig_m, 0) DESC
+                            LIMIT $1
+                            """,
+                            BANDIT_SELECT_K,
+                        )
+                    else:
+                        # No performance data yet - use top-K by PnL
+                        rows = await conn.fetch(
+                            """
+                            SELECT address
+                            FROM alpha_pool_addresses
+                            WHERE is_active = true
+                            ORDER BY pnl_30d DESC NULLS LAST
+                            LIMIT $1
+                            """,
+                            BANDIT_SELECT_K,
+                        )
+
+                if not rows:
+                    await asyncio.sleep(ALPHA_POOL_SUBSCRIPTION_SYNC_INTERVAL)
+                    continue
+
+                addresses = [row["address"] for row in rows]
+
+                # Register with hl-stream subscription manager
+                response = await client.post(
+                    f"{HL_STREAM_URL}/subscriptions/replace",
+                    json={"source": "alpha-pool", "addresses": addresses},
+                    headers={"x-owner-key": OWNER_TOKEN},
+                )
+
+                if response.status_code == 200:
+                    result = response.json()
+                    total = result.get("totalAddresses", "?")
+                    count = result.get("count", len(addresses))
+                    print(f"[hl-sage] Synced {count} Alpha Pool addresses to WebSocket (total subscribed: {total})")
+                else:
+                    print(f"[hl-sage] Failed to sync subscriptions: HTTP {response.status_code}")
+
+            except httpx.ConnectError:
+                # hl-stream not available yet, will retry
+                pass
+            except Exception as e:
+                print(f"[hl-sage] Subscription sync error: {e}")
+
+            await asyncio.sleep(ALPHA_POOL_SUBSCRIPTION_SYNC_INTERVAL)
+
+
+async def periodic_alpha_pool_refresh():
+    """
+    Periodically refresh the Alpha Pool from Hyperliquid leaderboard.
+
+    Checks if the pool is overdue for refresh (based on ALPHA_POOL_REFRESH_HOURS)
+    and triggers a refresh if needed.
+
+    This ensures the pool stays fresh without manual intervention.
+    """
+    # Wait for startup to complete and initial auto-refresh (if any)
+    await asyncio.sleep(120)  # 2 minutes
+
+    refresh_interval_seconds = ALPHA_POOL_REFRESH_HOURS * 3600
+    print(f"[hl-sage] Starting periodic Alpha Pool refresh (interval: {ALPHA_POOL_REFRESH_HOURS}h)")
+
+    while True:
+        try:
+            # Check if refresh is needed
+            async with app.state.db.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT MAX(last_refreshed) as last_refreshed
+                    FROM alpha_pool_addresses
+                    WHERE is_active = true
+                    """
+                )
+
+            if row and row["last_refreshed"]:
+                last_refreshed = row["last_refreshed"]
+                now = datetime.now(timezone.utc)
+                age_seconds = (now - last_refreshed).total_seconds()
+
+                if age_seconds >= refresh_interval_seconds:
+                    print(f"[hl-sage] Alpha Pool is {age_seconds / 3600:.1f}h old, triggering refresh...")
+                    # Check if refresh is already running
+                    if not _refresh_state.is_running:
+                        await _background_refresh_task(limit=ALPHA_POOL_DEFAULT_SIZE)
+                    else:
+                        print(f"[hl-sage] Refresh already in progress, skipping")
+                else:
+                    hours_until_refresh = (refresh_interval_seconds - age_seconds) / 3600
+                    print(f"[hl-sage] Alpha Pool refresh not needed yet ({hours_until_refresh:.1f}h until due)")
+            else:
+                # No data, trigger refresh
+                print(f"[hl-sage] No Alpha Pool data, triggering initial refresh...")
+                if not _refresh_state.is_running:
+                    await _background_refresh_task(limit=ALPHA_POOL_DEFAULT_SIZE)
+
+        except Exception as e:
+            print(f"[hl-sage] Periodic refresh check error: {e}")
+
+        # Check every hour
+        await asyncio.sleep(3600)
+
+
+async def periodic_daily_snapshot():
+    """
+    Create daily snapshots for the Shadow Ledger (Phase 3f: Selection Integrity).
+
+    Runs at SNAPSHOT_HOUR_UTC (default: midnight) and captures the state of all
+    traders for survivorship-bias-free analysis.
+
+    The snapshot includes:
+    - Universe membership (which stage each trader reached)
+    - Thompson sampling draws with stored seeds for reproducibility
+    - FDR qualification status
+    - Death/censor event detection
+    """
+    # Wait for startup to complete
+    await asyncio.sleep(180)  # 3 minutes
+
+    print(f"[hl-sage] Starting daily snapshot job (hour: {SNAPSHOT_HOUR_UTC:02d}:00 UTC)")
+
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            target_hour = SNAPSHOT_HOUR_UTC
+
+            # Calculate seconds until next snapshot time
+            if now.hour < target_hour:
+                # Same day
+                next_run = now.replace(hour=target_hour, minute=0, second=0, microsecond=0)
+            else:
+                # Next day
+                next_run = (now + timedelta(days=1)).replace(hour=target_hour, minute=0, second=0, microsecond=0)
+
+            wait_seconds = (next_run - now).total_seconds()
+
+            # Don't wait more than 1 hour at a time (allows for clock adjustments)
+            if wait_seconds > 3600:
+                print(f"[hl-sage] Next snapshot at {next_run.isoformat()}, waiting...")
+                await asyncio.sleep(3600)
+                continue
+
+            # Wait until snapshot time
+            if wait_seconds > 0:
+                print(f"[hl-sage] Snapshot due in {wait_seconds:.0f}s at {next_run.isoformat()}")
+                await asyncio.sleep(wait_seconds)
+
+            # Create snapshot
+            print(f"[hl-sage] Creating daily snapshot...")
+            result = await create_daily_snapshot(app.state.db)
+            print(f"[hl-sage] Snapshot complete: {result}")
+
+            # Wait a bit after snapshot to avoid running twice at boundary
+            await asyncio.sleep(60)
+
+        except Exception as e:
+            print(f"[hl-sage] Snapshot job error: {e}")
+            # Wait before retrying
+            await asyncio.sleep(300)
 
 
 @app.get("/healthz")
@@ -583,20 +946,394 @@ async def bandit_apply_decay(
 # =====================
 
 HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
-PNL_CURVE_CONCURRENCY = 2  # Max concurrent requests (reduced to avoid rate limits)
+PNL_CURVE_CONCURRENCY = int(os.getenv("PNL_CURVE_CONCURRENCY", "2"))  # Max concurrent requests
 PNL_CURVE_TIMEOUT = 10.0  # Timeout per request in seconds
-PNL_CURVE_DELAY = 0.3  # Delay between requests in seconds
+PNL_CURVE_DELAY = float(os.getenv("PNL_CURVE_DELAY", "0.3"))  # Delay between requests in seconds
 PNL_CURVE_MAX_RETRIES = 2  # Max retries on rate limit
 PNL_CURVE_CACHE_TTL = int(os.getenv("PNL_CURVE_CACHE_TTL", "86400"))  # Cache TTL in seconds (default 24 hours)
 
+# Historical fill backfill settings
+FILL_BACKFILL_CONCURRENCY = int(os.getenv("FILL_BACKFILL_CONCURRENCY", "1"))  # Max concurrent fill fetch requests
+FILL_BACKFILL_DELAY = float(os.getenv("FILL_BACKFILL_DELAY", "1.0"))  # Delay between requests in seconds
+
+# Rate limiting settings for Hyperliquid API
+# Target: stay under 1200 weight/minute = 20 weight/second
+# userFills = weight 20, so max ~1 req/second for fills
+HL_API_RATE_LIMIT_DELAY = float(os.getenv("HL_API_RATE_LIMIT_DELAY", "1.0"))  # Min delay between API calls
+HL_API_MAX_RETRIES = int(os.getenv("HL_API_MAX_RETRIES", "3"))  # Max retries on 429
+
 # In-memory cache for PnL curves: {address: (timestamp, curve_data)}
 _pnl_curve_cache: Dict[str, tuple] = {}
+
+# In-memory cache for user fills during refresh: {address: fills_list}
+# This cache is cleared after each refresh cycle to avoid stale data
+_fills_cache: Dict[str, List[Dict[str, Any]]] = {}
+
+# Background refresh state
+class RefreshState:
+    """Tracks the state of background Alpha Pool refresh."""
+    def __init__(self):
+        self.is_running = False
+        self.started_at: Optional[datetime] = None
+        self.completed_at: Optional[datetime] = None
+        self.current_step: str = "idle"
+        self.progress: int = 0  # 0-100
+        self.total_traders: int = 0
+        self.processed_traders: int = 0
+        self.result: Optional[Dict[str, Any]] = None
+        self.error: Optional[str] = None
+        self._lock = asyncio.Lock()
+
+    async def start(self):
+        async with self._lock:
+            self.is_running = True
+            self.started_at = datetime.now(timezone.utc)
+            self.completed_at = None
+            self.current_step = "starting"
+            self.progress = 0
+            self.total_traders = 0
+            self.processed_traders = 0
+            self.result = None
+            self.error = None
+
+    async def update(self, step: str, progress: int, processed: int = 0, total: int = 0):
+        async with self._lock:
+            self.current_step = step
+            self.progress = progress
+            self.processed_traders = processed
+            self.total_traders = total
+
+    async def complete(self, result: Dict[str, Any]):
+        async with self._lock:
+            self.is_running = False
+            self.completed_at = datetime.now(timezone.utc)
+            self.current_step = "completed"
+            self.progress = 100
+            self.result = result
+            self.error = None
+
+    async def fail(self, error: str):
+        async with self._lock:
+            self.is_running = False
+            self.completed_at = datetime.now(timezone.utc)
+            self.current_step = "failed"
+            self.error = error
+
+    async def get_status(self) -> Dict[str, Any]:
+        async with self._lock:
+            elapsed = None
+            if self.started_at:
+                end = self.completed_at or datetime.now(timezone.utc)
+                elapsed = (end - self.started_at).total_seconds()
+            return {
+                "is_running": self.is_running,
+                "started_at": self.started_at.isoformat() if self.started_at else None,
+                "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+                "elapsed_seconds": elapsed,
+                "current_step": self.current_step,
+                "progress": self.progress,
+                "processed_traders": self.processed_traders,
+                "total_traders": self.total_traders,
+                "result": self.result,
+                "error": self.error,
+            }
+
+_refresh_state = RefreshState()
+
+
+class RateLimiter:
+    """
+    Token bucket rate limiter for Hyperliquid API calls.
+
+    Hyperliquid limits: 1200 weight/minute per IP
+    - userFills: weight 20 (paginated, +1 per 20 items)
+    - portfolio: weight 20
+    - subAccounts: weight 20 (assumed)
+    - clearinghouseState: weight 2
+
+    Safe target: ~50 weight/second = 3000 weight/minute (2.5x safety margin)
+    For weight-20 calls: ~2.5 calls/second max
+    """
+
+    def __init__(self, calls_per_second: float = 2.0):
+        self._min_interval = 1.0 / calls_per_second
+        self._last_call = 0.0
+        self._lock = asyncio.Lock()
+
+    async def acquire(self):
+        """Wait until a request can be made within rate limits."""
+        async with self._lock:
+            now = asyncio.get_event_loop().time()
+            elapsed = now - self._last_call
+            if elapsed < self._min_interval:
+                wait_time = self._min_interval - elapsed
+                await asyncio.sleep(wait_time)
+            self._last_call = asyncio.get_event_loop().time()
+
+
+# Global rate limiter for Hyperliquid API
+# Hyperliquid: 1200 weight/minute, userFills = weight 20
+# Safe limit: 1200/20 = 60 calls/minute = 1 call/second
+# Default to 0.8 calls/second (48/min) for safety margin
+_hl_rate_limiter = RateLimiter(calls_per_second=float(os.getenv("HL_API_CALLS_PER_SECOND", "0.8")))
+
+
+async def fetch_user_fills_from_api(
+    client: httpx.AsyncClient,
+    address: str,
+    max_retries: int = HL_API_MAX_RETRIES,
+    use_cache: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch user fills from Hyperliquid API with rate limiting.
+
+    Returns all BTC/ETH fills for the address.
+    Uses rate limiter to stay under Hyperliquid's 1200 weight/minute limit.
+
+    Args:
+        client: Async HTTP client
+        address: Ethereum address
+        max_retries: Max retries on rate limit (uses Retry-After when available)
+        use_cache: Whether to check/update the fills cache
+    """
+    addr_lower = address.lower()
+
+    # Check cache first if enabled
+    if use_cache and addr_lower in _fills_cache:
+        return _fills_cache[addr_lower]
+
+    for attempt in range(max_retries + 1):
+        try:
+            # Rate limit before making the call
+            await _hl_rate_limiter.acquire()
+
+            response = await client.post(
+                HYPERLIQUID_INFO_URL,
+                json={"type": "userFills", "user": addr_lower},
+                timeout=15.0,
+            )
+
+            if response.status_code == 429:
+                if attempt < max_retries:
+                    # Check for Retry-After header
+                    retry_after = response.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            delay = float(retry_after)
+                        except ValueError:
+                            delay = (attempt + 1) * 2.0
+                    else:
+                        delay = (attempt + 1) * 2.0
+                    print(f"[hl-sage] Rate limited on fills for {addr_lower[:10]}..., retry {attempt + 1} in {delay:.1f}s")
+                    await asyncio.sleep(delay)
+                    continue
+                return []
+
+            if response.status_code != 200:
+                return []
+
+            fills = response.json()
+            if not isinstance(fills, list):
+                return []
+
+            # Filter to BTC/ETH only
+            result = []
+            for f in fills:
+                coin = f.get("coin", "").upper()
+                if coin not in ("BTC", "ETH"):
+                    continue
+                result.append({
+                    "coin": coin,
+                    "px": float(f.get("px", 0)),
+                    "sz": float(f.get("sz", 0)),
+                    "side": f.get("side", "B"),  # B=buy, A=ask(sell)
+                    "time": int(f.get("time", 0)),
+                    "startPosition": float(f.get("startPosition", 0)),
+                    "closedPnl": float(f.get("closedPnl", 0)) if f.get("closedPnl") else None,
+                    "fee": float(f.get("fee", 0)) if f.get("fee") else None,
+                    "hash": f.get("hash"),
+                })
+
+            # Cache the result for reuse during same refresh cycle
+            if use_cache:
+                _fills_cache[addr_lower] = result
+
+            return result
+        except Exception as e:
+            if attempt < max_retries:
+                await asyncio.sleep(1.0)
+                continue
+            print(f"[hl-sage] Error fetching fills for {address}: {e}")
+            return []
+    return []
+
+
+async def publish_fill_to_nats(payload: Dict[str, Any]) -> None:
+    """
+    Publish a backfilled fill to NATS for hl-decide to process.
+
+    Converts the hl_events payload format to FillEvent format and publishes
+    to c.fills.v1 subject for episode building and consensus detection.
+
+    Args:
+        payload: Fill payload in hl_events format
+    """
+    try:
+        # Convert to FillEvent format
+        fill_event = {
+            "fill_id": payload.get("hash") or f"backfill-{payload['address']}-{payload['at']}",
+            "source": "hyperliquid",
+            "address": payload["address"],
+            "asset": payload["symbol"].upper(),
+            "side": "buy" if "Long" in payload["action"] and ("Open" in payload["action"] or "Increase" in payload["action"]) else "sell",
+            "size": float(payload["size"]),
+            "price": float(payload["priceUsd"]),
+            "start_position": float(payload.get("startPosition", 0)),
+            "realized_pnl": float(payload["realizedPnlUsd"]) if payload.get("realizedPnlUsd") is not None else None,
+            "ts": payload["at"],
+            "meta": {"backfilled": True},
+        }
+
+        # Publish to NATS
+        if hasattr(app.state, "nc") and app.state.nc.is_connected:
+            await app.state.nc.publish(
+                "c.fills.v1",
+                json.dumps(fill_event).encode(),
+            )
+    except Exception as e:
+        # Don't fail backfill if NATS publish fails
+        print(f"[hl-sage] Failed to publish fill to NATS: {e}")
+
+
+async def backfill_historical_fills_for_addresses(
+    pool: asyncpg.Pool,
+    addresses: List[str],
+) -> Dict[str, int]:
+    """
+    Fetch and store historical BTC/ETH fills for the given addresses.
+
+    This is called when new addresses are added to the Alpha Pool to ensure
+    we have historical data for episode construction.
+
+    IMPORTANT: This function reuses fills from the _fills_cache populated by
+    analyze_user_fills() during the HFT filtering step. This avoids duplicate
+    API calls and saves rate limit budget.
+
+    Args:
+        pool: Database connection pool
+        addresses: List of addresses to backfill
+
+    Returns:
+        Dict mapping address -> number of fills inserted
+    """
+    if not addresses:
+        return {}
+
+    results: Dict[str, int] = {}
+    semaphore = asyncio.Semaphore(FILL_BACKFILL_CONCURRENCY)
+
+    async def backfill_one(client: httpx.AsyncClient, addr: str, index: int):
+        addr_lower = addr.lower()
+
+        # Check cache first - fills were already fetched during HFT filtering
+        if addr_lower in _fills_cache:
+            fills = _fills_cache[addr_lower]
+        else:
+            # Stagger requests to avoid rate limiting (only if not cached)
+            if index > 0:
+                await asyncio.sleep(FILL_BACKFILL_DELAY * index)
+            async with semaphore:
+                fills = await fetch_user_fills_from_api(client, addr, use_cache=True)
+
+        if not fills:
+            results[addr] = 0
+            print(f"[hl-sage] Backfill: no fills for {addr[:10]}... (cache={'hit' if addr_lower in _fills_cache else 'miss'})")
+            return
+
+        print(f"[hl-sage] Backfill: processing {len(fills)} fills for {addr[:10]}...")
+        inserted = 0
+        async with pool.acquire() as conn:
+            for f in fills:
+                # Calculate action from position change
+                delta = f["sz"] if f["side"] == "B" else -f["sz"]
+                start_pos = f["startPosition"]
+                new_pos = start_pos + delta
+
+                if start_pos == 0:
+                    action = "Open Long (Open New)" if delta > 0 else "Open Short (Open New)"
+                elif start_pos > 0:
+                    if delta > 0:
+                        action = "Increase Long"
+                    elif new_pos == 0:
+                        action = "Close Long (Close All)"
+                    else:
+                        action = "Decrease Long"
+                else:  # start_pos < 0
+                    if delta < 0:
+                        action = "Increase Short"
+                    elif new_pos == 0:
+                        action = "Close Short (Close All)"
+                    else:
+                        action = "Decrease Short"
+
+                # Build payload matching hl_events format
+                payload = {
+                    "at": datetime.fromtimestamp(f["time"] / 1000, tz=timezone.utc).isoformat(),
+                    "address": addr_lower,
+                    "symbol": f["coin"],
+                    "action": action,
+                    "size": abs(f["sz"]),
+                    "startPosition": start_pos,
+                    "priceUsd": f["px"],
+                    "realizedPnlUsd": f["closedPnl"],
+                    "fee": f["fee"],
+                    "hash": f["hash"],
+                }
+
+                # Insert into hl_events with dedup on hash
+                try:
+                    result = await conn.execute(
+                        """
+                        INSERT INTO hl_events (address, type, symbol, payload)
+                        SELECT $1, 'trade', $2, $3::jsonb
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM hl_events
+                            WHERE type = 'trade' AND payload->>'hash' = $4
+                        )
+                        """,
+                        addr_lower,
+                        f["coin"],
+                        json.dumps(payload),
+                        f["hash"],
+                    )
+                    # asyncpg returns "INSERT 0 1" for successful insert, "INSERT 0 0" if no rows inserted
+                    if result and result.endswith("1"):
+                        inserted += 1
+                        # Publish to NATS for hl-decide to process
+                        await publish_fill_to_nats(payload)
+                except asyncpg.exceptions.UniqueViolationError:
+                    # Duplicate hash - expected, skip
+                    pass
+                except Exception as e:
+                    # Log unexpected errors once per address
+                    if inserted == 0:
+                        print(f"[hl-sage] Backfill error for {addr[:10]}...: {type(e).__name__}: {e}")
+
+        results[addr] = inserted
+        if inserted > 0:
+            print(f"[hl-sage] Backfilled {inserted} fills for {addr[:10]}...")
+
+    async with httpx.AsyncClient() as client:
+        tasks = [backfill_one(client, addr, i) for i, addr in enumerate(addresses)]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    return results
 
 
 async def fetch_pnl_curve_from_api(
     client: httpx.AsyncClient,
     address: str,
-    window: str = "month",
+    window: str = "perpMonth",
     retries: int = 0,
 ) -> List[Dict[str, Any]]:
     """
@@ -605,22 +1342,32 @@ async def fetch_pnl_curve_from_api(
     Args:
         client: Async HTTP client
         address: Ethereum address
-        window: Time window ('day', 'week', 'month', 'allTime', 'period_30', etc.)
+        window: Time window ('perpMonth', 'perpWeek', 'month', 'week', etc.)
         retries: Current retry count
 
     Returns:
         List of {ts, value} points
     """
     try:
+        # Rate limit before making the call
+        await _hl_rate_limiter.acquire()
+
         response = await client.post(
             HYPERLIQUID_INFO_URL,
             json={"type": "portfolio", "user": address.lower()},
             timeout=PNL_CURVE_TIMEOUT,
         )
 
-        # Handle rate limiting with retry
+        # Handle rate limiting with retry and Retry-After header
         if response.status_code == 429 and retries < PNL_CURVE_MAX_RETRIES:
-            delay = (retries + 1) * 2.0  # Exponential backoff: 2s, 4s
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    delay = float(retry_after)
+                except ValueError:
+                    delay = (retries + 1) * 2.0
+            else:
+                delay = (retries + 1) * 2.0
             await asyncio.sleep(delay)
             return await fetch_pnl_curve_from_api(client, address, window, retries + 1)
 
@@ -635,8 +1382,9 @@ async def fetch_pnl_curve_from_api(
             if not isinstance(row, list) or len(row) < 2:
                 continue
             window_name = str(row[0] or "")
-            # Match 'month' or 'period_30' for 30-day curve
-            if window_name == window or window_name == "month":
+            # Match 'perpMonth' for 30-day perp-only PnL (excludes spot, funding noise)
+            # Fall back to 'month' if perpMonth not available
+            if window_name == window or window_name == "perpMonth":
                 history_data = row[1] or {}
                 pnl_history = history_data.get("pnlHistory", [])
                 if not isinstance(pnl_history, list):
@@ -667,17 +1415,17 @@ async def fetch_pnl_curve_from_api(
 
 async def get_pnl_curves_for_addresses(
     addresses: List[str],
-    window: str = "month",
+    window: str = "perpMonth",
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
     Fetch PnL curves for multiple addresses from Hyperliquid API with caching.
 
     Uses in-memory cache with TTL to avoid unnecessary API calls.
-    30-day PnL curves don't change frequently, so caching is safe.
+    30-day perp-only PnL curves don't change frequently, so caching is safe.
 
     Args:
         addresses: List of Ethereum addresses
-        window: Time window (default 'month' for 30-day curve)
+        window: Time window (default 'perpMonth' for 30-day perp-only curve)
 
     Returns:
         Dict mapping address -> list of {ts, value} points
@@ -786,7 +1534,13 @@ async def get_alpha_pool(
         # Fetch PnL curves directly from Hyperliquid API (decoupled from legacy leaderboard)
         # and nicknames from leaderboard entries
         addresses = [p.address for p in posteriors]
-        pnl_curves = await get_pnl_curves_for_addresses(addresses)
+
+        # Optimization: Only fetch PnL curves for selected traders + top performers
+        # This avoids slow API calls for 50 addresses (would take 15+ seconds)
+        # Limit to top 20 by NIG posterior mean (most likely to be useful)
+        pnl_curve_addresses = [p.address for p in posteriors[:20]]
+        pnl_curves = await get_pnl_curves_for_addresses(pnl_curve_addresses)
+
         nicknames = await get_nicknames_for_addresses(app.state.db, addresses)
 
         # Get pool refresh timing info
@@ -951,30 +1705,44 @@ ALPHA_POOL_REFRESH_HOURS = int(os.getenv("ALPHA_POOL_REFRESH_HOURS", "24"))  # R
 async def analyze_user_fills(
     client: httpx.AsyncClient,
     address: str,
-    max_retries: int = 2,
+    max_retries: int = HL_API_MAX_RETRIES,
 ) -> Dict[str, Any]:
     """
     Analyze user's fill history for HFT detection and BTC/ETH trading.
 
-    This combines multiple checks into one API call to avoid rate limits:
+    This uses the shared rate limiter and caches fills for later use by backfill.
+
+    Metrics computed:
     - orders_per_day: HFT detection (> 100 orders/day = HFT)
     - has_btc_eth: Whether trader has BTC or ETH fills
 
     Returns dict with analysis results, or None on error after retries.
     """
+    addr_lower = address.lower()
+
     for attempt in range(max_retries + 1):
         try:
+            # Rate limit before making the call
+            await _hl_rate_limiter.acquire()
+
             response = await client.post(
                 HYPERLIQUID_INFO_URL,
-                json={"type": "userFills", "user": address.lower()},
-                timeout=15.0,  # Increased timeout
+                json={"type": "userFills", "user": addr_lower},
+                timeout=15.0,
             )
 
-            # Handle rate limiting with retry
+            # Handle rate limiting with retry and Retry-After header
             if response.status_code == 429:
                 if attempt < max_retries:
-                    delay = (attempt + 1) * 2.0
-                    print(f"[hl-sage] Rate limited on fills for {address}, retry {attempt + 1} in {delay}s")
+                    retry_after = response.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            delay = float(retry_after)
+                        except ValueError:
+                            delay = (attempt + 1) * 2.0
+                    else:
+                        delay = (attempt + 1) * 2.0
+                    print(f"[hl-sage] Rate limited on fills for {addr_lower[:10]}..., retry {attempt + 1} in {delay:.1f}s")
                     await asyncio.sleep(delay)
                     continue
                 return None
@@ -989,23 +1757,35 @@ async def analyze_user_fills(
             if not isinstance(fills, list):
                 return None
 
+            # Cache the raw fills for later use by backfill
+            # Filter to BTC/ETH and convert to cached format
+            btc_eth_fills = []
+            for f in fills:
+                coin = f.get("coin", "").upper()
+                if coin in ("BTC", "ETH"):
+                    btc_eth_fills.append({
+                        "coin": coin,
+                        "px": float(f.get("px", 0)),
+                        "sz": float(f.get("sz", 0)),
+                        "side": f.get("side", "B"),
+                        "time": int(f.get("time", 0)),
+                        "startPosition": float(f.get("startPosition", 0)),
+                        "closedPnl": float(f.get("closedPnl", 0)) if f.get("closedPnl") else None,
+                        "fee": float(f.get("fee", 0)) if f.get("fee") else None,
+                        "hash": f.get("hash"),
+                    })
+            _fills_cache[addr_lower] = btc_eth_fills
+
             result = {
                 "orders_per_day": 0.0,
-                "has_btc_eth": False,
+                "has_btc_eth": len(btc_eth_fills) > 0,
                 "fill_count": len(fills),
             }
 
             if len(fills) == 0:
                 return result
 
-            # Check for BTC/ETH fills
-            for fill in fills:
-                coin = fill.get("coin", "").upper()
-                if coin in ("BTC", "ETH"):
-                    result["has_btc_eth"] = True
-                    break
-
-            # Calculate orders per day for HFT detection
+            # Calculate orders per day for HFT detection (use all fills, not just BTC/ETH)
             orders_by_id: Dict[str, List[dict]] = {}
             for fill in fills:
                 oid = str(fill.get("oid", ""))
@@ -1026,7 +1806,7 @@ async def analyze_user_fills(
             return result
         except httpx.TimeoutException:
             if attempt < max_retries:
-                print(f"[hl-sage] Timeout on fills for {address}, retry {attempt + 1}")
+                print(f"[hl-sage] Timeout on fills for {addr_lower[:10]}..., retry {attempt + 1}")
                 await asyncio.sleep(1.0)
                 continue
             print(f"[hl-sage] Timeout analyzing fills for {address} after {max_retries + 1} attempts")
@@ -1039,6 +1819,7 @@ async def analyze_user_fills(
 
 async def fetch_leaderboard_from_api(
     limit: int = 100,
+    progress_callback: Optional[callable] = None,
 ) -> List[Dict[str, Any]]:
     """
     Fetch top traders from Hyperliquid leaderboard API with quality filtering.
@@ -1054,6 +1835,7 @@ async def fetch_leaderboard_from_api(
 
     Args:
         limit: Number of qualified traders to return
+        progress_callback: Optional async callback(step, progress, processed, total) for progress updates
 
     Returns:
         List of qualified trader data sorted by 30d PnL descending
@@ -1154,12 +1936,24 @@ async def fetch_leaderboard_from_api(
             # Sort by PnL descending before API-based checks
             qualified_traders.sort(key=lambda t: t["pnl"], reverse=True)
 
+            # Report progress: initial filtering complete
+            if progress_callback:
+                await progress_callback("filtering_candidates", 10, 0, len(qualified_traders))
+
             # 5, 6, 7. API-based filters: HFT, subaccounts, and BTC/ETH trading history
             # These require individual API calls so we do them last
             final_traders = []
+            processed_count = 0
+            total_candidates = len(qualified_traders)
             for trader in qualified_traders:
                 if len(final_traders) >= limit:
                     break
+
+                processed_count += 1
+                # Report progress: processing candidates (10-80% range)
+                if progress_callback and processed_count % 5 == 0:
+                    progress = 10 + int((processed_count / total_candidates) * 70)
+                    await progress_callback("analyzing_traders", min(progress, 80), processed_count, total_candidates)
 
                 # 5 & 7. Combined fill analysis (HFT + BTC/ETH check in one API call)
                 fill_analysis = await analyze_user_fills(client, trader["address"])
@@ -1200,9 +1994,173 @@ async def fetch_leaderboard_from_api(
         return []
 
 
+async def _do_refresh_alpha_pool(limit: int, report_progress: bool = True) -> Dict[str, Any]:
+    """
+    Internal function to perform Alpha Pool refresh with progress tracking.
+
+    Args:
+        limit: Number of traders to fetch
+        report_progress: Whether to update _refresh_state with progress
+
+    Returns:
+        Dict with refresh results
+    """
+    async def progress_callback(step: str, progress: int, processed: int, total: int):
+        if report_progress:
+            await _refresh_state.update(step, progress, processed, total)
+
+    try:
+        # Fetch from Hyperliquid with quality filtering
+        if report_progress:
+            await _refresh_state.update("fetching_leaderboard", 5, 0, 0)
+
+        traders = await fetch_leaderboard_from_api(limit=limit, progress_callback=progress_callback)
+        if not traders:
+            raise Exception("Failed to fetch qualified traders from Hyperliquid (check filter thresholds)")
+
+        if report_progress:
+            await _refresh_state.update("saving_traders", 85, len(traders), len(traders))
+
+        # Upsert into alpha_pool_addresses and track newly inserted addresses
+        newly_inserted_addresses = []
+        async with app.state.db.acquire() as conn:
+            inserted = 0
+            updated = 0
+            for trader in traders:
+                # Check if address already exists
+                existing = await conn.fetchval(
+                    "SELECT 1 FROM alpha_pool_addresses WHERE address = $1",
+                    trader["address"],
+                )
+
+                result = await conn.execute(
+                    """
+                    INSERT INTO alpha_pool_addresses (address, nickname, account_value, pnl_30d, roi_30d, win_rate, last_refreshed, is_active)
+                    VALUES ($1, $2, $3, $4, $5, $6, NOW(), true)
+                    ON CONFLICT (address) DO UPDATE SET
+                        nickname = COALESCE(EXCLUDED.nickname, alpha_pool_addresses.nickname),
+                        account_value = EXCLUDED.account_value,
+                        pnl_30d = EXCLUDED.pnl_30d,
+                        roi_30d = EXCLUDED.roi_30d,
+                        win_rate = EXCLUDED.win_rate,
+                        last_refreshed = NOW(),
+                        is_active = true
+                    """,
+                    trader["address"],
+                    trader.get("display_name"),
+                    trader["account_value"],
+                    trader["pnl"],
+                    trader.get("roi", 0.0),
+                    trader["win_rate"],
+                )
+                if not existing:
+                    inserted += 1
+                    newly_inserted_addresses.append(trader["address"])
+                else:
+                    updated += 1
+
+            # Deactivate addresses not in the new batch
+            new_addresses = [t["address"] for t in traders]
+            await conn.execute(
+                """
+                UPDATE alpha_pool_addresses
+                SET is_active = false
+                WHERE address NOT IN (SELECT UNNEST($1::text[]))
+                  AND is_active = true
+                """,
+                new_addresses,
+            )
+
+        if report_progress:
+            await _refresh_state.update("backfilling_fills", 90, len(traders), len(traders))
+
+        # Backfill historical fills for NEWLY INSERTED addresses only
+        # Existing addresses should already have their fills from previous backfills
+        if newly_inserted_addresses:
+            print(f"[hl-sage] Starting historical fill backfill for {len(newly_inserted_addresses)} NEW addresses...")
+            backfill_results = await backfill_historical_fills_for_addresses(app.state.db, newly_inserted_addresses)
+            total_fills_inserted = sum(backfill_results.values())
+            print(f"[hl-sage] Backfill complete: {total_fills_inserted} fills inserted for {len(backfill_results)} addresses")
+        else:
+            print(f"[hl-sage] No new addresses to backfill (all {len(traders)} addresses already existed)")
+
+        # Clear fills cache after backfill - no longer needed and prevents stale data
+        _fills_cache.clear()
+        print(f"[hl-sage] Cleared fills cache after backfill")
+
+        if report_progress:
+            await _refresh_state.update("reconciling", 95, len(traders), len(traders))
+
+        # Notify hl-decide to reconcile the new fills into episodes
+        try:
+            async with httpx.AsyncClient() as client:
+                # Use internal Docker port 8080, not external mapped port
+                decide_url = os.getenv("DECIDE_URL", "http://hl-decide:8080")
+                response = await client.post(f"{decide_url}/reconcile", timeout=60.0)
+                if response.status_code == 200:
+                    reconcile_result = response.json()
+                    print(f"[hl-sage] hl-decide reconciliation: {reconcile_result}")
+                else:
+                    print(f"[hl-sage] hl-decide reconciliation failed: {response.status_code}")
+        except Exception as e:
+            print(f"[hl-sage] Failed to notify hl-decide for reconciliation: {e}")
+
+        return {
+            "success": True,
+            "fetched": len(traders),
+            "inserted": inserted,
+            "updated": updated,
+            "fills_backfilled": total_fills_inserted,
+            "filters": {
+                "min_pnl": ALPHA_POOL_MIN_PNL,
+                "min_roi": ALPHA_POOL_MIN_ROI,
+                "min_account_value": ALPHA_POOL_MIN_ACCOUNT_VALUE,
+                "min_week_vlm": ALPHA_POOL_MIN_WEEK_VLM,
+                "max_orders_per_day": ALPHA_POOL_MAX_ORDERS_PER_DAY,
+            },
+        }
+    except Exception as e:
+        # Clear cache on error too
+        _fills_cache.clear()
+        raise
+
+
+async def _background_refresh_task(limit: int):
+    """Background task wrapper for refresh with error handling."""
+    try:
+        await _refresh_state.start()
+        result = await _do_refresh_alpha_pool(limit, report_progress=True)
+        await _refresh_state.complete(result)
+        print(f"[hl-sage] Background refresh completed: {result}")
+    except Exception as e:
+        await _refresh_state.fail(str(e))
+        print(f"[hl-sage] Background refresh failed: {e}")
+
+
+@app.get("/alpha-pool/refresh/status")
+async def get_refresh_status():
+    """
+    Get the status of the Alpha Pool refresh operation.
+
+    Returns current state including:
+    - is_running: Whether a refresh is in progress
+    - started_at: When the current/last refresh started
+    - completed_at: When the last refresh completed
+    - elapsed_seconds: Duration of current/last refresh
+    - current_step: Current operation (fetching_leaderboard, analyzing_traders, etc.)
+    - progress: Progress percentage (0-100)
+    - processed_traders: Number of traders processed so far
+    - total_traders: Total traders to process
+    - result: Final result (if completed)
+    - error: Error message (if failed)
+    """
+    return await _refresh_state.get_status()
+
+
 @app.post("/alpha-pool/refresh")
 async def refresh_alpha_pool(
     limit: int = Query(default=ALPHA_POOL_DEFAULT_SIZE, ge=10, le=200),
+    background: bool = Query(default=True, description="Run refresh in background (non-blocking)"),
 ):
     """
     Refresh Alpha Pool addresses from Hyperliquid leaderboard API.
@@ -1226,72 +2184,38 @@ async def refresh_alpha_pool(
 
     The refresh deactivates addresses not in the new batch (is_active=false)
     rather than deleting them, preserving historical data.
+
+    Args:
+        limit: Number of traders to fetch (default 50)
+        background: If true (default), runs in background and returns immediately.
+                   Use GET /alpha-pool/refresh/status to check progress.
     """
-    try:
-        # Fetch from Hyperliquid with quality filtering
-        traders = await fetch_leaderboard_from_api(limit=limit)
-        if not traders:
-            raise HTTPException(status_code=502, detail="Failed to fetch qualified traders from Hyperliquid (check filter thresholds)")
+    # Check if refresh is already running
+    status = await _refresh_state.get_status()
+    if status["is_running"]:
+        raise HTTPException(
+            status_code=409,
+            detail="A refresh is already in progress. Check /alpha-pool/refresh/status for progress."
+        )
 
-        # Upsert into alpha_pool_addresses
-        async with app.state.db.acquire() as conn:
-            inserted = 0
-            updated = 0
-            for trader in traders:
-                result = await conn.execute(
-                    """
-                    INSERT INTO alpha_pool_addresses (address, nickname, account_value, pnl_30d, roi_30d, win_rate, last_refreshed, is_active)
-                    VALUES ($1, $2, $3, $4, $5, $6, NOW(), true)
-                    ON CONFLICT (address) DO UPDATE SET
-                        nickname = COALESCE(EXCLUDED.nickname, alpha_pool_addresses.nickname),
-                        account_value = EXCLUDED.account_value,
-                        pnl_30d = EXCLUDED.pnl_30d,
-                        roi_30d = EXCLUDED.roi_30d,
-                        win_rate = EXCLUDED.win_rate,
-                        last_refreshed = NOW(),
-                        is_active = true
-                    """,
-                    trader["address"],
-                    trader.get("display_name"),
-                    trader["account_value"],
-                    trader["pnl"],
-                    trader.get("roi", 0.0),
-                    trader["win_rate"],
-                )
-                if "INSERT" in result:
-                    inserted += 1
-                else:
-                    updated += 1
-
-            # Deactivate addresses not in the new batch
-            new_addresses = [t["address"] for t in traders]
-            await conn.execute(
-                """
-                UPDATE alpha_pool_addresses
-                SET is_active = false
-                WHERE address NOT IN (SELECT UNNEST($1::text[]))
-                  AND is_active = true
-                """,
-                new_addresses,
-            )
-
+    if background:
+        # Start background task and return immediately
+        asyncio.create_task(_background_refresh_task(limit))
         return {
-            "success": True,
-            "fetched": len(traders),
-            "inserted": inserted,
-            "updated": updated,
-            "filters": {
-                "min_pnl": ALPHA_POOL_MIN_PNL,
-                "min_roi": ALPHA_POOL_MIN_ROI,
-                "min_account_value": ALPHA_POOL_MIN_ACCOUNT_VALUE,
-                "min_week_vlm": ALPHA_POOL_MIN_WEEK_VLM,
-                "max_orders_per_day": ALPHA_POOL_MAX_ORDERS_PER_DAY,
-            },
+            "status": "started",
+            "message": "Refresh started in background. Check /alpha-pool/refresh/status for progress.",
+            "limit": limit,
         }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to refresh alpha pool: {e}")
+    else:
+        # Synchronous execution (blocking)
+        try:
+            await _refresh_state.start()
+            result = await _do_refresh_alpha_pool(limit, report_progress=True)
+            await _refresh_state.complete(result)
+            return result
+        except Exception as e:
+            await _refresh_state.fail(str(e))
+            raise HTTPException(status_code=500, detail=f"Failed to refresh alpha pool: {e}")
 
 
 @app.get("/alpha-pool/addresses")
@@ -1334,3 +2258,514 @@ async def list_alpha_pool_addresses(
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to list addresses: {e}")
+
+
+@app.post("/alpha-pool/backfill/{address}")
+async def backfill_address_fills(address: str):
+    """
+    Backfill historical fills for a specific address.
+
+    This fetches fills from Hyperliquid API and stores them in hl_events.
+    Useful for:
+    - Addresses that were added to the pool but backfill failed
+    - Inactive addresses that need historical data
+    - Manual data recovery
+
+    The address must exist in alpha_pool_addresses (active or inactive).
+    """
+    addr_lower = address.lower()
+
+    # Verify address is in the pool (active or inactive)
+    async with app.state.db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT address, is_active FROM alpha_pool_addresses WHERE address = $1",
+            addr_lower,
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Address {address} not found in Alpha Pool")
+
+    # Perform backfill
+    try:
+        results = await backfill_historical_fills_for_addresses(app.state.db, [addr_lower])
+        inserted = results.get(addr_lower, 0)
+        return {
+            "address": addr_lower,
+            "fills_inserted": inserted,
+            "is_active": row["is_active"],
+            "message": f"Backfilled {inserted} fills for {addr_lower[:10]}...",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to backfill: {e}")
+
+
+@app.post("/alpha-pool/backfill-all")
+async def backfill_all_addresses(
+    delay_ms: int = Query(default=500, ge=100, le=5000, description="Delay between requests in milliseconds"),
+    active_only: bool = Query(default=True, description="Only backfill active addresses"),
+):
+    """
+    Backfill historical fills for ALL Alpha Pool addresses.
+
+    Use this after a fresh system rebuild to populate historical data.
+    Respects rate limits with configurable delay between requests.
+
+    Args:
+        delay_ms: Milliseconds to wait between API calls (default 500ms)
+        active_only: If true, only backfill active addresses (default true)
+
+    Returns:
+        Summary of backfill results for all addresses
+    """
+    import asyncio
+
+    # Get all addresses
+    async with app.state.db.acquire() as conn:
+        if active_only:
+            rows = await conn.fetch(
+                "SELECT address FROM alpha_pool_addresses WHERE is_active = true ORDER BY added_at"
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT address FROM alpha_pool_addresses ORDER BY added_at"
+            )
+
+    addresses = [row["address"] for row in rows]
+
+    if not addresses:
+        return {
+            "total_addresses": 0,
+            "total_fills": 0,
+            "message": "No addresses found in Alpha Pool",
+        }
+
+    # Backfill each address with delay
+    results = {}
+    total_fills = 0
+    errors = []
+
+    for i, addr in enumerate(addresses):
+        try:
+            print(f"[backfill-all] ({i+1}/{len(addresses)}) Backfilling {addr[:10]}...")
+            result = await backfill_historical_fills_for_addresses(app.state.db, [addr])
+            inserted = result.get(addr, 0)
+            results[addr] = inserted
+            total_fills += inserted
+
+            # Rate limit delay (except for last address)
+            if i < len(addresses) - 1:
+                await asyncio.sleep(delay_ms / 1000.0)
+
+        except Exception as e:
+            print(f"[backfill-all] Error backfilling {addr}: {e}")
+            errors.append({"address": addr, "error": str(e)})
+            results[addr] = 0
+
+    return {
+        "total_addresses": len(addresses),
+        "total_fills": total_fills,
+        "addresses_with_fills": sum(1 for v in results.values() if v > 0),
+        "addresses_with_no_fills": sum(1 for v in results.values() if v == 0),
+        "errors": len(errors),
+        "error_details": errors[:10] if errors else [],  # First 10 errors
+        "message": f"Backfilled {total_fills} fills across {len(addresses)} addresses",
+    }
+
+
+# =====================
+# Shadow Ledger API (Phase 3f: Selection Integrity)
+# =====================
+#
+# The Shadow Ledger captures daily snapshots of all traders for survivorship-bias-free
+# analysis. It enables:
+# - Walk-forward replay without look-ahead bias
+# - Survival analysis (who blew up and when)
+# - FDR-controlled skill qualification
+# - Thompson sampling with stored draws for reproducibility
+# =====================
+
+
+@app.post("/snapshots/create")
+async def create_snapshot(
+    snapshot_date: Optional[str] = Query(default=None, description="Date in YYYY-MM-DD format (default: today)"),
+):
+    """
+    Create a daily snapshot for the Shadow Ledger.
+
+    This captures the current state of all traders including:
+    - Universe membership (leaderboard_scanned, candidate_filtered, quality_qualified, pool_selected)
+    - NIG posteriors and Thompson sampling draws with stored seeds
+    - FDR qualification via Benjamini-Hochberg procedure
+    - Death/censor event detection
+
+    Normally runs automatically at SNAPSHOT_HOUR_UTC, but can be triggered manually.
+
+    Args:
+        snapshot_date: Optional date to create snapshot for (default: today).
+                      Useful for backfilling historical snapshots.
+    """
+    try:
+        from datetime import date as date_type
+
+        target_date = None
+        if snapshot_date:
+            try:
+                target_date = date_type.fromisoformat(snapshot_date)
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"Invalid date format: {snapshot_date}. Use YYYY-MM-DD.")
+
+        result = await create_daily_snapshot(app.state.db, snapshot_date=target_date)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create snapshot: {e}")
+
+
+@app.get("/snapshots/summary")
+async def get_snapshots_summary(
+    snapshot_date: Optional[str] = Query(default=None, description="Date in YYYY-MM-DD format (default: today)"),
+):
+    """
+    Get summary statistics for a snapshot date.
+
+    Returns counts by universe membership and top selected traders.
+    """
+    try:
+        from datetime import date as date_type
+
+        target_date = None
+        if snapshot_date:
+            try:
+                target_date = date_type.fromisoformat(snapshot_date)
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"Invalid date format: {snapshot_date}. Use YYYY-MM-DD.")
+
+        result = await get_snapshot_summary(app.state.db, snapshot_date=target_date)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get snapshot summary: {e}")
+
+
+@app.get("/snapshots/universe")
+async def get_universe_at_date(
+    evaluation_date: str = Query(..., description="Date in YYYY-MM-DD format"),
+    version: Optional[str] = Query(default=None, description="Selection version (default: current)"),
+):
+    """
+    Get the trader universe as-of a specific date.
+
+    CRITICAL: This uses the snapshot table, NOT current qualification.
+    This prevents look-ahead bias in walk-forward replay.
+
+    Returns the list of addresses that were in the universe on that date.
+    """
+    try:
+        from datetime import date as date_type
+
+        try:
+            target_date = date_type.fromisoformat(evaluation_date)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid date format: {evaluation_date}. Use YYYY-MM-DD.")
+
+        addresses = await load_universe_at_date(
+            app.state.db,
+            evaluation_date=target_date,
+            version=version or SELECTION_VERSION,
+        )
+
+        return {
+            "evaluation_date": target_date.isoformat(),
+            "version": version or SELECTION_VERSION,
+            "count": len(addresses),
+            "addresses": addresses,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get universe: {e}")
+
+
+@app.get("/snapshots/history")
+async def get_snapshot_history(
+    address: str = Query(..., description="Trader address"),
+    limit: int = Query(default=30, ge=1, le=365),
+):
+    """
+    Get snapshot history for a specific trader.
+
+    Returns the trader's snapshots over time, useful for:
+    - Analyzing performance trajectory
+    - Understanding universe membership changes
+    - Detecting death/censor events
+    """
+    try:
+        addr_lower = address.lower()
+        async with app.state.db.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    snapshot_date,
+                    selection_version,
+                    is_leaderboard_scanned,
+                    is_candidate_filtered,
+                    is_quality_qualified,
+                    is_pool_selected,
+                    avg_r_gross,
+                    avg_r_net,
+                    nig_mu as nig_m,
+                    nig_kappa,
+                    thompson_draw,
+                    skill_p_value,
+                    fdr_qualified,
+                    event_type,
+                    death_type,
+                    censor_type,
+                    episode_count,
+                    selection_rank
+                FROM trader_snapshots
+                WHERE address = $1
+                ORDER BY snapshot_date DESC
+                LIMIT $2
+                """,
+                addr_lower,
+                limit,
+            )
+
+        return {
+            "address": addr_lower,
+            "count": len(rows),
+            "snapshots": [dict(row) for row in rows],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get snapshot history: {e}")
+
+
+@app.get("/snapshots/deaths")
+async def get_death_events(
+    days: int = Query(default=30, ge=1, le=365),
+    death_type: Optional[str] = Query(default=None, description="Filter by death type"),
+):
+    """
+    Get recent death events from the Shadow Ledger.
+
+    Death types (terminal events):
+    - liquidation: Account liquidated on Hyperliquid
+    - drawdown_80: Current equity < 20% of peak
+    - account_value_floor: Account dropped below $10k
+    - negative_equity: Account value <= 0
+
+    Useful for survival analysis and understanding trader lifecycle.
+    """
+    try:
+        from datetime import date as date_type
+
+        cutoff_date = date_type.today() - timedelta(days=days)
+
+        async with app.state.db.acquire() as conn:
+            if death_type:
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        address,
+                        snapshot_date,
+                        death_type,
+                        account_value,
+                        peak_account_value,
+                        avg_r_net,
+                        episode_count
+                    FROM trader_snapshots
+                    WHERE event_type = 'death'
+                      AND death_type = $1
+                      AND snapshot_date >= $2
+                    ORDER BY snapshot_date DESC
+                    """,
+                    death_type,
+                    cutoff_date,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        address,
+                        snapshot_date,
+                        death_type,
+                        account_value,
+                        peak_account_value,
+                        avg_r_net,
+                        episode_count
+                    FROM trader_snapshots
+                    WHERE event_type = 'death'
+                      AND snapshot_date >= $2
+                    ORDER BY snapshot_date DESC
+                    """,
+                    cutoff_date,
+                )
+
+        # Group by death type
+        by_type = {}
+        for row in rows:
+            dt = row["death_type"]
+            if dt not in by_type:
+                by_type[dt] = []
+            by_type[dt].append(dict(row))
+
+        return {
+            "period_days": days,
+            "total_deaths": len(rows),
+            "by_type": {k: len(v) for k, v in by_type.items()},
+            "events": [dict(row) for row in rows],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get death events: {e}")
+
+
+@app.get("/snapshots/config")
+async def get_snapshot_config():
+    """
+    Get current snapshot configuration.
+    """
+    from .snapshot import (
+        SNAPSHOT_FDR_ALPHA,
+        SNAPSHOT_MIN_EPISODES,
+        SNAPSHOT_MIN_AVG_R_NET,
+        DEATH_DRAWDOWN_PCT,
+        DEATH_ACCOUNT_FLOOR,
+        CENSOR_INACTIVE_DAYS,
+        ROUND_TRIP_COST_BPS,
+    )
+
+    return {
+        "enabled": SNAPSHOT_ENABLED,
+        "hour_utc": SNAPSHOT_HOUR_UTC,
+        "selection_version": SELECTION_VERSION,
+        "fdr_alpha": SNAPSHOT_FDR_ALPHA,
+        "min_episodes": SNAPSHOT_MIN_EPISODES,
+        "min_avg_r_net": SNAPSHOT_MIN_AVG_R_NET,
+        "round_trip_cost_bps": ROUND_TRIP_COST_BPS,
+        "death_thresholds": {
+            "drawdown_pct": DEATH_DRAWDOWN_PCT,
+            "account_floor": DEATH_ACCOUNT_FLOOR,
+        },
+        "censor_thresholds": {
+            "inactive_days": CENSOR_INACTIVE_DAYS,
+        },
+    }
+
+
+# =====================
+# Walk-Forward Replay API (Phase 3f)
+# =====================
+
+
+@app.post("/replay/run")
+async def run_replay(
+    start_date: str = Query(..., description="Start date in YYYY-MM-DD format"),
+    end_date: Optional[str] = Query(default=None, description="End date in YYYY-MM-DD (default: today)"),
+    evaluation_days: int = Query(default=REPLAY_EVALUATION_DAYS, ge=1, le=30),
+    version: Optional[str] = Query(default=None, description="Selection version (default: current)"),
+):
+    """
+    Run a walk-forward replay over a date range.
+
+    This provides an honest out-of-sample assessment:
+    - Selection uses only data available at selection_date (from snapshots)
+    - Performance measured on FUTURE data (not training data)
+    - Costs included in net returns
+
+    Process for each snapshot date:
+    1. Load traders selected on that date (from trader_snapshots)
+    2. Evaluate their performance over the next evaluation_days
+    3. Compute gross and net R-multiples (with costs)
+    4. Track deaths/censors
+
+    Args:
+        start_date: First selection date to replay
+        end_date: Last selection date to replay (default: today)
+        evaluation_days: Days to evaluate each selection (default: 7)
+        version: Selection version to replay (default: current)
+    """
+    try:
+        from datetime import date as date_type
+
+        try:
+            start = date_type.fromisoformat(start_date)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid start_date format: {start_date}")
+
+        if end_date:
+            try:
+                end = date_type.fromisoformat(end_date)
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"Invalid end_date format: {end_date}")
+        else:
+            end = date_type.today()
+
+        if start > end:
+            raise HTTPException(status_code=400, detail="start_date must be before end_date")
+
+        summary = await run_walk_forward_replay(
+            app.state.db,
+            start_date=start,
+            end_date=end,
+            evaluation_days=evaluation_days,
+            version=version or SELECTION_VERSION,
+        )
+
+        return format_replay_summary(summary)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to run replay: {e}")
+
+
+@app.get("/replay/period")
+async def replay_period(
+    selection_date: str = Query(..., description="Date in YYYY-MM-DD format"),
+    evaluation_days: int = Query(default=REPLAY_EVALUATION_DAYS, ge=1, le=30),
+    version: Optional[str] = Query(default=None, description="Selection version"),
+):
+    """
+    Replay a single selection period.
+
+    Returns detailed results for traders selected on the given date,
+    including their performance over the evaluation window.
+    """
+    try:
+        from datetime import date as date_type
+
+        try:
+            target_date = date_type.fromisoformat(selection_date)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid date format: {selection_date}")
+
+        result = await replay_single_period(
+            app.state.db,
+            selection_date=target_date,
+            evaluation_days=evaluation_days,
+            version=version or SELECTION_VERSION,
+        )
+
+        if not result:
+            raise HTTPException(status_code=404, detail=f"No snapshot data for {selection_date}")
+
+        return {
+            "selection_date": result.selection_date.isoformat(),
+            "evaluation_start": result.evaluation_start.isoformat(),
+            "evaluation_end": result.evaluation_end.isoformat(),
+            "universe_size": result.universe_size,
+            "selected_count": result.selected_count,
+            "fdr_qualified_count": result.fdr_qualified_count,
+            "total_r_gross": round(result.total_r_gross, 4),
+            "total_r_net": round(result.total_r_net, 4),
+            "avg_r_gross": round(result.avg_r_gross, 4),
+            "avg_r_net": round(result.avg_r_net, 4),
+            "deaths": result.deaths_during_period,
+            "censored": result.censored_during_period,
+            "traders": result.trader_results,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to replay period: {e}")

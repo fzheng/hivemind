@@ -333,12 +333,33 @@ export interface LiveFill {
   fee_token?: string | null;
 }
 
+/**
+ * List all live fills from the database (for backward compatibility)
+ * @deprecated Use listLiveFillsForAddresses for tab-specific fills
+ */
 export async function listLiveFills(limit = 25): Promise<LiveFill[]> {
+  return listLiveFillsForAddresses([], limit);
+}
+
+/**
+ * List live fills filtered by addresses
+ * @param addresses - Array of addresses to filter by (empty = all addresses)
+ * @param limit - Maximum number of fills to return
+ */
+export async function listLiveFillsForAddresses(addresses: string[], limit = 25): Promise<LiveFill[]> {
   const safeLimit = Math.max(1, Math.min(200, limit));
+  const normalizedAddresses = addresses.map(a => a.toLowerCase());
   try {
     const p = await getPool();
-    const { rows } = await p.query(
-      `
+
+    // Build query based on whether addresses filter is provided
+    const hasAddressFilter = normalizedAddresses.length > 0;
+    const addressPlaceholders = normalizedAddresses.map((_, i) => `$${i + 2}`).join(', ');
+    const whereClause = hasAddressFilter
+      ? `WHERE type = 'trade' AND LOWER(address) IN (${addressPlaceholders})`
+      : `WHERE type = 'trade'`;
+
+    const query = `
         SELECT
           COALESCE((payload->>'at')::timestamptz, at) AS time_utc,
           address,
@@ -376,25 +397,27 @@ export async function listLiveFills(limit = 25): Promise<LiveFill[]> {
           (payload->>'fee')::numeric           AS fee,
           payload->>'feeToken'                 AS fee_token
         FROM hl_events
-        WHERE type = 'trade'
+        ${whereClause}
         ORDER BY time_utc DESC, id DESC
         LIMIT $1
-      `,
-      [safeLimit]
-    );
-    return rows.map((row: any) => ({
-      time_utc: row.time_utc,
-      address: row.address,
-      action: row.action,
+      `;
+
+    const params = hasAddressFilter ? [safeLimit, ...normalizedAddresses] : [safeLimit];
+    const { rows } = await p.query(query, params);
+
+    return rows.map((row: Record<string, unknown>) => ({
+      time_utc: row.time_utc as string,
+      address: row.address as string,
+      action: row.action as string,
       size_signed: row.size_signed != null ? Number(row.size_signed) : null,
       previous_position: row.previous_position != null ? Number(row.previous_position) : null,
       resulting_position: row.resulting_position != null ? Number(row.resulting_position) : null,
       price_usd: row.price_usd != null ? Number(row.price_usd) : null,
       closed_pnl_usd: row.closed_pnl_usd != null ? Number(row.closed_pnl_usd) : null,
-      tx_hash: row.tx_hash || null,
-      symbol: row.symbol || null,
+      tx_hash: (row.tx_hash as string) || null,
+      symbol: (row.symbol as string) || null,
       fee: row.fee != null ? Number(row.fee) : null,
-      fee_token: row.fee_token || null,
+      fee_token: (row.fee_token as string) || null,
     }));
   } catch (_e) {
     return [];
@@ -966,6 +989,53 @@ export async function getBackfillFills(opts: {
   } catch (e) {
     console.error('[persist] getBackfillFills failed:', e);
     return { fills: [], hasMore: false, oldestTime: null };
+  }
+}
+
+/**
+ * Get the most recent fill timestamp for each address.
+ * Used to display "Last Activity" in the dashboard without being dominated by HFT traders.
+ * @param addresses Array of addresses to get last activity for
+ * @returns Map of address to most recent fill timestamp
+ */
+export async function getLastActivityPerAddress(
+  addresses: string[]
+): Promise<Record<string, string>> {
+  if (addresses.length === 0) {
+    return {};
+  }
+  try {
+    const p = await getPool();
+    const normalizedAddresses = addresses.map(a => a.toLowerCase());
+
+    // Use DISTINCT ON to get the most recent fill per address efficiently
+    const sql = `
+      SELECT DISTINCT ON (address)
+        address,
+        COALESCE((payload->>'at')::timestamptz, at) AS last_activity
+      FROM hl_events
+      WHERE type = 'trade'
+        AND address = ANY($1)
+        AND (payload->>'symbol' IN ('BTC', 'ETH') OR (payload->>'symbol' IS NULL))
+      ORDER BY address, last_activity DESC
+    `;
+
+    const { rows } = await p.query(sql, [normalizedAddresses]);
+
+    const result: Record<string, string> = {};
+    for (const row of rows) {
+      const addr = String(row.address).toLowerCase();
+      const timeValue = row.last_activity;
+      const timeUtc = timeValue instanceof Date
+        ? timeValue.toISOString()
+        : String(timeValue);
+      result[addr] = timeUtc;
+    }
+
+    return result;
+  } catch (e) {
+    console.error('[persist] getLastActivityPerAddress failed:', e);
+    return {};
   }
 }
 

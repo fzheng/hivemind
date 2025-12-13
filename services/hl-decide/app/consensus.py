@@ -18,7 +18,7 @@ import statistics
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 # Configuration
@@ -28,7 +28,8 @@ CONSENSUS_MIN_PCT = float(os.getenv("CONSENSUS_MIN_PCT", "0.70"))
 CONSENSUS_MIN_EFFECTIVE_K = float(os.getenv("CONSENSUS_MIN_EFFECTIVE_K", "2.0"))
 CONSENSUS_BASE_WINDOW_S = int(os.getenv("CONSENSUS_BASE_WINDOW_S", "120"))
 CONSENSUS_MAX_STALENESS_FACTOR = float(os.getenv("CONSENSUS_MAX_STALENESS_FACTOR", "1.25"))
-CONSENSUS_MAX_PRICE_BAND_BPS = float(os.getenv("CONSENSUS_MAX_PRICE_BAND_BPS", "8.0"))
+CONSENSUS_MAX_PRICE_BAND_BPS = float(os.getenv("CONSENSUS_MAX_PRICE_BAND_BPS", "8.0"))  # Legacy fallback
+CONSENSUS_MAX_PRICE_DRIFT_R = float(os.getenv("CONSENSUS_MAX_PRICE_DRIFT_R", "0.25"))  # ATR-based: 0.25 R-units
 CONSENSUS_EV_MIN_R = float(os.getenv("CONSENSUS_EV_MIN_R", "0.20"))
 CONSENSUS_SYMBOLS = os.getenv("CONSENSUS_SYMBOLS", "BTC,ETH").split(",")
 
@@ -41,8 +42,84 @@ DEFAULT_SLIP_BPS = float(os.getenv("DEFAULT_SLIP_BPS", "10.0"))  # Expected slip
 # Default correlation (used when pairwise not computed)
 DEFAULT_CORRELATION = float(os.getenv("DEFAULT_CORRELATION", "0.3"))
 
-# Weight cap for individual traders
+# Weight cap for individual traders (legacy, deprecated)
 WEIGHT_CAP = float(os.getenv("CONSENSUS_WEIGHT_CAP", "1.0"))
+
+# Vote weighting configuration
+# Mode: "equity" (equity-normalized with sqrt), "log" (logarithmic), or "linear" (legacy)
+VOTE_WEIGHT_MODE = os.getenv("VOTE_WEIGHT_MODE", "log")  # Default to log until equity data available
+VOTE_WEIGHT_LOG_BASE = float(os.getenv("VOTE_WEIGHT_LOG_BASE", "10000.0"))  # $10k base for log
+VOTE_WEIGHT_MAX = float(os.getenv("VOTE_WEIGHT_MAX", "1.0"))  # Max weight per trader
+
+# ============================================================================
+# RISK DEFAULTS & FAIL-SAFES
+# ============================================================================
+# Until Kelly/risk sizing is implemented, enforce conservative static limits.
+# These are hard caps that prevent over-exposure regardless of signal quality.
+#
+# NOTE: These are conservative defaults. Adjust based on account size and risk tolerance.
+# These values should be overridden by proper Kelly sizing when Phase 4 is complete.
+# ============================================================================
+
+# Maximum position size as fraction of account equity (per position)
+# Default 2% = very conservative, prevents catastrophic single-trade losses
+MAX_POSITION_SIZE_PCT = float(os.getenv("MAX_POSITION_SIZE_PCT", "2.0"))
+
+# Maximum total exposure (sum of all open positions) as fraction of equity
+# Default 10% = allows up to 5 concurrent 2% positions
+MAX_TOTAL_EXPOSURE_PCT = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "10.0"))
+
+# Maximum daily loss before halting signals (as fraction of equity)
+# Default 5% = stop trading after 5% drawdown in a day
+MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "5.0"))
+
+# Minimum EV required to generate a signal (in R-multiples)
+# Higher values = fewer but higher quality signals
+# Note: This overrides CONSENSUS_EV_MIN_R for risk management
+MIN_SIGNAL_EV_R = float(os.getenv("MIN_SIGNAL_EV_R", str(CONSENSUS_EV_MIN_R)))
+
+# Minimum confidence (p_win) required for signal generation
+# Default 0.55 = require at least 55% estimated win probability
+MIN_SIGNAL_CONFIDENCE = float(os.getenv("MIN_SIGNAL_CONFIDENCE", "0.55"))
+
+# Maximum leverage allowed (if/when execution layer is added)
+# Default 1.0 = no leverage until proper risk sizing is implemented
+MAX_LEVERAGE = float(os.getenv("MAX_LEVERAGE", "1.0"))
+
+# Cooldown period between signals for the same symbol (seconds)
+# Prevents rapid-fire entries that could compound losses
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "300"))  # 5 minutes
+
+
+def check_risk_limits(signal: "ConsensusSignal") -> Tuple[bool, str]:
+    """
+    Check if a signal passes conservative risk limits.
+
+    This is a fail-safe before any position sizing logic.
+    Returns (passes, reason).
+
+    Args:
+        signal: The consensus signal to check
+
+    Returns:
+        Tuple of (passes_checks, reason_if_failed)
+    """
+    # Check minimum confidence
+    if signal.p_win < MIN_SIGNAL_CONFIDENCE:
+        return (
+            False,
+            f"Confidence {signal.p_win:.2f} < minimum {MIN_SIGNAL_CONFIDENCE:.2f}"
+        )
+
+    # Check minimum EV
+    if signal.ev_net_r < MIN_SIGNAL_EV_R:
+        return (
+            False,
+            f"EV {signal.ev_net_r:.3f}R < minimum {MIN_SIGNAL_EV_R:.3f}R"
+        )
+
+    # All checks passed
+    return (True, "")
 
 
 @dataclass
@@ -74,9 +151,11 @@ class Vote:
     """A trader's vote in a consensus window (one per trader)."""
     address: str
     direction: str  # "long" or "short"
-    weight: float  # Based on position size
+    weight: float  # Computed weight (see calculate_vote_weight)
     price: float  # Entry price (for price band check)
     ts: datetime  # Timestamp of vote
+    notional: float = 0.0  # Position notional in USD
+    equity: Optional[float] = None  # Trader's account equity (if available)
 
 
 @dataclass
@@ -129,7 +208,7 @@ class ConsensusDetector:
     1. Dispersion gate: Require supermajority agreement
     2. Effective-K gate: Correlation-adjusted trader count
     3. Latency gate: Reject stale signals
-    4. Price band gate: Reject if market moved too far
+    4. Price band gate: Reject if market moved too far (requires valid ATR)
     5. EV gate: Require positive expected value after costs
     """
 
@@ -137,6 +216,14 @@ class ConsensusDetector:
         self.windows: Dict[str, ConsensusWindow] = {}
         self.correlation_matrix: Dict[Tuple[str, str], float] = {}
         self.current_prices: Dict[str, float] = {}
+        # ATR-based stop fractions per asset (updated by ATR provider)
+        self.stop_fractions: Dict[str, float] = {
+            "BTC": 0.01,  # Default 1%, will be updated by ATR provider
+            "ETH": 0.01,
+        }
+        # Track ATR data quality for strict mode gating
+        # Maps symbol -> (is_valid_for_gating, reason)
+        self.atr_validity: Dict[str, Tuple[bool, str]] = {}
 
     def set_current_price(self, symbol: str, price: float) -> None:
         """Update current mid price for a symbol."""
@@ -145,6 +232,41 @@ class ConsensusDetector:
     def get_current_mid(self, symbol: str) -> float:
         """Get current mid price for a symbol."""
         return self.current_prices.get(symbol, 0.0)
+
+    def set_stop_fraction(
+        self,
+        symbol: str,
+        stop_fraction: float,
+        is_valid_for_gating: bool = True,
+        validity_reason: str = "",
+    ) -> None:
+        """
+        Update ATR-based stop fraction for a symbol.
+
+        Called by ATR provider when new ATR data is available.
+        Stop fraction = ATR × multiplier / price
+
+        Args:
+            symbol: Asset symbol (BTC, ETH)
+            stop_fraction: Stop distance as fraction (0.01 = 1%)
+            is_valid_for_gating: Whether the ATR data is valid for gating decisions
+            validity_reason: Reason for validity status (for logging)
+        """
+        self.stop_fractions[symbol.upper()] = max(0.001, min(0.10, stop_fraction))
+        self.atr_validity[symbol.upper()] = (is_valid_for_gating, validity_reason)
+
+    def get_stop_fraction(self, symbol: str) -> float:
+        """Get current stop fraction for a symbol (default 1%)."""
+        return self.stop_fractions.get(symbol.upper(), 0.01)
+
+    def is_atr_valid_for_gating(self, symbol: str) -> Tuple[bool, str]:
+        """
+        Check if ATR data is valid for gating decisions.
+
+        Returns:
+            Tuple of (is_valid, reason)
+        """
+        return self.atr_validity.get(symbol.upper(), (True, ""))
 
     def update_correlation(self, addr1: str, addr2: str, correlation: float) -> None:
         """Update pairwise correlation between two traders."""
@@ -241,9 +363,10 @@ class ConsensusDetector:
         median_entry = statistics.median(v.price for v in agreeing_votes)
         mid_price = self.get_current_mid(symbol)
 
-        # Calculate stop price (simple ATR-based for now)
-        # TODO: Use actual ATR when available
-        stop_distance = median_entry * 0.01  # 1% as placeholder
+        # Calculate stop price using ATR-based stop fraction
+        # Stop fraction is updated by ATR provider based on current volatility
+        stop_fraction = self.get_stop_fraction(symbol)
+        stop_distance = median_entry * stop_fraction
         if majority_dir == "long":
             stop_price = median_entry - stop_distance
         else:
@@ -295,15 +418,22 @@ class ConsensusDetector:
 
         return signal
 
-    def collapse_to_votes(self, fills: List[Fill]) -> List[Vote]:
+    def collapse_to_votes(
+        self,
+        fills: List[Fill],
+        equity_by_address: Optional[Dict[str, float]] = None,
+    ) -> List[Vote]:
         """
         Collapse multiple fills per trader to one vote each.
 
         One trader = one vote, based on net position change.
-        Weight by |Δexposure| (capped).
+        Weight calculated using calculate_vote_weight() with:
+        - Equity-normalized sqrt weighting if equity available
+        - Logarithmic scaling as fallback
 
         Args:
             fills: List of fills in the window
+            equity_by_address: Optional dict mapping address -> account equity
 
         Returns:
             List of votes (one per trader)
@@ -312,6 +442,7 @@ class ConsensusDetector:
         for f in fills:
             by_trader[f.address.lower()].append(f)
 
+        equity_lookup = equity_by_address or {}
         votes = []
         for addr, trader_fills in by_trader.items():
             net_delta = sum(f.signed_size for f in trader_fills)
@@ -319,7 +450,6 @@ class ConsensusDetector:
                 continue  # No net position change
 
             direction = "long" if net_delta > 0 else "short"
-            weight = min(abs(net_delta) / WEIGHT_CAP, 1.0)
 
             # Use weighted average price
             total_size = sum(abs(f.size) for f in trader_fills)
@@ -327,6 +457,15 @@ class ConsensusDetector:
                 avg_price = sum(f.price * abs(f.size) for f in trader_fills) / total_size
             else:
                 avg_price = trader_fills[-1].price if trader_fills else 0.0
+
+            # Calculate notional value
+            notional = abs(net_delta) * avg_price
+
+            # Get equity if available
+            equity = equity_lookup.get(addr.lower())
+
+            # Calculate weight using improved formula
+            weight = calculate_vote_weight(notional, equity)
 
             # Use latest timestamp
             latest_ts = max(f.ts for f in trader_fills)
@@ -337,11 +476,17 @@ class ConsensusDetector:
                 weight=weight,
                 price=avg_price,
                 ts=latest_ts,
+                notional=notional,
+                equity=equity,
             ))
 
         return votes
 
-    def eff_k_from_corr(self, weights: Dict[str, float]) -> float:
+    def eff_k_from_corr(
+        self,
+        weights: Dict[str, float],
+        fallback_counter_callback: Optional[Callable[[], None]] = None,
+    ) -> float:
         """
         Calculate effective K using correlation matrix.
 
@@ -349,6 +494,7 @@ class ConsensusDetector:
 
         Args:
             weights: Dict mapping address to weight
+            fallback_counter_callback: Optional callback to increment when default ρ is used
 
         Returns:
             Effective number of independent traders
@@ -359,6 +505,7 @@ class ConsensusDetector:
 
         num = sum(weights.values()) ** 2
         den = 0.0
+        fallback_count = 0
 
         for i, a in enumerate(addrs):
             for j, b in enumerate(addrs):
@@ -366,10 +513,20 @@ class ConsensusDetector:
                     rho = 1.0
                 else:
                     key = tuple(sorted([a, b]))
-                    rho = self.correlation_matrix.get(key, DEFAULT_CORRELATION)
+                    stored_rho = self.correlation_matrix.get(key)
+                    if stored_rho is None:
+                        rho = DEFAULT_CORRELATION
+                        fallback_count += 1
+                    else:
+                        rho = stored_rho
                     rho = max(0.0, min(1.0, rho))  # Clip negative correlations
 
                 den += weights[a] * weights[b] * rho
+
+        # Report fallback usage (only count unique pairs, not i,j and j,i)
+        if fallback_count > 0 and fallback_counter_callback:
+            # Each pair is counted twice (i,j and j,i), so divide by 2
+            fallback_counter_callback()
 
         return num / max(den, 1e-9)
 
@@ -380,6 +537,15 @@ class ConsensusDetector:
     ) -> bool:
         """
         Check latency and price band gates.
+
+        Price band now uses ATR-based R-units instead of fixed BPS:
+        - Get stop_fraction from ATR provider (e.g., 1% for BTC)
+        - Convert price deviation to R-units: deviation_R = bps / (stop_fraction * 10000)
+        - Compare against CONSENSUS_MAX_PRICE_DRIFT_R (default 0.25 R)
+
+        IMPORTANT: In strict mode (ATR_STRICT_MODE=true), this gate will FAIL
+        if ATR data is not available or is using hardcoded fallback. This prevents
+        trading on stale/guessed volatility data.
 
         Args:
             window: Current consensus window
@@ -401,16 +567,35 @@ class ConsensusDetector:
         if staleness_s > max_staleness:
             return False
 
-        # Price band gate: current mid vs median voter entry
+        # ATR validity gate: check if we have valid ATR data for this symbol
+        is_valid, reason = self.is_atr_valid_for_gating(window.symbol)
+        if not is_valid:
+            print(f"[consensus] Price gate BLOCKED: {reason}")
+            return False
+
+        # Price band gate: current mid vs median voter entry (ATR-based R-units)
         median_entry = statistics.median(v.price for v in votes)
         mid_price = self.get_current_mid(window.symbol)
 
         if median_entry <= 0 or mid_price <= 0:
             return False
 
+        # Calculate price deviation in BPS
         bps_deviation = abs(mid_price - median_entry) / median_entry * 10000
 
-        return bps_deviation <= CONSENSUS_MAX_PRICE_BAND_BPS
+        # Convert BPS to R-units using ATR-based stop fraction
+        # R-units = bps_deviation / (stop_fraction_pct * 100)
+        # E.g., 8 bps with 1% stop = 8 / 100 = 0.08 R
+        stop_fraction = self.get_stop_fraction(window.symbol)
+        stop_bps = stop_fraction * 10000  # Convert fraction to BPS (0.01 -> 100 bps)
+
+        if stop_bps > 0:
+            deviation_r = bps_deviation / stop_bps
+            return deviation_r <= CONSENSUS_MAX_PRICE_DRIFT_R
+        else:
+            # This shouldn't happen if ATR validity check passed
+            print(f"[consensus] WARNING: stop_bps=0 for {window.symbol}, using legacy BPS check")
+            return bps_deviation <= CONSENSUS_MAX_PRICE_BAND_BPS
 
     def calibrated_p_win(self, votes: List[Vote], eff_k: float) -> float:
         """
@@ -584,3 +769,62 @@ def calculate_ev(
         "ev_cost_r": cost_r,
         "ev_net_r": net_ev,
     }
+
+
+def calculate_vote_weight(
+    notional: float,
+    equity: Optional[float] = None,
+    mode: str = VOTE_WEIGHT_MODE,
+    log_base: float = VOTE_WEIGHT_LOG_BASE,
+    max_weight: float = VOTE_WEIGHT_MAX,
+) -> float:
+    """
+    Calculate vote weight for a trader based on their position and equity.
+
+    Three modes are supported:
+    1. "equity": Equity-normalized with sqrt smoothing
+       - weight = sqrt(notional / equity) capped at max_weight
+       - Best reflects risk-adjusted conviction
+       - Requires equity data to be available
+
+    2. "log": Logarithmic scaling
+       - weight = log(1 + notional / base)
+       - Smooths out large positions vs small ones
+       - Fallback when equity not available
+
+    3. "linear": Legacy linear scaling (deprecated)
+       - weight = min(notional / base, max_weight)
+       - Flattens all large accounts
+
+    Args:
+        notional: Position notional in USD
+        equity: Trader's account equity (optional)
+        mode: Weighting mode ("equity", "log", or "linear")
+        log_base: Base for logarithmic scaling (default $10k)
+        max_weight: Maximum weight cap (default 1.0)
+
+    Returns:
+        Computed weight (0 to max_weight)
+    """
+    if notional <= 0:
+        return 0.0
+
+    if mode == "equity" and equity is not None and equity > 0:
+        # Equity-normalized with sqrt to soften large positions
+        # sqrt(position_ratio) means doubling position only adds 41% weight
+        position_ratio = notional / equity
+        weight = math.sqrt(position_ratio)
+        return min(weight, max_weight)
+
+    elif mode == "log" or (mode == "equity" and equity is None):
+        # Logarithmic scaling: log(1 + notional/base)
+        # With base=$10k: $10k -> 0.69, $100k -> 2.40, $1M -> 4.62
+        weight = math.log(1 + notional / log_base)
+        # Normalize to roughly 0-1 range (log(101) ≈ 4.62 for $1M)
+        normalized = weight / 4.0  # Roughly normalize to 1.0 at ~$500k
+        return min(normalized, max_weight)
+
+    else:
+        # Legacy linear mode
+        weight = notional / log_base
+        return min(weight, max_weight)

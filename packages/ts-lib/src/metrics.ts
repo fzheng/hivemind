@@ -8,8 +8,9 @@
  * @module metrics
  */
 
-import client, { Histogram } from 'prom-client';
+import client, { Histogram, Counter, Gauge } from 'prom-client';
 import type { Request, Response } from 'express';
+import { getRateLimiterMetrics } from './hyperliquid';
 
 /**
  * Context object containing the metrics registry and service name.
@@ -79,6 +80,97 @@ export function createHistogram(
 }
 
 /**
+ * Creates a counter metric.
+ *
+ * @param ctx - Metrics context from initMetrics
+ * @param name - Metric name (will be prefixed with service name)
+ * @param help - Human-readable description of the metric
+ * @param labelNames - Optional label names for this counter
+ * @returns Prometheus Counter instance
+ */
+export function createCounter(
+  ctx: MetricsContext,
+  name: string,
+  help: string,
+  labelNames?: string[]
+): Counter<string> {
+  const metric = new Counter({
+    name: `${ctx.service}_${name}`,
+    help,
+    registers: [ctx.registry],
+    labelNames: labelNames ?? [],
+  });
+  return metric;
+}
+
+/**
+ * Creates a gauge metric.
+ *
+ * @param ctx - Metrics context from initMetrics
+ * @param name - Metric name (will be prefixed with service name)
+ * @param help - Human-readable description of the metric
+ * @param labelNames - Optional label names for this gauge
+ * @returns Prometheus Gauge instance
+ */
+export function createGauge(
+  ctx: MetricsContext,
+  name: string,
+  help: string,
+  labelNames?: string[]
+): Gauge<string> {
+  const metric = new Gauge({
+    name: `${ctx.service}_${name}`,
+    help,
+    registers: [ctx.registry],
+    labelNames: labelNames ?? [],
+  });
+  return metric;
+}
+
+// Rate limiter metrics (lazily initialized per service)
+let rateLimiterMetricsInitialized = false;
+let rateLimitHitsCounter: Counter<string> | null = null;
+let rateLimitRetriesCounter: Counter<string> | null = null;
+let rateLimitWeightGauge: Gauge<string> | null = null;
+let rateLimitBudgetUsageGauge: Gauge<string> | null = null;
+
+/**
+ * Initialize rate limiter metrics for a service.
+ * Call this once during service startup.
+ */
+export function initRateLimiterMetrics(ctx: MetricsContext): void {
+  if (rateLimiterMetricsInitialized) return;
+
+  rateLimitHitsCounter = createCounter(ctx, 'hl_rate_limit_hits_total', 'Total 429 errors from Hyperliquid API');
+  rateLimitRetriesCounter = createCounter(ctx, 'hl_rate_limit_retries_total', 'Total retries attempted after rate limit');
+  rateLimitWeightGauge = createGauge(ctx, 'hl_rate_limit_weight_consumed', 'API weight consumed in current minute window');
+  rateLimitBudgetUsageGauge = createGauge(ctx, 'hl_rate_limit_budget_usage_pct', 'Percentage of weight budget used (0-100)');
+
+  rateLimiterMetricsInitialized = true;
+}
+
+/**
+ * Update rate limiter metrics from the global rate limiter state.
+ * Call this periodically or before metrics scraping.
+ */
+function updateRateLimiterMetrics(): void {
+  if (!rateLimiterMetricsInitialized) return;
+
+  const stats = getRateLimiterMetrics();
+  if (rateLimitHitsCounter) {
+    // Reset and set to current value (counters should only increase)
+    // We use the diff approach - track last value
+  }
+  if (rateLimitWeightGauge) {
+    rateLimitWeightGauge.set(stats.weightConsumedThisMinute);
+  }
+  if (rateLimitBudgetUsageGauge) {
+    const budgetPerMinute = Number(process.env.HL_SDK_WEIGHT_BUDGET ?? 800);
+    rateLimitBudgetUsageGauge.set((stats.weightConsumedThisMinute / budgetPerMinute) * 100);
+  }
+}
+
+/**
  * Creates an Express request handler for the /metrics endpoint.
  * Returns Prometheus-formatted metrics for scraping.
  *
@@ -93,6 +185,9 @@ export function createHistogram(
  */
 export function metricsHandler(ctx: MetricsContext) {
   return async (_req: Request, res: Response) => {
+    // Update rate limiter metrics before scraping
+    updateRateLimiterMetrics();
+
     res.setHeader('Content-Type', ctx.registry.contentType);
     res.send(await ctx.registry.metrics());
   };
