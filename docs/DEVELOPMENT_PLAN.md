@@ -22,7 +22,7 @@ A collective intelligence trading system that learns from top Hyperliquid trader
 | 4 | Risk Management (Kelly criterion, stops, circuit breakers) | ✅ Complete |
 | 5 | Market Regime Detection | ✅ Complete |
 | 4-5 Integration | Wire regime/risk/execution together | ✅ Complete |
-| 6 | Multi-Exchange Integration | 🔲 Planned |
+| 6 | Multi-Exchange Integration | 🔶 In Progress |
 
 ---
 
@@ -500,13 +500,14 @@ MAX_CONSECUTIVE_LOSSES=5      # Loss streak threshold
 LOSS_STREAK_PAUSE_SECONDS=3600  # 1 hour pause
 ```
 
-### Test Coverage (Phases 4-5)
+### Test Coverage (Phases 4-6)
 - Kelly: 38 tests
-- Exchange: 30 tests
+- Exchange (hl_exchange): 30 tests
+- Exchange Adapters (Phase 6): 34 tests
 - Regime: 39 tests
 - Risk Governor: 27 tests + circuit breaker extensions
 - Integration: 7 fail-closed tests (retry, metrics)
-- **Python total: 384 tests**
+- **Python total: 418 tests**
 - **TypeScript total: 1,035 tests**
 
 ---
@@ -622,16 +623,124 @@ Wire together the Phase 4/5 components into the live signal/execution pipeline.
 
 ---
 
-## Phase 6: Multi-Exchange Integration
+## Phase 6: Multi-Exchange Integration 🔶
 
 ### Goal
-Expand beyond Hyperliquid to support additional exchanges.
+Expand beyond Hyperliquid to support additional exchanges with a unified interface.
 
-### Tasks
-- [ ] Abstract exchange interface
-- [ ] Add Binance/Bybit support
+### Status: In Progress (December 2025)
+
+**Completed:**
+- [x] Abstract exchange interface (`ExchangeInterface` ABC)
+- [x] Hyperliquid adapter (wraps hyperliquid-python-sdk)
+- [x] Aster DEX adapter (ECDSA signing, agent wallet support)
+- [x] Bybit adapter (pybit SDK, USDT linear perpetuals)
+- [x] Exchange factory for adapter creation
+- [x] 34 unit tests for exchange module
+
+**Pending:**
 - [ ] Unified position tracking across exchanges
 - [ ] Cross-exchange risk management
+- [ ] Dashboard exchange selector
+- [ ] Multi-exchange execution routing
+
+### Exchange Interface Design
+
+All adapters implement the `ExchangeInterface` ABC with these operations:
+
+| Operation | Description |
+|-----------|-------------|
+| `connect()` / `disconnect()` | Connection lifecycle |
+| `get_balance()` | Account equity, margin, P&L |
+| `get_positions()` | Open positions with entry/mark prices |
+| `open_position()` | Market/limit orders with stops |
+| `close_position()` | Partial or full close |
+| `set_leverage()` | Leverage configuration |
+| `set_stop_loss()` / `set_take_profit()` | Position protection |
+| `get_market_price()` / `get_market_data()` | Price and orderbook |
+| `format_symbol()` / `format_quantity()` | Exchange-specific formatting |
+
+### Supported Exchanges
+
+| Exchange | Type | Adapter | Symbol Format |
+|----------|------|---------|---------------|
+| Hyperliquid | DEX | `HyperliquidAdapter` | `BTC`, `ETH` |
+| Aster | DEX | `AsterAdapter` | `BTC-PERP`, `ETH-PERP` |
+| Bybit | CEX | `BybitAdapter` | `BTCUSDT`, `ETHUSDT` |
+
+### Key Files
+
+| File | Description |
+|------|-------------|
+| `exchanges/__init__.py` | Module exports |
+| `exchanges/interface.py` | Abstract interface & data classes |
+| `exchanges/factory.py` | Adapter factory functions |
+| `exchanges/hyperliquid_adapter.py` | Hyperliquid implementation |
+| `exchanges/aster_adapter.py` | Aster DEX implementation |
+| `exchanges/bybit_adapter.py` | Bybit implementation |
+| `tests/test_exchanges.py` | Unit tests (34 tests) |
+
+### Configuration
+
+Each exchange requires credentials via environment variables:
+
+```bash
+# Hyperliquid (DEX)
+HL_PRIVATE_KEY=0x...
+HL_ACCOUNT_ADDRESS=0x...
+
+# Aster (DEX)
+ASTER_PRIVATE_KEY=0x...
+ASTER_ACCOUNT_ADDRESS=0x...
+
+# Bybit (CEX)
+BYBIT_API_KEY=your-api-key
+BYBIT_API_SECRET=your-api-secret
+```
+
+### Usage Example
+
+```python
+from app.exchanges import (
+    get_exchange,
+    connect_exchange,
+    ExchangeType,
+    OrderParams,
+    OrderSide,
+)
+
+# Create adapter with default env vars
+exchange = get_exchange(ExchangeType.HYPERLIQUID, testnet=True)
+
+# Or connect directly
+exchange = await connect_exchange(ExchangeType.BYBIT, testnet=True)
+
+# Get account state
+balance = await exchange.get_balance()
+positions = await exchange.get_positions()
+
+# Place order
+result = await exchange.open_position(
+    OrderParams(
+        symbol="BTC",
+        side=OrderSide.BUY,
+        size=0.01,
+        stop_loss=49000.0,
+        take_profit=52000.0,
+    )
+)
+
+await exchange.disconnect()
+```
+
+### Success Criteria
+
+| Criteria | Pass Condition | Status |
+|----------|----------------|--------|
+| Interface abstraction | All 3 adapters pass same test suite | ✅ 34 tests passing |
+| Symbol formatting | Each exchange handles formats correctly | ✅ Tested |
+| Credential loading | Secure env var loading, no hardcoded keys | ✅ Config pattern |
+| Graceful failures | Not-connected returns None/empty, not exceptions | ✅ Tested |
 
 ---
 
@@ -674,6 +783,11 @@ Expand beyond Hyperliquid to support additional exchanges.
 | Kelly Calculator | `services/hl-decide/app/kelly.py` |
 | Exchange Wrapper | `services/hl-decide/app/hl_exchange.py` |
 | Regime Detector | `services/hl-decide/app/regime.py` |
+| Exchange Interface | `services/hl-decide/app/exchanges/interface.py` |
+| Exchange Factory | `services/hl-decide/app/exchanges/factory.py` |
+| Hyperliquid Adapter | `services/hl-decide/app/exchanges/hyperliquid_adapter.py` |
+| Aster Adapter | `services/hl-decide/app/exchanges/aster_adapter.py` |
+| Bybit Adapter | `services/hl-decide/app/exchanges/bybit_adapter.py` |
 | Dashboard | `services/hl-stream/public/dashboard.html` |
 | Init Script | `scripts/init-alpha-pool.mjs` |
 
@@ -791,4 +905,4 @@ docker compose logs -f hl-decide
 
 ---
 
-*Last updated: December 13, 2025 (Phase 4-5 Integration Complete + Safety Hardening)*
+*Last updated: December 13, 2025 (Phase 6 Multi-Exchange: Hyperliquid + Aster + Bybit adapters)*

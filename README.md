@@ -86,14 +86,15 @@ Built with TypeScript, Python, PostgreSQL, NATS, and Docker. Event-driven micros
 
 ## Status
 
-**Phase 4-5 Complete** — Core algorithm, risk management, and market regime detection are fully integrated.
+**Phase 6 In Progress** — Multi-exchange integration with Hyperliquid, Aster, and Bybit adapters.
 
 Current capabilities:
 - Kelly criterion position sizing with regime adjustments
 - Daily drawdown kill switch and circuit breakers
 - Market regime detection (trending/ranging/volatile)
 - Fail-closed safety posture with retry and metrics
-- 384 Python + 1,035 TypeScript tests passing
+- Multi-exchange interface (Hyperliquid, Aster DEX, Bybit)
+- 418 Python + 1,035 TypeScript tests passing
 
 ## License
 
