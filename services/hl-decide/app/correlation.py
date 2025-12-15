@@ -42,6 +42,10 @@ CORR_DECAY_HALFLIFE_DAYS = float(os.getenv("CORR_DECAY_HALFLIFE_DAYS", "3.0"))  
 # Default correlation when data is missing or stale
 DEFAULT_CORRELATION = float(os.getenv("DEFAULT_CORRELATION", "0.3"))
 
+# Conservative default for non-Hyperliquid venues (Phase 6.4)
+# Higher correlation = lower effective-K = more conservative sizing
+NON_HL_DEFAULT_CORRELATION = float(os.getenv("NON_HL_DEFAULT_CORRELATION", "0.5"))
+
 
 @dataclass
 class TraderSignVector:
@@ -514,7 +518,13 @@ class CorrelationProvider:
         key = tuple(sorted([addr_a.lower(), addr_b.lower()]))
         return self.correlations.get(key)
 
-    def get_with_decay(self, addr_a: str, addr_b: str, log_default: bool = True) -> float:
+    def get_with_decay(
+        self,
+        addr_a: str,
+        addr_b: str,
+        log_default: bool = True,
+        target_exchange: str = "hyperliquid",
+    ) -> float:
         """
         Get correlation with time-decay applied.
 
@@ -523,26 +533,37 @@ class CorrelationProvider:
         - Stale data (decay=0.0): Use default correlation
         - In between: Weighted blend
 
+        Phase 6.4: Uses exchange-aware default. For non-Hyperliquid venues,
+        we use a more conservative default (higher ρ) since our correlation
+        data is derived from Hyperliquid traders only.
+
         Args:
             addr_a: First trader address
             addr_b: Second trader address
             log_default: Whether to log when default is used
+            target_exchange: Target execution venue for default selection
 
         Returns:
             Decayed correlation value (always returns a value, never None)
         """
         raw_rho = self.get(addr_a, addr_b)
 
+        # Determine default based on exchange (Phase 6.4)
+        if target_exchange.lower() == "hyperliquid":
+            default_rho = DEFAULT_CORRELATION
+        else:
+            default_rho = NON_HL_DEFAULT_CORRELATION
+
         if raw_rho is None:
-            # No stored correlation, use default
+            # No stored correlation, use exchange-aware default
             self._default_used_count += 1
             if log_default and self._default_used_count <= 5:
                 print(
-                    f"[correlation] Using default ρ={DEFAULT_CORRELATION} "
+                    f"[correlation] Using default ρ={default_rho} "
                     f"for pair ({addr_a[:8]}..., {addr_b[:8]}...) - "
-                    f"no stored correlation found"
+                    f"no stored correlation found (exchange={target_exchange})"
                 )
-            return DEFAULT_CORRELATION
+            return default_rho
 
         # Apply decay
         decay = self._decay_factor()
@@ -550,7 +571,7 @@ class CorrelationProvider:
             return raw_rho  # No significant decay
 
         # Blend toward default: decayed = raw * decay + default * (1 - decay)
-        decayed_rho = raw_rho * decay + DEFAULT_CORRELATION * (1 - decay)
+        decayed_rho = raw_rho * decay + default_rho * (1 - decay)
         return decayed_rho
 
     def check_freshness(self) -> Tuple[bool, str]:
@@ -578,23 +599,38 @@ class CorrelationProvider:
             f"Correlations fresh: {age_days} days old, decay={decay:.2f}"
         )
 
-    def hydrate_detector(self, detector, apply_decay: bool = True) -> int:
+    def hydrate_detector(
+        self,
+        detector,
+        apply_decay: bool = True,
+        target_exchange: str = "hyperliquid",
+    ) -> int:
         """
         Hydrate a ConsensusDetector with loaded correlations.
+
+        Phase 6.4: Uses exchange-aware default for decay blending.
 
         Args:
             detector: ConsensusDetector instance
             apply_decay: Whether to apply time-decay
+            target_exchange: Target execution venue for default selection
 
         Returns:
             Number of pairs added
         """
         decay = self._decay_factor() if apply_decay else 1.0
+
+        # Determine default based on exchange (Phase 6.4)
+        if target_exchange.lower() == "hyperliquid":
+            default_rho = DEFAULT_CORRELATION
+        else:
+            default_rho = NON_HL_DEFAULT_CORRELATION
+
         count = 0
 
         for (addr_a, addr_b), rho in self.correlations.items():
             if apply_decay and decay < 0.99:
-                rho = rho * decay + DEFAULT_CORRELATION * (1 - decay)
+                rho = rho * decay + default_rho * (1 - decay)
             detector.update_correlation(addr_a, addr_b, rho)
             count += 1
 

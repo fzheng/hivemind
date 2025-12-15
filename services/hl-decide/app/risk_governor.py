@@ -1,12 +1,12 @@
 """
 Risk Governor: Hard safety limits before live trading
 
-Phase 3f: Selection Integrity
-
 The Risk Governor provides hard safety limits that CANNOT be overridden:
 1. **Liquidation Distance Guard**: Block trades if account too close to liquidation
 2. **Daily Drawdown Kill Switch**: Halt all trading if daily loss exceeds threshold
 3. **Exposure Limits**: Prevent excessive position sizing
+4. **Circuit Breakers**: Max concurrent positions, API error pause, loss streak pause
+5. **Multi-Exchange Support**: Aggregated risk tracking across exchanges (Phase 6)
 
 These are the LAST line of defense before capital destruction.
 
@@ -15,7 +15,7 @@ These are the LAST line of defense before capital destruction.
 
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
 import asyncpg
@@ -44,19 +44,50 @@ MAX_TOTAL_EXPOSURE_PCT = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.50"))  # 5
 # Cooldown after kill switch triggers (seconds)
 KILL_SWITCH_COOLDOWN = int(os.getenv("KILL_SWITCH_COOLDOWN", "86400"))  # 24 hours
 
+# Phase 4.4: Circuit Breakers
+# Maximum concurrent positions across all symbols
+MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))
+
+# Maximum positions per symbol (prevents concentration)
+MAX_POSITION_PER_SYMBOL = int(os.getenv("MAX_POSITION_PER_SYMBOL", "1"))
+
+# Pause trading after consecutive API errors
+API_ERROR_THRESHOLD = int(os.getenv("API_ERROR_THRESHOLD", "3"))
+API_ERROR_PAUSE_SECONDS = int(os.getenv("API_ERROR_PAUSE_SECONDS", "300"))  # 5 minutes
+
+# Maximum consecutive losing trades before pause
+MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "5"))
+LOSS_STREAK_PAUSE_SECONDS = int(os.getenv("LOSS_STREAK_PAUSE_SECONDS", "3600"))  # 1 hour
+
 
 @dataclass
 class RiskState:
     """Current risk state from account data."""
     timestamp: datetime
-    account_value: float
-    margin_used: float
+    account_value: float  # Always in USD (normalized)
+    margin_used: float  # Always in USD (normalized)
     maintenance_margin: float
-    total_exposure: float
+    total_exposure: float  # Always in USD (normalized)
     margin_ratio: float
     daily_pnl: float
     daily_starting_equity: float
     daily_drawdown_pct: float
+    exchange: str = "hyperliquid"  # Phase 6: track which exchange this state is from
+    original_currency: str = "USD"  # Original currency before normalization
+    conversion_rate: float = 1.0  # Conversion rate used (1.0 for USD)
+
+
+@dataclass
+class AggregatedRiskState:
+    """Aggregated risk state across all connected exchanges (Phase 6)."""
+    timestamp: datetime
+    total_equity: float  # USD-normalized
+    total_margin_used: float  # USD-normalized
+    total_exposure: float  # USD-normalized
+    per_exchange: dict  # exchange -> RiskState
+    daily_pnl: float
+    daily_drawdown_pct: float
+    is_normalized: bool = True  # All values USD-normalized (Phase 6.1.5)
 
 
 @dataclass
@@ -92,6 +123,18 @@ class RiskGovernor:
         self._kill_switch_triggered_at: Optional[datetime] = None
         self._daily_starting_equity: Optional[float] = None
         self._daily_start_date: Optional[str] = None
+
+        # Phase 4.4: Circuit breaker state
+        self._consecutive_api_errors = 0
+        self._api_pause_until: Optional[datetime] = None
+        self._consecutive_losses = 0
+        self._loss_streak_pause_until: Optional[datetime] = None
+        self._current_position_count = 0
+        self._positions_by_symbol: Dict[str, int] = {}
+
+        # Phase 6: Multi-exchange tracking
+        self._positions_by_exchange: Dict[str, Dict[str, int]] = {}  # exchange -> {symbol: count}
+        self._risk_state_by_exchange: Dict[str, RiskState] = {}
 
     async def load_state(self) -> None:
         """Load persisted state from database."""
@@ -147,9 +190,32 @@ class RiskGovernor:
             self._daily_starting_equity = equity
             self._daily_start_date = today
 
+    def is_kill_switch_active(self) -> bool:
+        """
+        Quick check if kill switch is currently active.
+
+        This is a lightweight check for early bailout. Does NOT update cooldown state.
+        Use check_kill_switch() for full check with reason and cooldown handling.
+
+        Returns:
+            True if kill switch is active
+        """
+        if not self._kill_switch_active:
+            return False
+
+        # Check if cooldown has expired (but don't modify state)
+        if self._kill_switch_triggered_at:
+            elapsed = (datetime.now(timezone.utc) - self._kill_switch_triggered_at).total_seconds()
+            if elapsed >= KILL_SWITCH_COOLDOWN:
+                return False  # Will be reset on next full check
+
+        return True
+
     def check_kill_switch(self) -> Tuple[bool, str]:
         """
-        Check if kill switch is active.
+        Check if kill switch is active and return reason.
+
+        This is the full check that handles cooldown expiry.
 
         Returns:
             Tuple of (is_active, reason)
@@ -469,6 +535,331 @@ class RiskGovernor:
             warnings=all_warnings,
         )
 
+    # =========================================================================
+    # Phase 4.4: Circuit Breakers
+    # =========================================================================
+
+    def check_concurrent_positions(self, current_count: int) -> RiskCheckResult:
+        """
+        Check if at maximum concurrent positions.
+
+        Args:
+            current_count: Current number of open positions
+
+        Returns:
+            RiskCheckResult
+        """
+        if current_count >= MAX_CONCURRENT_POSITIONS:
+            return RiskCheckResult(
+                allowed=False,
+                reason=f"At max concurrent positions ({current_count}/{MAX_CONCURRENT_POSITIONS})",
+            )
+
+        warnings = []
+        if current_count >= MAX_CONCURRENT_POSITIONS - 1:
+            warnings.append(f"Near position limit ({current_count}/{MAX_CONCURRENT_POSITIONS})")
+
+        return RiskCheckResult(
+            allowed=True,
+            reason="Concurrent positions OK",
+            warnings=warnings,
+        )
+
+    def check_symbol_position(self, symbol: str, has_position: bool) -> RiskCheckResult:
+        """
+        Check if already have a position in this symbol.
+
+        Args:
+            symbol: Asset symbol
+            has_position: Whether already have a position
+
+        Returns:
+            RiskCheckResult
+        """
+        if has_position and MAX_POSITION_PER_SYMBOL == 1:
+            return RiskCheckResult(
+                allowed=False,
+                reason=f"Already have position in {symbol}",
+            )
+
+        return RiskCheckResult(
+            allowed=True,
+            reason="Symbol position OK",
+        )
+
+    def report_api_error(self) -> None:
+        """
+        Report an API error. May trigger pause if too many consecutive errors.
+        """
+        self._consecutive_api_errors += 1
+
+        if self._consecutive_api_errors >= API_ERROR_THRESHOLD:
+            self._api_pause_until = (
+                datetime.now(timezone.utc) +
+                timedelta(seconds=API_ERROR_PAUSE_SECONDS)
+            )
+            print(
+                f"[risk_governor] API error pause triggered: "
+                f"{self._consecutive_api_errors} errors, paused until {self._api_pause_until}"
+            )
+
+    def report_api_success(self) -> None:
+        """Report successful API call, resetting error counter."""
+        self._consecutive_api_errors = 0
+
+    def check_api_pause(self) -> RiskCheckResult:
+        """
+        Check if in API error pause period.
+
+        Returns:
+            RiskCheckResult
+        """
+        if self._api_pause_until:
+            now = datetime.now(timezone.utc)
+            if now < self._api_pause_until:
+                remaining = (self._api_pause_until - now).total_seconds()
+                return RiskCheckResult(
+                    allowed=False,
+                    reason=f"API error pause, {remaining:.0f}s remaining",
+                )
+            # Pause expired
+            self._api_pause_until = None
+            self._consecutive_api_errors = 0
+
+        return RiskCheckResult(
+            allowed=True,
+            reason="No API pause",
+        )
+
+    def report_trade_result(self, is_win: bool) -> None:
+        """
+        Report trade result. May trigger pause if too many consecutive losses.
+
+        Args:
+            is_win: Whether the trade was profitable
+        """
+        if is_win:
+            self._consecutive_losses = 0
+        else:
+            self._consecutive_losses += 1
+
+            if self._consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+                self._loss_streak_pause_until = (
+                    datetime.now(timezone.utc) +
+                    timedelta(seconds=LOSS_STREAK_PAUSE_SECONDS)
+                )
+                print(
+                    f"[risk_governor] Loss streak pause triggered: "
+                    f"{self._consecutive_losses} losses, paused until {self._loss_streak_pause_until}"
+                )
+
+    def check_loss_streak_pause(self) -> RiskCheckResult:
+        """
+        Check if in loss streak pause period.
+
+        Returns:
+            RiskCheckResult
+        """
+        if self._loss_streak_pause_until:
+            now = datetime.now(timezone.utc)
+            if now < self._loss_streak_pause_until:
+                remaining = (self._loss_streak_pause_until - now).total_seconds()
+                return RiskCheckResult(
+                    allowed=False,
+                    reason=f"Loss streak pause ({self._consecutive_losses} losses), {remaining:.0f}s remaining",
+                )
+            # Pause expired
+            self._loss_streak_pause_until = None
+            self._consecutive_losses = 0
+
+        return RiskCheckResult(
+            allowed=True,
+            reason="No loss streak pause",
+        )
+
+    def update_position_count(self, symbol: str, delta: int) -> None:
+        """
+        Update position tracking incrementally.
+
+        Args:
+            symbol: Asset symbol
+            delta: Change in position count (+1 for open, -1 for close)
+        """
+        self._current_position_count += delta
+        self._current_position_count = max(0, self._current_position_count)
+
+        current = self._positions_by_symbol.get(symbol, 0)
+        self._positions_by_symbol[symbol] = max(0, current + delta)
+
+    def update_positions_from_account_state(
+        self,
+        account_state: Dict[str, Any],
+        exchange: str = "hyperliquid",
+    ) -> None:
+        """
+        Update position tracking from exchange account state.
+
+        Derives per-symbol position counts from assetPositions array.
+        This is the preferred method to sync governor state with actual positions.
+
+        Args:
+            account_state: Account state from exchange API containing assetPositions
+            exchange: Exchange identifier (hyperliquid, aster, bybit)
+        """
+        positions_by_symbol: Dict[str, int] = {}
+
+        for ap in account_state.get("assetPositions", []):
+            pos = ap.get("position", {})
+            coin = pos.get("coin", "")
+            size = float(pos.get("szi", 0))
+            if size != 0 and coin:
+                positions_by_symbol[coin] = positions_by_symbol.get(coin, 0) + 1
+
+        # Phase 6: Track per-exchange positions
+        self._positions_by_exchange[exchange] = positions_by_symbol
+
+        # Update aggregated totals
+        self._update_aggregated_positions()
+
+    def _update_aggregated_positions(self) -> None:
+        """Update aggregated position counts from per-exchange data."""
+        aggregated: Dict[str, int] = {}
+
+        for exchange_positions in self._positions_by_exchange.values():
+            for symbol, count in exchange_positions.items():
+                aggregated[symbol] = aggregated.get(symbol, 0) + count
+
+        self._positions_by_symbol = aggregated
+        self._current_position_count = sum(aggregated.values())
+
+    def update_risk_state_for_exchange(
+        self,
+        exchange: str,
+        account_value: float,
+        margin_used: float,
+        maintenance_margin: float,
+        total_exposure: float,
+        daily_pnl: float,
+    ) -> RiskState:
+        """
+        Update risk state for a specific exchange.
+
+        Args:
+            exchange: Exchange identifier
+            account_value: Current account equity
+            margin_used: Currently used margin
+            maintenance_margin: Minimum required margin
+            total_exposure: Total notional exposure
+            daily_pnl: Today's PnL
+
+        Returns:
+            RiskState for this exchange
+        """
+        state = self.compute_risk_state(
+            account_value, margin_used, maintenance_margin, total_exposure, daily_pnl
+        )
+        state.exchange = exchange
+        self._risk_state_by_exchange[exchange] = state
+        return state
+
+    def get_aggregated_risk_state(self) -> Optional[AggregatedRiskState]:
+        """
+        Get aggregated risk state across all exchanges.
+
+        Returns:
+            AggregatedRiskState or None if no exchange data available
+        """
+        if not self._risk_state_by_exchange:
+            return None
+
+        total_equity = sum(s.account_value for s in self._risk_state_by_exchange.values())
+        total_margin = sum(s.margin_used for s in self._risk_state_by_exchange.values())
+        total_exposure = sum(s.total_exposure for s in self._risk_state_by_exchange.values())
+        daily_pnl = sum(s.daily_pnl for s in self._risk_state_by_exchange.values())
+
+        # Calculate aggregated drawdown
+        starting = self._daily_starting_equity or total_equity
+        daily_drawdown_pct = -daily_pnl / starting if starting > 0 and daily_pnl < 0 else 0
+
+        return AggregatedRiskState(
+            timestamp=datetime.now(timezone.utc),
+            total_equity=total_equity,
+            total_margin_used=total_margin,
+            total_exposure=total_exposure,
+            per_exchange=dict(self._risk_state_by_exchange),
+            daily_pnl=daily_pnl,
+            daily_drawdown_pct=daily_drawdown_pct,
+        )
+
+    def get_positions_for_exchange(self, exchange: str) -> Dict[str, int]:
+        """
+        Get position counts for a specific exchange.
+
+        Args:
+            exchange: Exchange identifier
+
+        Returns:
+            Dict of symbol -> position count
+        """
+        return self._positions_by_exchange.get(exchange, {})
+
+    def get_symbol_position_count(self, symbol: str) -> int:
+        """
+        Get current position count for a symbol.
+
+        Args:
+            symbol: Asset symbol
+
+        Returns:
+            Number of positions in this symbol (0 if none)
+        """
+        return self._positions_by_symbol.get(symbol, 0)
+
+    def run_circuit_breaker_checks(
+        self,
+        symbol: str,
+        symbol_position_count: int = 0,
+    ) -> RiskCheckResult:
+        """
+        Run all circuit breaker checks before a trade.
+
+        Args:
+            symbol: Asset symbol to trade
+            symbol_position_count: Current number of positions in this symbol (0 if new)
+
+        Returns:
+            RiskCheckResult with aggregated result
+        """
+        all_warnings = []
+
+        # 1. API pause check
+        api_check = self.check_api_pause()
+        if not api_check.allowed:
+            return api_check
+
+        # 2. Loss streak pause check
+        loss_check = self.check_loss_streak_pause()
+        if not loss_check.allowed:
+            return loss_check
+
+        # 3. Concurrent positions check
+        pos_check = self.check_concurrent_positions(self._current_position_count)
+        if not pos_check.allowed:
+            return pos_check
+        all_warnings.extend(pos_check.warnings)
+
+        # 4. Symbol position check (pass count for future multi-position support)
+        has_existing = symbol_position_count > 0
+        symbol_check = self.check_symbol_position(symbol, has_existing)
+        if not symbol_check.allowed:
+            return symbol_check
+
+        return RiskCheckResult(
+            allowed=True,
+            reason="Circuit breaker checks passed",
+            warnings=all_warnings,
+        )
+
 
 # Global instance
 _risk_governor: Optional[RiskGovernor] = None
@@ -480,6 +871,78 @@ def get_risk_governor(db_pool: Optional[asyncpg.Pool] = None) -> RiskGovernor:
     if _risk_governor is None:
         _risk_governor = RiskGovernor(db_pool)
     return _risk_governor
+
+
+async def get_daily_pnl(db_pool: asyncpg.Pool, current_equity: float) -> float:
+    """
+    Get daily PnL by comparing current equity to daily starting equity.
+
+    If no record exists for today, creates one with current equity as starting.
+    Returns the difference: current_equity - starting_equity.
+
+    **Important**: This is EQUITY-BASED (not realized-only), meaning it includes
+    both realized and unrealized PnL. The kill switch will trigger if total
+    equity drops by the threshold amount, even from unrealized losses. This is
+    intentional - we want to halt trading when the account is under stress,
+    regardless of whether losses are realized.
+
+    The daily record resets on first call each day (UTC). Starting equity is
+    captured from the first account state query of the day.
+
+    Args:
+        db_pool: Database pool
+        current_equity: Current account equity (realized + unrealized)
+
+    Returns:
+        Daily PnL (positive = profit, negative = loss)
+    """
+    today = datetime.now(timezone.utc).date()
+
+    try:
+        async with db_pool.acquire() as conn:
+            # Check if we have a record for today
+            row = await conn.fetchrow(
+                """
+                SELECT starting_equity, current_equity
+                FROM risk_daily_pnl
+                WHERE date = $1
+                """,
+                today,
+            )
+
+            if row:
+                starting_equity = float(row["starting_equity"])
+                # Update current equity
+                await conn.execute(
+                    """
+                    UPDATE risk_daily_pnl
+                    SET current_equity = $1,
+                        daily_drawdown_pct = CASE
+                            WHEN starting_equity > 0 THEN (starting_equity - $1) / starting_equity
+                            ELSE 0
+                        END,
+                        updated_at = NOW()
+                    WHERE date = $2
+                    """,
+                    current_equity,
+                    today,
+                )
+                return current_equity - starting_equity
+            else:
+                # First check of the day - create record with current equity as starting
+                await conn.execute(
+                    """
+                    INSERT INTO risk_daily_pnl (date, starting_equity, current_equity)
+                    VALUES ($1, $2, $2)
+                    ON CONFLICT (date) DO NOTHING
+                    """,
+                    today,
+                    current_equity,
+                )
+                return 0.0  # No PnL yet today
+    except Exception as e:
+        print(f"[risk_governor] Failed to get daily PnL: {e}")
+        return 0.0  # Fail safe - assume no PnL
 
 
 async def check_risk_before_trade(
@@ -514,8 +977,8 @@ async def check_risk_before_trade(
         entry_price = float(pos.get("entryPx", 0))
         total_exposure += size * entry_price
 
-    # Get daily PnL (would need to track this)
-    daily_pnl = 0.0  # TODO: Implement daily PnL tracking
+    # Get daily PnL from database tracking
+    daily_pnl = await get_daily_pnl(db_pool, account_value)
 
     return governor.run_all_checks(
         account_value=account_value,

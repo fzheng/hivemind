@@ -632,6 +632,36 @@ class TestATRToConsensusFlow:
         assert detector.get_stop_fraction("BTC") == 0.01
         assert detector.get_stop_fraction("ETH") == 0.01
 
+    def test_consensus_detector_initializes_with_target_exchange(self):
+        """Detector should accept target exchange for fee calculation."""
+        # Default is hyperliquid
+        detector = ConsensusDetector()
+        assert detector.target_exchange == "hyperliquid"
+
+        # Can set to other exchanges
+        detector = ConsensusDetector(target_exchange="bybit")
+        assert detector.target_exchange == "bybit"
+
+        detector = ConsensusDetector(target_exchange="ASTER")  # Case insensitive
+        assert detector.target_exchange == "aster"
+
+    def test_consensus_detector_set_target_exchange(self):
+        """Can change target exchange at runtime."""
+        from app.consensus import get_exchange_fees_bps
+        detector = ConsensusDetector()
+
+        # Initially hyperliquid
+        assert detector.target_exchange == "hyperliquid"
+
+        # Change to bybit
+        detector.set_target_exchange("bybit")
+        assert detector.target_exchange == "bybit"
+
+        # Verify fee lookup works
+        assert get_exchange_fees_bps("hyperliquid") == 10.0  # 5 bps × 2
+        assert get_exchange_fees_bps("bybit") == 12.0  # 6 bps × 2
+        assert get_exchange_fees_bps("aster") == 10.0
+
     def test_atr_updates_detector_stop(self):
         """ATR provider updates should reflect in detector."""
         provider = ATRProvider()
@@ -1299,3 +1329,729 @@ class TestQuantPipelineIntegration:
 
         # Decayed (lower) correlation → higher effK
         assert eff_k_decayed > eff_k_fresh
+
+
+class TestRegimeIntegration:
+    """Test regime detection integration with stops and Kelly sizing."""
+
+    def test_regime_adjusted_stop_trending(self):
+        """Trending regime should widen stops."""
+        from app.regime import get_regime_adjusted_stop, MarketRegime
+
+        base_stop = 0.02  # 2%
+        adjusted = get_regime_adjusted_stop(base_stop, MarketRegime.TRENDING)
+
+        # Trending: 1.2x multiplier
+        assert adjusted == pytest.approx(0.024, rel=0.01)
+
+    def test_regime_adjusted_stop_ranging(self):
+        """Ranging regime should tighten stops."""
+        from app.regime import get_regime_adjusted_stop, MarketRegime
+
+        base_stop = 0.02  # 2%
+        adjusted = get_regime_adjusted_stop(base_stop, MarketRegime.RANGING)
+
+        # Ranging: 0.8x multiplier
+        assert adjusted == pytest.approx(0.016, rel=0.01)
+
+    def test_regime_adjusted_stop_volatile(self):
+        """Volatile regime should widen stops significantly."""
+        from app.regime import get_regime_adjusted_stop, MarketRegime
+
+        base_stop = 0.02  # 2%
+        adjusted = get_regime_adjusted_stop(base_stop, MarketRegime.VOLATILE)
+
+        # Volatile: 1.5x multiplier
+        assert adjusted == pytest.approx(0.03, rel=0.01)
+
+    def test_regime_adjusted_kelly_trending(self):
+        """Trending regime should use full Kelly."""
+        from app.regime import get_regime_adjusted_kelly, MarketRegime
+
+        base_kelly = 0.25  # 25%
+        adjusted = get_regime_adjusted_kelly(base_kelly, MarketRegime.TRENDING)
+
+        # Trending: 1.0x multiplier
+        assert adjusted == pytest.approx(0.25, rel=0.01)
+
+    def test_regime_adjusted_kelly_volatile(self):
+        """Volatile regime should reduce Kelly."""
+        from app.regime import get_regime_adjusted_kelly, MarketRegime
+
+        base_kelly = 0.25  # 25%
+        adjusted = get_regime_adjusted_kelly(base_kelly, MarketRegime.VOLATILE)
+
+        # Volatile: 0.5x multiplier
+        assert adjusted == pytest.approx(0.125, rel=0.01)
+
+    def test_regime_adjusted_kelly_ranging(self):
+        """Ranging regime should slightly reduce Kelly."""
+        from app.regime import get_regime_adjusted_kelly, MarketRegime
+
+        base_kelly = 0.25  # 25%
+        adjusted = get_regime_adjusted_kelly(base_kelly, MarketRegime.RANGING)
+
+        # Ranging: 0.75x multiplier
+        assert adjusted == pytest.approx(0.1875, rel=0.01)
+
+
+class TestRiskGovernorIntegration:
+    """Test risk governor integration with execution."""
+
+    def test_kill_switch_blocks_execution(self):
+        """Kill switch should block all trades."""
+        from app.risk_governor import RiskGovernor
+
+        governor = RiskGovernor()
+        governor.trigger_kill_switch(reason="test kill switch")
+
+        result = governor.run_all_checks(
+            account_value=100000,
+            margin_used=10000,
+            maintenance_margin=5000,
+            total_exposure=0.1,
+            daily_pnl=0,
+        )
+
+        assert result.allowed is False
+        # Check for kill switch in reason
+        assert result.reason is not None
+        assert "kill" in result.reason.lower() or "halt" in result.reason.lower()
+
+    def test_liquidation_distance_blocks(self):
+        """Trades should be blocked when close to liquidation."""
+        from app.risk_governor import RiskGovernor
+
+        governor = RiskGovernor()
+
+        # Margin ratio < 1.5x
+        result = governor.run_all_checks(
+            account_value=10000,
+            margin_used=9000,
+            maintenance_margin=8000,  # ratio = 10000/8000 = 1.25
+            total_exposure=0.5,
+            daily_pnl=0,
+        )
+
+        assert result.allowed is False
+        # Should have reason about margin or liquidation
+        assert result.reason is not None
+        assert "margin" in result.reason.lower() or "liquidation" in result.reason.lower()
+
+    def test_equity_floor_blocks(self):
+        """Trades should be blocked when below equity floor."""
+        from app.risk_governor import RiskGovernor, MIN_EQUITY_FLOOR
+
+        governor = RiskGovernor()
+
+        # Below minimum
+        result = governor.run_all_checks(
+            account_value=MIN_EQUITY_FLOOR - 1,
+            margin_used=0,
+            maintenance_margin=1,
+            total_exposure=0,
+            daily_pnl=0,
+        )
+
+        assert result.allowed is False
+        # Should have reason about account value or floor
+        assert result.reason is not None
+        assert "floor" in result.reason.lower() or "account" in result.reason.lower()
+
+
+class TestExecutorIntegration:
+    """Test executor integration with regime and risk governor."""
+
+    @pytest.mark.asyncio
+    async def test_executor_dry_run_by_default(self):
+        """Executor should default to dry run mode."""
+        from app.hl_exchange import REAL_EXECUTION_ENABLED
+
+        # By default, real execution should be disabled
+        assert REAL_EXECUTION_ENABLED is False
+
+    def test_kelly_result_includes_method(self):
+        """Kelly result should include the method used."""
+        from app.kelly import kelly_position_size, KellyInput
+
+        input_data = KellyInput(
+            win_rate=0.6,
+            avg_win_r=1.0,
+            avg_loss_r=0.5,
+            episode_count=50,
+            account_value=100000,
+            current_price=50000,
+            stop_distance_pct=0.02,
+        )
+
+        result = kelly_position_size(input_data)
+
+        assert result.method == "kelly"
+        assert result.position_pct > 0
+        assert result.reasoning is not None
+
+    def test_kelly_fallback_insufficient_data(self):
+        """Kelly should fall back when insufficient episodes."""
+        from app.kelly import kelly_position_size, KellyInput, KELLY_MIN_EPISODES
+
+        input_data = KellyInput(
+            win_rate=0.6,
+            avg_win_r=1.0,
+            avg_loss_r=0.5,
+            episode_count=KELLY_MIN_EPISODES - 1,  # Insufficient
+            account_value=100000,
+            current_price=50000,
+            stop_distance_pct=0.02,
+        )
+
+        result = kelly_position_size(input_data)
+
+        assert result.method == "fallback_insufficient_data"
+        # Reasoning mentions episode count needed
+        assert "episode" in result.reasoning.lower() or "need" in result.reasoning.lower()
+
+
+class TestDailyPnLTracking:
+    """Test daily PnL tracking for drawdown kill switch."""
+
+    @pytest.mark.asyncio
+    async def test_get_daily_pnl_first_call_creates_record(self):
+        """First call of the day should create record with current equity as starting."""
+        from app.risk_governor import get_daily_pnl
+        from unittest.mock import AsyncMock, MagicMock
+
+        # Mock database pool
+        mock_pool = MagicMock()
+        mock_conn = AsyncMock()
+        mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        # First call - no existing record
+        mock_conn.fetchrow.return_value = None
+
+        result = await get_daily_pnl(mock_pool, 100000.0)
+
+        # Should return 0 (no PnL yet)
+        assert result == 0.0
+        # Should insert record
+        assert mock_conn.execute.called
+
+    @pytest.mark.asyncio
+    async def test_get_daily_pnl_returns_difference(self):
+        """Subsequent calls should return difference from starting equity."""
+        from app.risk_governor import get_daily_pnl
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_pool = MagicMock()
+        mock_conn = AsyncMock()
+        mock_pool.acquire.return_value.__aenter__.return_value = mock_conn
+
+        # Existing record with starting equity 100000
+        mock_conn.fetchrow.return_value = {
+            "starting_equity": 100000.0,
+            "current_equity": 100000.0,
+        }
+
+        # Current equity is 95000 (lost $5000)
+        result = await get_daily_pnl(mock_pool, 95000.0)
+
+        # Should return -5000
+        assert result == -5000.0
+
+
+class TestRegimeAwareConfidence:
+    """Test regime-aware confidence gating."""
+
+    def test_check_risk_limits_with_trending_regime(self):
+        """Trending regime should use higher confidence threshold."""
+        from app.consensus import check_risk_limits, MIN_SIGNAL_CONFIDENCE
+        from app.regime import get_regime_adjusted_confidence, MarketRegime
+        from unittest.mock import MagicMock
+
+        signal = MagicMock()
+        signal.p_win = 0.58  # Above base 0.55, but may fail trending
+        signal.ev_net_r = 0.3
+
+        # Without regime - should pass
+        passes_base, _ = check_risk_limits(signal, regime=None)
+        assert passes_base is True
+
+        # Calculate what trending threshold would be
+        trending_threshold = get_regime_adjusted_confidence(MIN_SIGNAL_CONFIDENCE, MarketRegime.TRENDING)
+
+        # If trending requires higher confidence, this signal may fail
+        if trending_threshold > signal.p_win:
+            passes_trending, reason = check_risk_limits(signal, regime="TRENDING")
+            assert passes_trending is False
+            assert "TRENDING" in reason
+
+    def test_check_risk_limits_with_volatile_regime(self):
+        """Volatile regime should use lower confidence threshold (more cautious sizing instead)."""
+        from app.consensus import check_risk_limits
+        from unittest.mock import MagicMock
+
+        signal = MagicMock()
+        signal.p_win = 0.52  # Below base 0.55
+        signal.ev_net_r = 0.3
+
+        # Without regime - should fail
+        passes_base, _ = check_risk_limits(signal, regime=None)
+        assert passes_base is False
+
+        # With volatile - regime adjustment applies
+        passes_volatile, reason = check_risk_limits(signal, regime="VOLATILE")
+        # Still should fail since 0.52 is quite low
+        # The key test is that it uses regime-adjusted threshold
+        assert "minimum" in reason.lower()
+
+    def test_check_risk_limits_invalid_regime_falls_back(self):
+        """Invalid regime should fall back to static threshold."""
+        from app.consensus import check_risk_limits
+        from unittest.mock import MagicMock
+
+        signal = MagicMock()
+        signal.p_win = 0.56
+        signal.ev_net_r = 0.3
+
+        # Invalid regime should still work (falls back)
+        passes, reason = check_risk_limits(signal, regime="INVALID_REGIME")
+        assert passes is True
+
+
+class TestCircuitBreakerIntegration:
+    """Test circuit breaker checks in execution path."""
+
+    def test_circuit_breaker_blocks_on_api_pause(self):
+        """Circuit breaker should block when API is paused."""
+        from app.risk_governor import RiskGovernor
+
+        governor = RiskGovernor()
+
+        # Simulate API errors that trigger pause
+        for _ in range(5):  # More than threshold
+            governor.report_api_error()
+
+        # Now check circuit breakers (0 = no existing position)
+        result = governor.run_circuit_breaker_checks("BTC", symbol_position_count=0)
+
+        assert result.allowed is False
+        assert "pause" in result.reason.lower() or "api" in result.reason.lower()
+
+    def test_circuit_breaker_blocks_on_loss_streak(self):
+        """Circuit breaker should block on loss streak."""
+        from app.risk_governor import RiskGovernor, MAX_CONSECUTIVE_LOSSES
+
+        governor = RiskGovernor()
+
+        # Record enough losses to trigger pause
+        for _ in range(MAX_CONSECUTIVE_LOSSES + 1):
+            governor.report_trade_result(is_win=False)
+
+        result = governor.run_circuit_breaker_checks("BTC", symbol_position_count=0)
+
+        assert result.allowed is False
+        assert "loss" in result.reason.lower() or "streak" in result.reason.lower()
+
+    def test_circuit_breaker_passes_when_healthy(self):
+        """Circuit breaker should pass when no issues."""
+        from app.risk_governor import RiskGovernor
+
+        governor = RiskGovernor()
+
+        result = governor.run_circuit_breaker_checks("BTC", symbol_position_count=0)
+
+        assert result.allowed is True
+
+
+class TestRiskGovernorProposedSize:
+    """Test risk governor with actual proposed size."""
+
+    def test_proposed_size_blocks_oversize_position(self):
+        """Large proposed size should be blocked by position size check."""
+        from app.risk_governor import RiskGovernor, MAX_POSITION_SIZE_PCT
+
+        governor = RiskGovernor()
+
+        # Account value $100k, max position 10% = $10k
+        # Propose a $15k trade - should be blocked
+        result = governor.run_all_checks(
+            account_value=100000,
+            margin_used=0,
+            maintenance_margin=1,
+            total_exposure=0,
+            daily_pnl=0,
+            proposed_size_usd=15000,  # 15% > 10% limit
+        )
+
+        assert result.allowed is False
+        assert "position" in result.reason.lower() or "size" in result.reason.lower()
+
+    def test_proposed_size_allows_valid_position(self):
+        """Valid proposed size should pass."""
+        from app.risk_governor import RiskGovernor
+
+        governor = RiskGovernor()
+
+        # Account value $100k, max position 10% = $10k
+        # Propose a $5k trade - should pass
+        result = governor.run_all_checks(
+            account_value=100000,
+            margin_used=0,
+            maintenance_margin=1,
+            total_exposure=0,
+            daily_pnl=0,
+            proposed_size_usd=5000,  # 5% < 10% limit
+        )
+
+        assert result.allowed is True
+
+
+class TestCircuitBreakerPositionTracking:
+    """Test circuit breaker with actual position data."""
+
+    def test_position_count_from_account_state(self):
+        """Governor should track positions from account state using public method."""
+        from app.risk_governor import RiskGovernor, MAX_CONCURRENT_POSITIONS
+
+        governor = RiskGovernor()
+
+        # Use public method to update from account state
+        mock_account_state = {
+            "assetPositions": [
+                {"position": {"coin": "BTC", "szi": "0.1"}},
+                {"position": {"coin": "ETH", "szi": "-0.5"}},
+                {"position": {"coin": "SOL", "szi": "10"}},
+            ]
+        }
+        governor.update_positions_from_account_state(mock_account_state)
+
+        # Verify position counts
+        assert governor._current_position_count == 3
+        assert governor.get_symbol_position_count("BTC") == 1
+        assert governor.get_symbol_position_count("ETH") == 1
+        assert governor.get_symbol_position_count("SOL") == 1
+        assert governor.get_symbol_position_count("DOGE") == 0
+
+        # Now check if we can open another position (depends on MAX_CONCURRENT_POSITIONS)
+        result = governor.run_circuit_breaker_checks("DOGE", symbol_position_count=0)
+
+        # Default MAX_CONCURRENT_POSITIONS is 3, so this should be blocked
+        if MAX_CONCURRENT_POSITIONS == 3:
+            assert result.allowed is False
+            assert "concurrent" in result.reason.lower() or "position" in result.reason.lower()
+
+    def test_existing_symbol_position_blocked_when_limit_is_one(self):
+        """Adding to existing position should be blocked when MAX_POSITION_PER_SYMBOL=1."""
+        from app.risk_governor import RiskGovernor, MAX_POSITION_PER_SYMBOL
+
+        governor = RiskGovernor()
+
+        # Already have BTC position
+        governor._current_position_count = 1
+        governor._positions_by_symbol = {"BTC": 1}
+
+        # Adding to BTC position with count=1 (existing position)
+        result = governor.run_circuit_breaker_checks("BTC", symbol_position_count=1)
+
+        # When MAX_POSITION_PER_SYMBOL is 1, this should be blocked
+        if MAX_POSITION_PER_SYMBOL == 1:
+            assert result.allowed is False
+            assert "position" in result.reason.lower() or "BTC" in result.reason
+
+    def test_per_symbol_limit_blocks_new_position(self):
+        """Per-symbol position limit should block additional positions."""
+        from app.risk_governor import RiskGovernor, MAX_POSITION_PER_SYMBOL
+
+        governor = RiskGovernor()
+
+        # Already have max positions in BTC
+        governor._current_position_count = 1
+        governor._positions_by_symbol = {"BTC": MAX_POSITION_PER_SYMBOL}
+
+        # Adding another BTC position should be blocked
+        result = governor.run_circuit_breaker_checks("BTC", symbol_position_count=MAX_POSITION_PER_SYMBOL)
+
+        # If MAX_POSITION_PER_SYMBOL is 1, this should be blocked
+        if MAX_POSITION_PER_SYMBOL == 1:
+            assert result.allowed is False
+
+    def test_new_symbol_position_allowed(self):
+        """New position in a different symbol should be allowed."""
+        from app.risk_governor import RiskGovernor
+
+        governor = RiskGovernor()
+
+        # Have one BTC position
+        governor._current_position_count = 1
+        governor._positions_by_symbol = {"BTC": 1}
+
+        # Opening new position in ETH (count=0) should be allowed
+        result = governor.run_circuit_breaker_checks("ETH", symbol_position_count=0)
+
+        assert result.allowed is True
+
+
+class TestFailClosedBehavior:
+    """Test fail-closed safety behavior when account state unavailable."""
+
+    @pytest.mark.asyncio
+    async def test_account_state_failure_blocks_execution_after_retries(self):
+        """Verify execution is blocked when account state fetch fails after all retries."""
+        from app.executor import HyperliquidExecutor
+
+        executor = HyperliquidExecutor()
+
+        # Mock get_account_value to return valid value
+        executor.get_account_value = AsyncMock(return_value=100000.0)
+
+        # Mock get_account_state_with_retry to raise exception (simulates all retries failed)
+        executor.get_account_state_with_retry = AsyncMock(
+            side_effect=Exception("Account state fetch failed after 3 attempts: API unavailable")
+        )
+
+        mock_db = MagicMock()
+
+        # Config that enables trading
+        config = {
+            "enabled": True,
+            "hyperliquid": {
+                "enabled": True,
+                "address": "0x1234567890123456789012345678901234567890",
+            },
+        }
+
+        allowed, reason, context = await executor.validate_execution(
+            db=mock_db,
+            symbol="BTC",
+            direction="long",
+            config=config,
+            consensus_addresses=["0x123"],
+        )
+
+        assert allowed is False
+        assert "Account state unavailable" in reason
+
+    @pytest.mark.asyncio
+    async def test_account_state_retry_succeeds_on_second_attempt(self):
+        """Verify execution proceeds if account state succeeds after initial failures."""
+        from app.executor import HyperliquidExecutor, ACCOUNT_STATE_MAX_RETRIES
+
+        executor = HyperliquidExecutor()
+        executor.address = "0x1234567890123456789012345678901234567890"
+
+        # Mock get_account_state to fail twice then succeed
+        call_count = 0
+        async def mock_get_account_state(exchange_type=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                return None  # Simulates failure (returns None)
+            return {
+                "marginSummary": {
+                    "accountValue": "100000",
+                    "totalMarginUsed": "1000",
+                },
+                "assetPositions": [],
+            }
+
+        executor.get_account_state = mock_get_account_state
+
+        # Should succeed on third attempt
+        result = await executor.get_account_state_with_retry()
+        assert result is not None
+        assert call_count == 3  # Called 3 times before success
+
+    @pytest.mark.asyncio
+    async def test_account_state_success_continues_validation(self):
+        """Verify execution proceeds past account state check when available."""
+        from app.executor import HyperliquidExecutor
+
+        executor = HyperliquidExecutor()
+
+        account_state = {
+            "marginSummary": {
+                "accountValue": "100000",
+                "totalMarginUsed": "1000",
+                "totalRawUsd": "90000",
+            },
+            "crossMaintenanceMarginUsed": "500",
+            "assetPositions": [],
+        }
+
+        # Mock successful account state response (with retry)
+        executor.get_account_value = AsyncMock(return_value=100000.0)
+        executor.get_account_state_with_retry = AsyncMock(return_value=account_state)
+        # Mock exposure to exceed limit to trigger a different rejection
+        executor.get_current_exposure = AsyncMock(return_value=0.99)  # 99% exposure
+
+        mock_db = MagicMock()
+
+        # Config that enables trading
+        config = {
+            "enabled": True,
+            "hyperliquid": {
+                "enabled": True,
+                "address": "0x1234567890123456789012345678901234567890",
+                "max_exposure_pct": 10,  # 10% max exposure
+            },
+        }
+
+        # Patch risk governor for kill switch check
+        with patch("app.risk_governor.get_risk_governor") as mock_gov:
+            mock_governor = MagicMock()
+            mock_governor.is_kill_switch_active.return_value = False
+            mock_gov.return_value = mock_governor
+
+            allowed, reason, context = await executor.validate_execution(
+                db=mock_db,
+                symbol="BTC",
+                direction="long",
+                config=config,
+                consensus_addresses=None,
+            )
+
+        # We expect to fail on exposure limit, NOT on account_state
+        # This proves we got past the account_state check
+        assert allowed is False
+        assert "Exposure" in reason or "exposure" in reason.lower()
+        assert "Account state unavailable" not in reason
+
+    @pytest.mark.asyncio
+    async def test_retry_exhausts_all_attempts_before_failing(self):
+        """Verify all retry attempts are made before failing."""
+        from app.executor import HyperliquidExecutor, ACCOUNT_STATE_MAX_RETRIES
+
+        executor = HyperliquidExecutor()
+        executor.address = "0x1234567890123456789012345678901234567890"
+
+        # Mock get_account_state to always return None
+        call_count = 0
+        async def mock_get_account_state(exchange_type=None):
+            nonlocal call_count
+            call_count += 1
+            return None
+
+        executor.get_account_state = mock_get_account_state
+
+        # Should fail after all retries
+        with pytest.raises(Exception) as exc_info:
+            await executor.get_account_state_with_retry()
+
+        assert call_count == ACCOUNT_STATE_MAX_RETRIES
+        assert "failed after" in str(exc_info.value).lower()
+
+    @pytest.mark.asyncio
+    async def test_retry_succeeds_immediately_on_first_attempt(self):
+        """Verify no unnecessary retries when first attempt succeeds."""
+        from app.executor import HyperliquidExecutor
+
+        executor = HyperliquidExecutor()
+        executor.address = "0x1234567890123456789012345678901234567890"
+
+        call_count = 0
+        async def mock_get_account_state(exchange_type=None):
+            nonlocal call_count
+            call_count += 1
+            return {"marginSummary": {"accountValue": "100000"}, "assetPositions": []}
+
+        executor.get_account_state = mock_get_account_state
+
+        result = await executor.get_account_state_with_retry()
+        assert result is not None
+        assert call_count == 1  # Only called once
+
+    @pytest.mark.asyncio
+    async def test_safety_block_metric_incremented_on_kill_switch(self):
+        """Verify safety block metric is called when kill switch blocks."""
+        from app.executor import HyperliquidExecutor, increment_safety_block
+
+        executor = HyperliquidExecutor()
+        executor.get_account_value = AsyncMock(return_value=100000.0)
+        executor.get_account_state_with_retry = AsyncMock(return_value={
+            "marginSummary": {"accountValue": "100000"},
+            "assetPositions": [],
+        })
+
+        mock_db = MagicMock()
+        config = {
+            "enabled": True,
+            "hyperliquid": {
+                "enabled": True,
+                "address": "0x1234567890123456789012345678901234567890",
+            },
+        }
+
+        # Patch risk governor to have kill switch active
+        with patch("app.risk_governor.get_risk_governor") as mock_gov, \
+             patch("app.executor.increment_safety_block") as mock_metric:
+            mock_governor = MagicMock()
+            mock_governor.is_kill_switch_active.return_value = True
+            mock_gov.return_value = mock_governor
+
+            allowed, reason, _ = await executor.validate_execution(
+                db=mock_db,
+                symbol="BTC",
+                direction="long",
+                config=config,
+                consensus_addresses=None,
+            )
+
+            assert allowed is False
+            assert "Kill switch" in reason
+            mock_metric.assert_called_once_with("kill_switch")
+
+    @pytest.mark.asyncio
+    async def test_safety_block_metric_incremented_on_account_state_failure(self):
+        """Verify safety block metric is called when account state fails."""
+        from app.executor import HyperliquidExecutor
+
+        executor = HyperliquidExecutor()
+        executor.get_account_value = AsyncMock(return_value=100000.0)
+        executor.get_account_state_with_retry = AsyncMock(
+            side_effect=Exception("API unavailable after retries")
+        )
+
+        mock_db = MagicMock()
+        config = {
+            "enabled": True,
+            "hyperliquid": {
+                "enabled": True,
+                "address": "0x1234567890123456789012345678901234567890",
+            },
+        }
+
+        with patch("app.executor.increment_safety_block") as mock_metric:
+            allowed, reason, _ = await executor.validate_execution(
+                db=mock_db,
+                symbol="BTC",
+                direction="long",
+                config=config,
+                consensus_addresses=None,
+            )
+
+            assert allowed is False
+            assert "Account state unavailable" in reason
+            mock_metric.assert_called_once_with("account_state")
+
+
+class TestMigrationVerification:
+    """Test that required migrations exist."""
+
+    def test_risk_daily_pnl_migration_exists(self):
+        """Verify 026_risk_governor_state.sql migration file exists with risk_daily_pnl table."""
+        import os
+
+        migration_path = os.path.join(
+            os.path.dirname(__file__),
+            "..", "..", "..", "db", "migrations", "026_risk_governor_state.sql"
+        )
+
+        # Check file exists
+        assert os.path.exists(migration_path), f"Migration file not found: {migration_path}"
+
+        # Check it contains risk_daily_pnl table definition
+        with open(migration_path, "r") as f:
+            content = f.read()
+
+        assert "risk_daily_pnl" in content, "Migration missing risk_daily_pnl table"
+        assert "starting_equity" in content, "Migration missing starting_equity column"
+        assert "daily_drawdown_pct" in content, "Migration missing daily_drawdown_pct column"

@@ -363,6 +363,168 @@ Signal generation and consensus detection (Python/FastAPI).
 }
 ```
 
+### Market Regime Detection (Phase 5)
+
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/regime` | GET | No | Get regime for all assets (BTC, ETH) |
+| `/regime/{asset}` | GET | No | Get regime for specific asset |
+| `/regime/params` | GET | No | Get regime parameter presets |
+
+**GET `/regime` Response:**
+```json
+{
+  "regimes": {
+    "BTC": {
+      "asset": "BTC",
+      "regime": "trending",
+      "confidence": 0.75,
+      "params": {
+        "stop_multiplier": 1.2,
+        "kelly_multiplier": 1.0,
+        "min_confidence_adjustment": 0.0,
+        "max_position_fraction": 1.0
+      },
+      "signals": {
+        "ma_spread_pct": 0.035,
+        "volatility_ratio": 0.85,
+        "price_range_pct": 0.025
+      },
+      "candles_used": 60
+    }
+  },
+  "summary": {
+    "trending": 1,
+    "ranging": 1,
+    "volatile": 0,
+    "unknown": 0
+  }
+}
+```
+
+**Regime Types:**
+| Regime | Detection | Strategy Adjustment |
+|--------|-----------|---------------------|
+| `trending` | MA spread > 2% | Wider stops (1.2x), full Kelly |
+| `ranging` | MAs converged, low vol | Tighter stops (0.8x), 75% Kelly |
+| `volatile` | ATR ratio > 1.5x | Wide stops (1.5x), 50% Kelly |
+| `unknown` | Insufficient data | Conservative defaults |
+
+### Multi-Exchange Module (Phase 6)
+
+The exchange module provides a unified interface for trading across multiple exchanges. Currently not exposed as REST API - used internally by executor.
+
+**Python Usage:**
+```python
+from app.exchanges import (
+    get_exchange,
+    connect_exchange,
+    ExchangeType,
+    OrderParams,
+    OrderSide,
+)
+
+# Create and connect to exchange
+exchange = await connect_exchange(ExchangeType.HYPERLIQUID, testnet=True)
+
+# Get account state
+balance = await exchange.get_balance()
+positions = await exchange.get_positions()
+
+# Place order with stops
+result = await exchange.open_position(
+    OrderParams(
+        symbol="BTC",
+        side=OrderSide.BUY,
+        size=0.01,
+        stop_loss=49000.0,
+        take_profit=52000.0,
+    )
+)
+
+await exchange.disconnect()
+```
+
+**Supported Exchanges:**
+| Exchange | Type | SDK | Symbol Format |
+|----------|------|-----|---------------|
+| Hyperliquid | DEX | hyperliquid-python-sdk | `BTC`, `ETH` |
+| Aster | DEX | ECDSA/EIP-712 | `BTC-PERP`, `ETH-PERP` |
+| Bybit | CEX | pybit | `BTCUSDT`, `ETHUSDT` |
+
+**Interface Operations:**
+| Operation | Description |
+|-----------|-------------|
+| `connect()` / `disconnect()` | Connection lifecycle |
+| `get_balance()` | Account equity, margin, P&L |
+| `get_positions()` | Open positions with entry/mark prices |
+| `open_position()` | Market/limit orders with stops |
+| `close_position()` | Partial or full close |
+| `set_leverage()` | Leverage configuration |
+| `set_stop_loss()` / `set_take_profit()` | Position protection |
+| `set_stop_loss_take_profit()` | Combined SL/TP placement (Phase 6.2) |
+| `cancel_stop_orders()` | Cancel all conditional orders (Phase 6.2) |
+| `get_market_price()` | Current mid price |
+
+### Native Stop Orders (Phase 6.2)
+
+The exchange interface supports native stop orders for lower latency execution. When enabled, stop-loss and take-profit orders are placed directly on the exchange instead of relying on local price polling.
+
+**Python Usage:**
+```python
+from app.exchanges import get_exchange, ExchangeType
+
+# Connect to exchange
+exchange = await connect_exchange(ExchangeType.HYPERLIQUID, testnet=True)
+
+# Check if exchange supports native stops
+if exchange.supports_native_stops:
+    # Set stop-loss and take-profit atomically
+    sl_result, tp_result = await exchange.set_stop_loss_take_profit(
+        symbol="BTC",
+        stop_price=49000.0,      # Stop-loss trigger
+        take_profit_price=52000.0,  # Take-profit trigger
+        size=0.01,              # Position size
+    )
+
+    # Cancel all stop orders for a symbol
+    cancelled = await exchange.cancel_stop_orders(symbol="BTC")
+    print(f"Cancelled {cancelled} stop orders")
+```
+
+**Exchange-Specific Implementations:**
+
+| Exchange | SL/TP Method | Cancel Method |
+|----------|--------------|---------------|
+| Hyperliquid | Trigger orders (`tpsl`) | Cancel by order type filter |
+| Bybit | `set_trading_stop()` | Set SL/TP to 0 |
+| Aster | Conditional orders API | `cancel-all` endpoint |
+
+**StopManager Modes:**
+
+The `StopManager` automatically selects the best mode based on configuration:
+
+| Mode | Condition | Behavior |
+|------|-----------|----------|
+| Native | `USE_NATIVE_STOPS=true` + non-trailing | Place SL/TP on exchange |
+| Polling | Trailing enabled or native fails | Local price monitoring |
+| Hybrid | Native SL + polling timeout | Best of both worlds |
+
+**Configuration:**
+```bash
+# Enable native stop orders (default: true)
+USE_NATIVE_STOPS=true
+
+# Polling interval for fallback mode
+STOP_POLL_INTERVAL_S=5
+
+# Take-profit ratio
+DEFAULT_RR_RATIO=2.0
+
+# Position timeout
+MAX_POSITION_HOURS=168
+```
+
 ---
 
 ## NATS Message Topics
