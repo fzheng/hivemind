@@ -1,4 +1,4 @@
-# Sigma Pilot
+# HiveMind
 
 ![Coverage](badges/coverage.svg) [![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-brightgreen.svg?style=flat-square)](https://polyformproject.org/licenses/noncommercial/1.0.0/)
 
@@ -6,7 +6,7 @@
 
 ## Overview
 
-**Sigma Pilot** is a collective intelligence trading system that learns from the best traders on [Hyperliquid](https://hyperliquid.xyz), the leading decentralized perpetual futures exchange.
+**HiveMind** is a collective intelligence trading system that learns from the best traders on [Hyperliquid](https://hyperliquid.xyz), the leading decentralized perpetual futures exchange.
 
 Instead of relying on traditional technical analysis or blindly copy-trading individual wallets, SigmaPilot aggregates wisdom from top-performing traders and generates consensus-based trading signals—only acting when multiple successful traders agree.
 
@@ -23,7 +23,7 @@ Traditional signals rely on lagging indicators that don't adapt to changing mark
 
 ## Our Solution
 
-SigmaPilot solves this by:
+HiveMind solves this by:
 
 1. **Monitoring the Best** — Continuously tracks 1,000+ traders on Hyperliquid's leaderboard
 2. **Filtering for Quality** — Removes noise traders, HFT bots, and inactive accounts
