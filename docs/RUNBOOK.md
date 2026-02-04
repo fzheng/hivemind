@@ -1,10 +1,10 @@
-# SigmaPilot Operational Runbook
+# HiveMind Operational Runbook
 
-This document provides operational procedures for managing and monitoring the SigmaPilot trading system.
+This document provides operational procedures for managing and monitoring the HiveMind trading system.
 
 ## System Overview
 
-SigmaPilot is a consensus-based trading signal system that:
+HiveMind is a consensus-based trading signal system that:
 1. **hl-scout** - Ingests Hyperliquid leaderboard data, scores addresses
 2. **hl-stream** - Subscribes to realtime fills, serves dashboard
 3. **hl-sage** - Thompson Sampling trader selection, NIG posteriors

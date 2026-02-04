@@ -2,13 +2,13 @@
 
 ![Coverage](badges/coverage.svg) [![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-brightgreen.svg?style=flat-square)](https://polyformproject.org/licenses/noncommercial/1.0.0/)
 
-**Website**: [sigmapilot.ai](https://sigmapilot.ai)
+**Website**: [hivemind.trade](https://hivemind.trade)
 
 ## Overview
 
 **HiveMind** is a collective intelligence trading system that learns from the best traders on [Hyperliquid](https://hyperliquid.xyz), the leading decentralized perpetual futures exchange.
 
-Instead of relying on traditional technical analysis or blindly copy-trading individual wallets, SigmaPilot aggregates wisdom from top-performing traders and generates consensus-based trading signals—only acting when multiple successful traders agree.
+Instead of relying on traditional technical analysis or blindly copy-trading individual wallets, HiveMind aggregates wisdom from top-performing traders and generates consensus-based trading signals—only acting when multiple successful traders agree.
 
 > "Be as smart as the smartest traders by learning from their collective behavior"
 
@@ -100,4 +100,4 @@ Current capabilities:
 
 [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/) — Free for personal and non-commercial use.
 
-For commercial licensing inquiries, please contact us at [sigmapilot.ai](https://sigmapilot.ai).
+For commercial licensing inquiries, please contact us at [hivemind.trade](https://hivemind.trade).

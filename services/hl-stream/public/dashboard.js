@@ -1,5 +1,5 @@
 /**
- * SigmaPilot Dashboard JavaScript
+ * HiveMind Dashboard JavaScript
  *
  * Real-time dashboard for monitoring top Hyperliquid traders.
  * Features:

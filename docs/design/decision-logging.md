@@ -6,7 +6,7 @@
 
 ## 1. Overview
 
-This document specifies a comprehensive decision logging system for SigmaPilot that captures, stores, and surfaces AI trading decisions with human-readable reasoning. The system enables:
+This document specifies a comprehensive decision logging system for HiveMind that captures, stores, and surfaces AI trading decisions with human-readable reasoning. The system enables:
 
 - **Full transparency**: Every decision is recorded with inputs and reasoning
 - **Queryable history**: Filter by symbol, result, time, exchange
@@ -1000,4 +1000,4 @@ async def process_consensus(
 
 ---
 
-*This design provides full transparency into SigmaPilot's decision-making process.*
+*This design provides full transparency into HiveMind's decision-making process.*
