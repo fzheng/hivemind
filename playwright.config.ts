@@ -1,7 +1,7 @@
 import { defineConfig, devices } from '@playwright/test';
 
 /**
- * Playwright configuration for SigmaPilot dashboard UI tests
+ * Playwright configuration for HiveMind dashboard UI tests
  * @see https://playwright.dev/docs/test-configuration
  */
 export default defineConfig({

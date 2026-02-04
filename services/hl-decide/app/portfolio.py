@@ -1,5 +1,5 @@
 """
-Portfolio Management for SigmaPilot
+Portfolio Management for HiveMind
 
 Fetches account state and positions from Hyperliquid.
 Provides execution configuration and logging for trade execution.

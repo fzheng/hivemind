@@ -1,6 +1,6 @@
 # Render Cloud Deployment
 
-This guide covers deploying SigmaPilot to [Render](https://render.com) using the Blueprint specification.
+This guide covers deploying HiveMind to [Render](https://render.com) using the Blueprint specification.
 
 ## Prerequisites
 

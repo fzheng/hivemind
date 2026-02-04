@@ -1,4 +1,4 @@
-# Code Review Fixes - SigmaPilot Platform
+# Code Review Fixes - HiveMind Platform
 
 This document summarizes all fixes applied to address the code review findings.
 

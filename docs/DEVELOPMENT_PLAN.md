@@ -1,4 +1,4 @@
-# SigmaPilot Development Plan
+# HiveMind Development Plan
 
 ## Vision
 

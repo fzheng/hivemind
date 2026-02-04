@@ -1,4 +1,4 @@
-/* Simple Postgres migration runner for SigmaPilot */
+/* Simple Postgres migration runner for HiveMind */
 const fs = require('fs');
 const path = require('path');
 const { Client } = require('pg');

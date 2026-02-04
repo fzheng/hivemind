@@ -1,10 +1,10 @@
-# SigmaPilot Current Architecture Analysis
+# HiveMind Current Architecture Analysis
 
 *Phase 3e Analysis - December 2025*
 
 ## Executive Summary
 
-SigmaPilot is a collective intelligence trading system for Hyperliquid that aggregates wisdom from top traders to generate consensus-based signals. Unlike copy-trading platforms, it uses Bayesian learning (Thompson Sampling with NIG posteriors) to adaptively select traders and requires multi-party agreement before generating signals.
+HiveMind is a collective intelligence trading system for Hyperliquid that aggregates wisdom from top traders to generate consensus-based signals. Unlike copy-trading platforms, it uses Bayesian learning (Thompson Sampling with NIG posteriors) to adaptively select traders and requires multi-party agreement before generating signals.
 
 ---
 

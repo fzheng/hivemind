@@ -1,11 +1,11 @@
-# Makefile for SigmaPilot
+# Makefile for HiveMind
 
 .PHONY: test test-ts test-py test-e2e test-unit test-coverage build install clean help
 .PHONY: up down restart rebuild rebuild-clean logs ps wipe init
 
 # Default target
 help:
-	@echo "SigmaPilot Development Commands"
+	@echo "HiveMind Development Commands"
 	@echo ""
 	@echo "Testing:"
 	@echo "  make test          Run all tests (TypeScript + Python)"

@@ -1,6 +1,6 @@
 # API Reference
 
-SigmaPilot exposes REST APIs and WebSocket endpoints across its services. Each service provides interactive Swagger documentation at `/docs`.
+HiveMind exposes REST APIs and WebSocket endpoints across its services. Each service provides interactive Swagger documentation at `/docs`.
 
 ## Service URLs
 

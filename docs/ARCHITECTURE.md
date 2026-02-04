@@ -1,6 +1,6 @@
 # Architecture
 
-Technical documentation for developers working on SigmaPilot.
+Technical documentation for developers working on HiveMind.
 
 ## Services
 
